@@ -25,7 +25,7 @@ import { BrainSidebar, WorkspaceViewMode } from './BrainSidebar';
 import { BrainViewerCanvas } from './BrainViewerCanvas';
 import { FactPanel } from './FactPanel';
 import { AddFactModal } from './AddFactModal';
-import { IngestModal } from './IngestModal';
+import { IngestModal, CaptureHubTab } from './IngestModal';
 import { McpBridgeModal } from './McpBridgeModal';
 import { GuidedConnectionModal, GuidedService } from './GuidedConnectionModal';
 import { DeleteBrainModal } from './DeleteBrainModal';
@@ -135,7 +135,13 @@ export const BrainView: React.FC<BrainViewProps> = ({
   // Modals
   const [isAddFactOpen, setIsAddFactOpen] = useState(false);
   const [isIngestOpen, setIsIngestOpen] = useState(false);
+  const [captureHubTab, setCaptureHubTab] = useState<CaptureHubTab>('import');
   const [isMcpOpen, setIsMcpOpen] = useState(false);
+
+  const handleOpenCaptureHub = (tab: CaptureHubTab = 'import') => {
+    setCaptureHubTab(tab);
+    setIsIngestOpen(true);
+  };
   const [isGuidedConfigOpen, setIsGuidedConfigOpen] = useState(false);
   const [guidedService, setGuidedService] = useState<GuidedService>('chatgpt');
   const [isDeleteBrainOpen, setIsDeleteBrainOpen] = useState(false);
@@ -435,7 +441,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
           }}
           recentActivityCount={activities.length}
           onOpenAddFact={() => setIsAddFactOpen(true)}
-          onOpenIngest={() => setIsIngestOpen(true)}
+          onOpenIngest={(tab) => handleOpenCaptureHub(tab || 'import')}
           onOpenGuidedConfig={handleOpenGuidedConfig}
           onExportSnapshot={handleExportSnapshot}
           onSwitchToWelcome={onSwitchToLogin}
@@ -489,9 +495,9 @@ export const BrainView: React.FC<BrainViewProps> = ({
                 setIsMobileSidebarOpen(false);
                 setIsAddFactOpen(true);
               }}
-              onOpenIngest={() => {
+              onOpenIngest={(tab) => {
                 setIsMobileSidebarOpen(false);
-                setIsIngestOpen(true);
+                handleOpenCaptureHub(tab || 'import');
               }}
               onOpenGuidedConfig={(s) => {
                 setIsMobileSidebarOpen(false);
@@ -522,7 +528,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
           activeFileTypeFilter={activeFileTypeFilter}
           onSelectFileTypeFilter={setActiveFileTypeFilter}
           onOpenAddFact={() => setIsAddFactOpen(true)}
-          onOpenIngest={() => setIsIngestOpen(true)}
+          onOpenIngest={(tab) => handleOpenCaptureHub(tab || 'import')}
           onOpenMcp={() => handleOpenGuidedConfig('chatgpt')}
           onOpenGuidedConfig={handleOpenGuidedConfig}
           connectionStatus={connectionStatus}
@@ -1099,6 +1105,8 @@ export const BrainView: React.FC<BrainViewProps> = ({
         onClose={() => setIsIngestOpen(false)}
         currentBrain={currentBrain}
         brains={brains}
+        initialTab={captureHubTab}
+        onCreateBrain={handleCreateBrain}
         onIngest={handleIngest}
       />
 

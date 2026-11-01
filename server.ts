@@ -40,6 +40,16 @@ db.exec(`
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS companion_devices (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    token_prefix TEXT NOT NULL,
+    token_value TEXT NOT NULL,
+    browser TEXT,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT
+  );
 `);
 
 // Ensure new columns exist on older DB files
@@ -316,17 +326,82 @@ function getBrainList(): string[] {
   return Array.from(new Set([...defaults, ...found]));
 }
 
+// Track Browser Companion device token usage if Bearer header is present
+app.use((req, _res, next) => {
+  const auth = req.headers.authorization;
+  if (auth && auth.startsWith('Bearer ')) {
+    const token = auth.slice(7).trim();
+    if (token) {
+      try {
+        db.prepare('UPDATE companion_devices SET last_used_at = ? WHERE token_value = ?').run(
+          new Date().toISOString(),
+          token
+        );
+      } catch {}
+    }
+  }
+  next();
+});
+
 // 1. Status API
 app.get('/api/status', (req, res) => {
   const count = (db.prepare('SELECT count(*) as count FROM facts').get() as { count: number }).count;
+  const devices = db
+    .prepare('SELECT id, name, token_prefix, browser, created_at, last_used_at FROM companion_devices ORDER BY created_at DESC')
+    .all();
   res.json({
     status: 'online',
     time: new Date().toISOString(),
     database: 'sqlite-embedded',
     factsCount: count,
     brains: getBrainList(),
+    companionDevicesCount: devices.length,
     geminiLiveTest: Boolean(process.env.GEMINI_API_KEY),
   });
+});
+
+// 1b. Browser Companion Device Tokens API
+app.get('/api/companion/devices', (_req, res) => {
+  const rows = db
+    .prepare('SELECT id, name, token_prefix, browser, created_at, last_used_at FROM companion_devices ORDER BY created_at DESC')
+    .all();
+  res.json(rows);
+});
+
+app.post('/api/companion/devices', (req, res) => {
+  const name = (req.body?.name || 'Chrome Browser Companion').trim();
+  const browser = (req.body?.browser || 'Chromium / Manifest V3').trim();
+  const id = `dev_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+  const randomSecret =
+    Math.random().toString(36).slice(2, 12) +
+    Math.random().toString(36).slice(2, 12) +
+    Date.now().toString(36);
+  const fullToken = `brn_live_${randomSecret}`;
+  const tokenPrefix = `${fullToken.slice(0, 13)}…${fullToken.slice(-4)}`;
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO companion_devices (id, name, token_prefix, token_value, browser, created_at, last_used_at)
+    VALUES (?, ?, ?, ?, ?, ?, NULL)
+  `).run(id, name, tokenPrefix, fullToken, browser, now);
+
+  res.json({
+    device: {
+      id,
+      name,
+      token_prefix: tokenPrefix,
+      browser,
+      created_at: now,
+      last_used_at: null,
+    },
+    token: fullToken,
+  });
+});
+
+app.delete('/api/companion/devices/:id', (req, res) => {
+  const { id } = req.params;
+  db.prepare('DELETE FROM companion_devices WHERE id = ?').run(id);
+  res.json({ ok: true, id });
 });
 
 // 2. List Brains API

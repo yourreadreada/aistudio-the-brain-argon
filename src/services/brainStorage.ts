@@ -1118,6 +1118,218 @@ class BrainStorageService {
     return lines.join('\n');
   }
 
+  public exportPortableMarkdown(
+    brain: string,
+    options?: {
+      sourceFilter?: AISource | null;
+      includeMetadata?: boolean;
+      groupBySource?: boolean;
+    }
+  ): string {
+    const includeMetadata = options?.includeMetadata ?? true;
+    const groupBySource = options?.groupBySource ?? true;
+    const facts = this.recall(brain, '', options?.sourceFilter || null);
+    const nowIso = new Date().toISOString();
+
+    const lines: string[] = [];
+    if (includeMetadata) {
+      lines.push('---');
+      lines.push(`brain: "${brain}"`);
+      lines.push(`exported_at: "${nowIso}"`);
+      lines.push(`fact_count: ${facts.length}`);
+      if (options?.sourceFilter) {
+        lines.push(`source_filter: "${options.sourceFilter}"`);
+      }
+      lines.push(`format: "the-brain-portable-markdown-v1"`);
+      lines.push('---');
+      lines.push('');
+    }
+
+    lines.push(`# The Brain · ${brain.toUpperCase()} Memory Export`);
+    lines.push('');
+    lines.push(
+      `> Portable context snapshot containing **${facts.length}** memory node${
+        facts.length === 1 ? '' : 's'
+      }${options?.sourceFilter ? ` filtered by **${options.sourceFilter}**` : ''}.`
+    );
+    lines.push('');
+
+    if (facts.length === 0) {
+      lines.push('_No memory nodes recorded in this selection yet._');
+      return lines.join('\n');
+    }
+
+    if (groupBySource) {
+      const sources = Array.from(new Set(facts.map((f) => f.source)));
+      for (const src of sources) {
+        const srcFacts = facts.filter((f) => f.source === src);
+        lines.push(`## Source: ${src.toUpperCase()} (${srcFacts.length})`);
+        lines.push('');
+        for (const f of srcFacts) {
+          const title = f.documentTitle || f.fileName || `Node #${f.id}`;
+          lines.push(`### [#${f.id}] ${title}`);
+          if (includeMetadata) {
+            const metaParts = [
+              `Source: \`${f.source}\``,
+              `Updated: \`${new Date(f.updated_at).toISOString().slice(0, 10)}\``,
+            ];
+            if (f.fileName) metaParts.push(`File: \`${f.fileName}\``);
+            if (f.tags && f.tags.length > 0) {
+              metaParts.push(`Tags: ${f.tags.map((t) => `\`#${t}\``).join(' ')}`);
+            }
+            lines.push(metaParts.join(' · '));
+            lines.push('');
+          }
+          lines.push(f.content);
+          lines.push('');
+          lines.push('---');
+          lines.push('');
+        }
+      }
+    } else {
+      for (const f of facts) {
+        const title = f.documentTitle || f.fileName || `Node #${f.id}`;
+        lines.push(`## [#${f.id}] ${title} (${f.source})`);
+        if (includeMetadata) {
+          const metaParts = [
+            `Updated: \`${new Date(f.updated_at).toISOString().slice(0, 10)}\``,
+          ];
+          if (f.fileName) metaParts.push(`File: \`${f.fileName}\``);
+          if (f.tags && f.tags.length > 0) {
+            metaParts.push(`Tags: ${f.tags.map((t) => `\`#${t}\``).join(' ')}`);
+          }
+          lines.push(metaParts.join(' · '));
+          lines.push('');
+        }
+        lines.push(f.content);
+        lines.push('');
+        lines.push('---');
+        lines.push('');
+      }
+    }
+
+    return lines.join('\n').trim() + '\n';
+  }
+
+  public async checkGatewayStatus(): Promise<{
+    reachable: boolean;
+    database: string;
+    factsCount: number;
+    companionDevicesCount: number;
+  }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/status`, {
+        signal: AbortSignal.timeout(2500),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      this.backendReachable = true;
+      this.backendChecked = true;
+      return {
+        reachable: true,
+        database: data.database || 'sqlite-embedded',
+        factsCount: data.factsCount ?? this.facts.length,
+        companionDevicesCount: data.companionDevicesCount ?? 0,
+      };
+    } catch {
+      this.backendReachable = false;
+      this.backendChecked = true;
+      return {
+        reachable: false,
+        database: 'local-storage-fallback',
+        factsCount: this.facts.length,
+        companionDevicesCount: 0,
+      };
+    }
+  }
+
+  public async fetchCompanionDevices(): Promise<
+    {
+      id: string;
+      name: string;
+      token_prefix: string;
+      browser: string;
+      created_at: string;
+      last_used_at: string | null;
+    }[]
+  > {
+    try {
+      const res = await fetch(`${API_BASE}/api/companion/devices`, {
+        signal: AbortSignal.timeout(2500),
+      });
+      if (!res.ok) throw new Error('Failed to fetch devices');
+      const rows = await res.json();
+      localStorage.setItem('brain_companion_devices_v1', JSON.stringify(rows));
+      return rows;
+    } catch {
+      try {
+        const raw = localStorage.getItem('brain_companion_devices_v1');
+        return raw ? JSON.parse(raw) : [];
+      } catch {
+        return [];
+      }
+    }
+  }
+
+  public async createCompanionDevice(
+    name: string,
+    browser: string = 'Chromium / Manifest V3'
+  ): Promise<{
+    device: {
+      id: string;
+      name: string;
+      token_prefix: string;
+      browser: string;
+      created_at: string;
+      last_used_at: string | null;
+    };
+    token: string;
+  }> {
+    try {
+      const res = await fetch(`${API_BASE}/api/companion/devices`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, browser }),
+      });
+      if (!res.ok) throw new Error('Backend create failed');
+      const data = await res.json();
+      await this.fetchCompanionDevices();
+      return data;
+    } catch {
+      const id = `dev_${Date.now().toString(36)}`;
+      const secret = Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
+      const token = `brn_live_${secret}`;
+      const device = {
+        id,
+        name: name.trim() || 'Browser Companion',
+        token_prefix: `${token.slice(0, 13)}…${token.slice(-4)}`,
+        browser,
+        created_at: new Date().toISOString(),
+        last_used_at: null,
+      };
+      const existing = await this.fetchCompanionDevices();
+      localStorage.setItem(
+        'brain_companion_devices_v1',
+        JSON.stringify([device, ...existing])
+      );
+      return { device, token };
+    }
+  }
+
+  public async revokeCompanionDevice(id: string): Promise<boolean> {
+    try {
+      await fetch(`${API_BASE}/api/companion/devices/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+    } catch {}
+    try {
+      const existing = await this.fetchCompanionDevices();
+      const filtered = existing.filter((d) => d.id !== id);
+      localStorage.setItem('brain_companion_devices_v1', JSON.stringify(filtered));
+    } catch {}
+    return true;
+  }
+
   /**
    * Generates tailored Custom Instructions for ChatGPT Free (Settings -> Personalization).
    */

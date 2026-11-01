@@ -1,8 +1,9 @@
 import React from 'react';
-import { Menu, Plus, Upload } from 'lucide-react';
+import { Menu, Plus, Upload, Puzzle } from 'lucide-react';
 import { AISource, Fact, FactFileType, SOURCE_PALETTE, FILE_TYPE_CONFIG } from '../types/brain';
 import { GlobalSearchBar } from './GlobalSearchBar';
 import { GuidedService } from './GuidedConnectionModal';
+import { CaptureHubTab } from './CaptureHubModal';
 
 interface BrainAppHeaderProps {
   currentBrain: string;
@@ -19,7 +20,7 @@ interface BrainAppHeaderProps {
   activeFileTypeFilter?: FactFileType | null;
   onSelectFileTypeFilter?: (ft: FactFileType | null) => void;
   onOpenAddFact: () => void;
-  onOpenIngest: () => void;
+  onOpenIngest: (initialTab?: CaptureHubTab) => void;
   onOpenMcp: () => void;
   onOpenGuidedConfig?: (service?: GuidedService) => void;
   connectionStatus?: { chatgpt: boolean; claude: boolean; gemini: boolean; backend: boolean };
@@ -46,7 +47,7 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
   totalFactsCount = 0,
 }) => {
   return (
-    <header className="relative z-20 flex h-14 w-full shrink-0 items-center justify-between gap-6 border-b border-white/10 bg-[#050710]/90 px-4 md:px-6 backdrop-blur-xl">
+    <header className="relative z-20 flex h-14 w-full shrink-0 items-center justify-between gap-4 border-b border-white/10 bg-[#050710]/90 px-4 md:px-6 backdrop-blur-xl">
       {/* Zone 1: Mobile Sidebar Toggle & Contextual Breadcrumb */}
       <div className="flex items-center gap-3 min-w-0 shrink-0">
         {onToggleMobileSidebar && (
@@ -112,14 +113,24 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
       </div>
 
       {/* Zone 3: Primary Workspace Actions */}
-      <div className="flex items-center gap-2.5 shrink-0">
+      <div className="flex items-center gap-2 shrink-0">
         <button
           type="button"
-          onClick={onOpenIngest}
-          className="hidden sm:flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-white/80 transition hover:border-white/30 hover:bg-white/[0.07] hover:text-white whitespace-nowrap shrink-0"
+          onClick={() => onOpenIngest('companion')}
+          className="hidden lg:flex items-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.02] px-2.5 py-1.5 text-xs font-medium text-white/75 transition hover:border-white/25 hover:bg-white/[0.06] hover:text-white whitespace-nowrap shrink-0"
+          title="Browser Companion & Device Tokens"
         >
-          <Upload className="h-3.5 w-3.5" />
-          <span>Ingest</span>
+          <Puzzle className="h-3.5 w-3.5 text-[#9db4ff]" />
+          <span>Companion</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => onOpenIngest('import')}
+          className="hidden sm:flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-white/90 transition hover:border-white/30 hover:bg-white/[0.08] hover:text-white whitespace-nowrap shrink-0"
+        >
+          <Upload className="h-3.5 w-3.5 text-emerald-400" />
+          <span>Capture Hub</span>
         </button>
 
         <button

@@ -1,6 +1,7 @@
 import { AISource } from '../types/brain';
 
 export const SUPPORTED_FILE_EXTENSIONS = [
+  '.zip',
   '.md',
   '.markdown',
   '.txt',
@@ -18,18 +19,21 @@ export const SUPPORTED_FILE_EXTENSIONS = [
 ];
 
 export interface ExtractedFileResult {
+  title: string;
   fileName: string;
+  archiveParent?: string;
   extension: string;
   sizeBytes: number;
   text: string;
   pageOrItemCount?: number;
+  itemUnitLabel?: string;
   detectedSource: AISource;
   status: 'success' | 'warning' | 'error';
   statusMessage?: string;
 }
 
-export function detectSourceFromFileName(filename: string): AISource {
-  const lower = filename.toLowerCase();
+export function detectSourceFromFileName(filename: string, textSample: string = ''): AISource {
+  const lower = (filename + ' ' + textSample.slice(0, 400)).toLowerCase();
   if (
     lower.includes('moodle') ||
     lower.includes('syllabus') ||
@@ -47,20 +51,25 @@ export function detectSourceFromFileName(filename: string): AISource {
   if (
     lower.includes('github') ||
     lower.includes('commit') ||
-    lower.includes('pr') ||
+    lower.includes('pull request') ||
     lower.includes('issue') ||
     lower.includes('diff') ||
     lower.includes('repo')
   ) {
     return 'github';
   }
-  if (lower.includes('claude') || lower.includes('anthropic')) {
+  if (lower.includes('claude') || lower.includes('anthropic') || lower.includes('chat_messages')) {
     return 'claude';
   }
-  if (lower.includes('gpt') || lower.includes('chatgpt') || lower.includes('openai')) {
+  if (
+    lower.includes('gpt') ||
+    lower.includes('chatgpt') ||
+    lower.includes('openai') ||
+    lower.includes('conversations.json')
+  ) {
     return 'gpt';
   }
-  if (lower.includes('gemini') || lower.includes('bard')) {
+  if (lower.includes('gemini') || lower.includes('bard') || lower.includes('aistudio')) {
     return 'gemini';
   }
   if (lower.includes('cursor') || lower.includes('antigravity') || lower.includes('composer')) {
@@ -78,103 +87,222 @@ export function detectSourceFromFileName(filename: string): AISource {
   return 'claude';
 }
 
+function cleanTitleFromFileName(fileName: string): string {
+  const base = fileName.split(/[\\/]/).pop() || fileName;
+  return base.replace(/\.[^/.]+$/, '').replace(/[_-]+/g, ' ').trim() || base;
+}
+
+function countMarkdownSectionsOrTurns(text: string): { count: number; label: string } {
+  if (text.includes('#### User') || text.includes('#### Assistant') || text.includes('**USER**:')) {
+    const turns = text.split(/(?=#### (?:User|Assistant)|\*\*(?:USER|ASSISTANT)\*\*:)/g).filter(Boolean);
+    return { count: Math.max(1, turns.length), label: turns.length === 1 ? 'turn' : 'turns' };
+  }
+  const headings = text.match(/^#{1,3}\s+.+$/gm);
+  if (headings && headings.length > 0) {
+    return { count: headings.length, label: headings.length === 1 ? 'section' : 'sections' };
+  }
+  const paras = text.split(/\n\s*\n/).filter(Boolean);
+  return { count: Math.max(1, paras.length), label: paras.length === 1 ? 'block' : 'blocks' };
+}
+
 /**
- * Extracts plain text from any college or chat export file type:
- * PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), Markdown (.md), Text (.txt), JSON chat exports, or Images.
+ * Unpacks a file or a .zip archive into one or more ExtractedFileResult items for the Review Queue.
+ */
+export async function extractItemsFromFile(file: File): Promise<ExtractedFileResult[]> {
+  const ext = '.' + (file.name.split('.').pop() || '').toLowerCase();
+  if (ext === '.zip') {
+    return await extractZipArchive(file);
+  }
+  const single = await extractTextFromFile(file);
+  return [single];
+}
+
+/**
+ * Extracts plain text from a single file:
+ * PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), Markdown (.md), Text (.txt), JSON chat exports, ZIP, or Images.
  */
 export async function extractTextFromFile(file: File): Promise<ExtractedFileResult> {
   const fileName = file.name;
+  const title = cleanTitleFromFileName(fileName);
   const extension = '.' + (fileName.split('.').pop() || '').toLowerCase();
-  const detectedSource = detectSourceFromFileName(fileName);
+  const initialSource = detectSourceFromFileName(fileName);
   const sizeBytes = file.size;
 
   try {
-    // 1. Markdown, Plain Text, or CSV
-    if (['.md', '.markdown', '.txt', '.csv'].includes(extension)) {
-      const text = await file.text();
+    // 0. If a .zip file is passed to single-file extractor, combine or return first summary
+    if (extension === '.zip') {
+      const items = await extractZipArchive(file);
+      if (items.length === 0) {
+        return {
+          title,
+          fileName,
+          extension,
+          sizeBytes,
+          text: '',
+          detectedSource: initialSource,
+          status: 'warning',
+          statusMessage: 'No supported documents or conversations found inside ZIP archive.',
+        };
+      }
+      const combinedText = items.map((i) => `# ${i.title}\n\n${i.text}`).join('\n\n---\n\n');
       return {
+        title,
         fileName,
         extension,
         sizeBytes,
-        text: text.trim(),
-        detectedSource,
-        status: text.trim() ? 'success' : 'warning',
-        statusMessage: text.trim() ? undefined : 'File is empty',
+        text: combinedText,
+        pageOrItemCount: items.length,
+        itemUnitLabel: items.length === 1 ? 'document' : 'documents',
+        detectedSource: items[0].detectedSource,
+        status: 'success',
       };
     }
 
-    // 2. JSON Chat Exports (e.g. ChatGPT conversations.json or structured memory)
+    // 1. Markdown, Plain Text, or CSV
+    if (['.md', '.markdown', '.txt', '.csv'].includes(extension)) {
+      const text = (await file.text()).trim();
+      const detectedSource = detectSourceFromFileName(fileName, text);
+      const stats = countMarkdownSectionsOrTurns(text);
+      return {
+        title,
+        fileName,
+        extension,
+        sizeBytes,
+        text,
+        pageOrItemCount: stats.count,
+        itemUnitLabel: stats.label,
+        detectedSource,
+        status: text ? 'success' : 'warning',
+        statusMessage: text ? undefined : 'File is empty',
+      };
+    }
+
+    // 2. JSON Chat Exports (ChatGPT conversations.json, Claude conversations.json, or structured memory)
     if (extension === '.json') {
       const rawText = await file.text();
       try {
         const parsed = JSON.parse(rawText);
-        const extractedChat = extractChatFromJson(parsed);
+        const extracted = extractChatFromJson(parsed, fileName);
         return {
+          title: extracted.title || title,
           fileName,
           extension,
           sizeBytes,
-          text: extractedChat || rawText,
-          detectedSource: lowerMatch(fileName, 'chatgpt') ? 'gpt' : detectedSource,
+          text: extracted.text || rawText.trim(),
+          pageOrItemCount: extracted.conversationCount || 1,
+          itemUnitLabel:
+            (extracted.conversationCount || 1) === 1 ? 'conversation' : 'conversations',
+          detectedSource: extracted.detectedSource || detectSourceFromFileName(fileName, rawText),
           status: 'success',
         };
       } catch {
         return {
+          title,
           fileName,
           extension,
           sizeBytes,
           text: rawText.trim(),
-          detectedSource,
+          pageOrItemCount: 1,
+          itemUnitLabel: 'document',
+          detectedSource: initialSource,
           status: 'success',
         };
       }
     }
 
-    // 3. PDF Documents (Syllabus, handouts, research papers, exam sheets)
+    // 3. PDF Documents
     if (extension === '.pdf') {
-      return await extractPdf(file, detectedSource);
+      return await extractPdf(file, initialSource);
     }
 
     // 4. Microsoft Word Documents (.docx)
     if (extension === '.docx') {
-      return await extractDocx(file, detectedSource);
+      return await extractDocx(file, initialSource);
     }
 
     // 5. Microsoft Excel Spreadsheets (.xlsx, .xls)
     if (['.xlsx', '.xls'].includes(extension)) {
-      return await extractXlsx(file, detectedSource);
+      return await extractXlsx(file, initialSource);
     }
 
     // 6. Microsoft PowerPoint Presentations (.pptx)
     if (extension === '.pptx') {
-      return await extractPptx(file, detectedSource);
+      return await extractPptx(file, initialSource);
     }
 
-    // 7. Images (Diagrams, whiteboard photos, slides, screenshots)
+    // 7. Images
     if (['.png', '.jpg', '.jpeg', '.webp'].includes(extension)) {
-      return await extractImageInfo(file, detectedSource);
+      return await extractImageInfo(file, initialSource);
     }
 
-    // Unsupported format fallback
     return {
+      title,
       fileName,
       extension,
       sizeBytes,
       text: '',
-      detectedSource,
+      detectedSource: initialSource,
       status: 'error',
-      statusMessage: `Unsupported file format '${extension}'. Supported: .pdf, .docx, .xlsx, .pptx, .md, .txt, .json, .csv, images`,
+      statusMessage: `Unsupported file format '${extension}'. Supported: .zip, .pdf, .docx, .xlsx, .pptx, .md, .txt, .json, .csv, images`,
     };
   } catch (err: any) {
     return {
+      title,
       fileName,
       extension,
       sizeBytes,
       text: '',
-      detectedSource,
+      detectedSource: initialSource,
       status: 'error',
       statusMessage: err?.message || 'Failed to extract text from file',
     };
   }
+}
+
+/**
+ * Unpacks a .zip archive using JSZip and extracts all supported inner files or conversation exports.
+ */
+async function extractZipArchive(zipFile: File): Promise<ExtractedFileResult[]> {
+  const JSZipModule = await import('jszip');
+  const JSZip = (JSZipModule as any).default || JSZipModule;
+  const arrayBuffer = await zipFile.arrayBuffer();
+  const zip = await JSZip.loadAsync(arrayBuffer);
+
+  const results: ExtractedFileResult[] = [];
+  const entries = Object.keys(zip.files);
+
+  for (const relativePath of entries) {
+    const zipEntry = zip.files[relativePath];
+    if (!zipEntry || zipEntry.dir) continue;
+    // Skip macOS metadata / hidden files
+    if (relativePath.includes('__MACOSX') || relativePath.split('/').pop()?.startsWith('.')) {
+      continue;
+    }
+
+    const baseName = relativePath.split('/').pop() || relativePath;
+    const ext = '.' + (baseName.split('.').pop() || '').toLowerCase();
+
+    if (!SUPPORTED_FILE_EXTENSIONS.includes(ext) || ext === '.zip') {
+      continue;
+    }
+
+    try {
+      const blob = await zipEntry.async('blob');
+      const innerFile = new File([blob], baseName, { type: blob.type });
+      const extracted = await extractTextFromFile(innerFile);
+      if (extracted.text.trim()) {
+        results.push({
+          ...extracted,
+          fileName: baseName,
+          archiveParent: zipFile.name,
+        });
+      }
+    } catch {
+      // Skip unreadable entry inside archive
+    }
+  }
+
+  return results;
 }
 
 // PDF Extraction (Lazy-loaded)
@@ -211,16 +339,18 @@ async function extractPdf(file: File, detectedSource: AISource): Promise<Extract
   const fullText = pageTexts.join('\n\n').trim();
 
   return {
+    title: cleanTitleFromFileName(file.name),
     fileName: file.name,
     extension: '.pdf',
     sizeBytes: file.size,
     text: fullText,
     pageOrItemCount: numPages,
-    detectedSource,
+    itemUnitLabel: numPages === 1 ? 'page' : 'pages',
+    detectedSource: detectSourceFromFileName(file.name, fullText) || detectedSource,
     status: fullText ? 'success' : 'warning',
     statusMessage: fullText
       ? undefined
-      : 'No text layer found (scanned image PDF). OCR recommended.',
+      : 'No text layer found (scanned image PDF).',
   };
 }
 
@@ -231,13 +361,17 @@ async function extractDocx(file: File, detectedSource: AISource): Promise<Extrac
   const arrayBuffer = await file.arrayBuffer();
   const result = await mammoth.extractRawText({ arrayBuffer });
   const rawText = (result.value || '').trim();
+  const stats = countMarkdownSectionsOrTurns(rawText);
 
   return {
+    title: cleanTitleFromFileName(file.name),
     fileName: file.name,
     extension: '.docx',
     sizeBytes: file.size,
     text: rawText,
-    detectedSource,
+    pageOrItemCount: stats.count,
+    itemUnitLabel: stats.label,
+    detectedSource: detectSourceFromFileName(file.name, rawText) || detectedSource,
     status: rawText ? 'success' : 'warning',
     statusMessage: rawText ? undefined : 'No readable text in Word document',
   };
@@ -275,11 +409,13 @@ async function extractXlsx(file: File, detectedSource: AISource): Promise<Extrac
   const fullText = parts.join('\n\n').trim();
 
   return {
+    title: cleanTitleFromFileName(file.name),
     fileName: file.name,
     extension: '.' + (file.name.split('.').pop() || 'xlsx').toLowerCase(),
     sizeBytes: file.size,
     text: fullText,
     pageOrItemCount: sheetNames.length,
+    itemUnitLabel: sheetNames.length === 1 ? 'sheet' : 'sheets',
     detectedSource,
     status: fullText ? 'success' : 'warning',
     statusMessage: fullText ? undefined : 'Spreadsheet is empty',
@@ -326,18 +462,20 @@ async function extractPptx(file: File, detectedSource: AISource): Promise<Extrac
   const fullText = slideTexts.join('\n\n').trim();
 
   return {
+    title: cleanTitleFromFileName(file.name),
     fileName: file.name,
     extension: '.pptx',
     sizeBytes: file.size,
     text: fullText,
     pageOrItemCount: slideFiles.length,
+    itemUnitLabel: slideFiles.length === 1 ? 'slide' : 'slides',
     detectedSource,
     status: fullText ? 'success' : 'warning',
     statusMessage: fullText ? undefined : 'No text content found in slides',
   };
 }
 
-// Images (Extract metadata, dimensions, and image contextual header)
+// Images
 async function extractImageInfo(file: File, detectedSource: AISource): Promise<ExtractedFileResult> {
   return new Promise((resolve) => {
     const img = new Image();
@@ -347,11 +485,13 @@ async function extractImageInfo(file: File, detectedSource: AISource): Promise<E
       URL.revokeObjectURL(url);
       const text = `[Image Reference: ${file.name} | ${img.naturalWidth}x${img.naturalHeight}px | Type: ${file.type}]\nAttached diagram / screenshot uploaded to knowledge base.`;
       resolve({
+        title: cleanTitleFromFileName(file.name),
         fileName: file.name,
         extension: '.' + (file.name.split('.').pop() || 'png').toLowerCase(),
         sizeBytes: file.size,
         text,
         pageOrItemCount: 1,
+        itemUnitLabel: 'image',
         detectedSource,
         status: 'success',
       });
@@ -360,10 +500,13 @@ async function extractImageInfo(file: File, detectedSource: AISource): Promise<E
     img.onerror = () => {
       URL.revokeObjectURL(url);
       resolve({
+        title: cleanTitleFromFileName(file.name),
         fileName: file.name,
         extension: '.' + (file.name.split('.').pop() || 'png').toLowerCase(),
         sizeBytes: file.size,
         text: `[Image: ${file.name}] Attached visual reference.`,
+        pageOrItemCount: 1,
+        itemUnitLabel: 'image',
         detectedSource,
         status: 'success',
       });
@@ -373,40 +516,74 @@ async function extractImageInfo(file: File, detectedSource: AISource): Promise<E
   });
 }
 
-function lowerMatch(str: string, term: string) {
-  return str.toLowerCase().includes(term.toLowerCase());
-}
-
-// Helper to extract clean conversation logs from ChatGPT conversations.json exports
-function extractChatFromJson(data: any): string {
+// Helper to extract clean conversation logs from ChatGPT or Claude JSON exports
+function extractChatFromJson(
+  data: any,
+  fileName: string
+): {
+  text: string;
+  conversationCount: number;
+  title?: string;
+  detectedSource?: AISource;
+} {
   if (Array.isArray(data)) {
     const convoLogs: string[] = [];
+    let detectedSource: AISource | undefined = undefined;
+    let firstTitle: string | undefined = undefined;
+
     data.forEach((convo: any, idx: number) => {
-      const title = convo.title || `Conversation ${idx + 1}`;
+      const title = convo.title || convo.name || `Conversation ${idx + 1}`;
+      if (!firstTitle && (convo.title || convo.name)) {
+        firstTitle = convo.title || convo.name;
+      }
       const messages: string[] = [];
 
-      if (convo.mapping) {
+      // 1. OpenAI ChatGPT export format (`mapping`)
+      if (convo.mapping && typeof convo.mapping === 'object') {
+        detectedSource = 'gpt';
         Object.values(convo.mapping).forEach((node: any) => {
           const msg = node?.message;
           if (msg && msg.content && Array.isArray(msg.content.parts)) {
-            const role = msg.author?.role || 'speaker';
-            const textParts = msg.content.parts.filter((p: any) => typeof p === 'string');
+            const rawRole = msg.author?.role || 'assistant';
+            if (rawRole === 'system') return;
+            const roleLabel = rawRole === 'user' ? 'User' : 'Assistant';
+            const textParts = msg.content.parts.filter((p: any) => typeof p === 'string' && p.trim());
             if (textParts.length > 0) {
-              messages.push(`**${role.toUpperCase()}**: ${textParts.join('\n')}`);
+              messages.push(`#### ${roleLabel}\n${textParts.join('\n')}`);
             }
           }
         });
       }
 
+      // 2. Anthropic Claude export format (`chat_messages`)
+      if (Array.isArray(convo.chat_messages)) {
+        detectedSource = 'claude';
+        convo.chat_messages.forEach((msg: any) => {
+          const sender = msg.sender === 'human' || msg.role === 'user' ? 'User' : 'Assistant';
+          const text = msg.text || (Array.isArray(msg.content) ? msg.content.map((c: any) => c.text || '').join('\n') : '');
+          if (text && text.trim()) {
+            messages.push(`#### ${sender}\n${text.trim()}`);
+          }
+        });
+      }
+
       if (messages.length > 0) {
-        convoLogs.push(`## ${title}\n\n${messages.join('\n\n')}`);
+        convoLogs.push(`# ${title}\n\n${messages.join('\n\n')}`);
       }
     });
 
     if (convoLogs.length > 0) {
-      return convoLogs.join('\n\n---\n\n');
+      return {
+        text: convoLogs.join('\n\n---\n\n'),
+        conversationCount: convoLogs.length,
+        title: convoLogs.length === 1 ? firstTitle : `${cleanTitleFromFileName(fileName)} (${convoLogs.length} chats)`,
+        detectedSource,
+      };
     }
   }
 
-  return '';
+  return {
+    text: '',
+    conversationCount: 1,
+  };
 }

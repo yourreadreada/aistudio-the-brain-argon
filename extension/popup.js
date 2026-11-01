@@ -2,6 +2,7 @@
 // Runs in the extension's popup context
 
 const apiUrlInput = document.getElementById('apiUrl');
+const deviceTokenInput = document.getElementById('deviceToken');
 const brainSelect = document.getElementById('brainSelect');
 const injectBtn = document.getElementById('injectBtn');
 const saveBtn = document.getElementById('saveBtn');
@@ -11,6 +12,15 @@ const serverDot = document.getElementById('serverDot');
 const serverText = document.getElementById('serverText');
 const targetSite = document.getElementById('targetSite');
 
+function getAuthHeaders(extra = {}) {
+  const headers = { ...extra };
+  const token = deviceTokenInput?.value?.trim();
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  return headers;
+}
+
 function setStatus(text, kind) {
   statusEl.textContent = text;
   statusEl.className = kind || '';
@@ -18,7 +28,10 @@ function setStatus(text, kind) {
 
 async function checkServer() {
   try {
-    const res = await fetch(`${apiUrlInput.value}/api/brains`, { signal: AbortSignal.timeout(2000) });
+    const res = await fetch(`${apiUrlInput.value}/api/brains`, {
+      headers: getAuthHeaders(),
+      signal: AbortSignal.timeout(2000),
+    });
     if (res.ok) {
       serverDot.className = 'server-status online';
       serverText.textContent = 'Server Online';
@@ -32,14 +45,15 @@ async function checkServer() {
     }
   } catch (err) {
     serverDot.className = 'server-status offline';
-    serverText.textContent = 'Offline (Start python -m brain.web)';
+    serverText.textContent = 'Offline (Check Brain URL)';
   }
 }
 
 async function init() {
-  const stored = await chrome.storage.local.get(['apiUrl', 'lastBrain']);
+  const stored = await chrome.storage.local.get(['apiUrl', 'lastBrain', 'deviceToken']);
   if (stored.apiUrl) apiUrlInput.value = stored.apiUrl;
   if (stored.lastBrain) brainSelect.value = stored.lastBrain;
+  if (stored.deviceToken && deviceTokenInput) deviceTokenInput.value = stored.deviceToken;
 
   // Check active tab host
   try {
@@ -273,7 +287,7 @@ saveBtn.addEventListener('click', async () => {
     setStatus('Saving to Brain...', 'info');
     const res = await fetch(`${apiUrlInput.value}/api/ingest`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         brain,
         content,
@@ -286,7 +300,11 @@ saveBtn.addEventListener('click', async () => {
     if (!res.ok) throw new Error(`Backend returned HTTP ${res.status}`);
     const saved = await res.json();
 
-    await chrome.storage.local.set({ apiUrl: apiUrlInput.value, lastBrain: brain });
+    await chrome.storage.local.set({
+      apiUrl: apiUrlInput.value,
+      lastBrain: brain,
+      deviceToken: deviceTokenInput ? deviceTokenInput.value : '',
+    });
     setStatus(`✓ Saved to '${brain}' (${saved.action || 'updated'}) — ${result.turns.length} turn(s) recorded!`, 'ok');
   } catch (err) {
     setStatus(`Failed: ${err.message}`, 'err');
@@ -299,7 +317,9 @@ saveBtn.addEventListener('click', async () => {
 copyBtn.addEventListener('click', async () => {
   try {
     const brain = brainSelect.value || 'coding';
-    const res = await fetch(`${apiUrlInput.value}/api/facts?brain=${encodeURIComponent(brain)}`);
+    const res = await fetch(`${apiUrlInput.value}/api/facts?brain=${encodeURIComponent(brain)}`, {
+      headers: getAuthHeaders(),
+    });
     const facts = await res.json();
     const contextPrimer = buildContextPrimer(brain, facts);
     await navigator.clipboard.writeText(contextPrimer);
@@ -313,6 +333,13 @@ apiUrlInput.addEventListener('change', () => {
   chrome.storage.local.set({ apiUrl: apiUrlInput.value });
   checkServer();
 });
+
+if (deviceTokenInput) {
+  deviceTokenInput.addEventListener('change', () => {
+    chrome.storage.local.set({ deviceToken: deviceTokenInput.value });
+    checkServer();
+  });
+}
 
 brainSelect.addEventListener('change', () => {
   chrome.storage.local.set({ lastBrain: brainSelect.value });

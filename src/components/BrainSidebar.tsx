@@ -32,6 +32,7 @@ import {
 } from '../types/brain';
 import { BrainLogo } from './BrainLogo';
 import { GuidedService } from './GuidedConnectionModal';
+import { CaptureHubTab } from './CaptureHubModal';
 
 export type WorkspaceViewMode = 'graph' | 'list' | 'simulator';
 
@@ -58,7 +59,7 @@ interface BrainSidebarProps {
   onToggleRecentActivity: () => void;
   recentActivityCount: number;
   onOpenAddFact: () => void;
-  onOpenIngest: () => void;
+  onOpenIngest: (tab?: CaptureHubTab) => void;
   onOpenGuidedConfig: (service?: GuidedService) => void;
   onExportSnapshot: () => void;
   onSwitchToWelcome: () => void;
@@ -556,17 +557,17 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
             <div className="grid grid-cols-2 gap-1.5">
               <button
                 type="button"
-                onClick={onOpenIngest}
+                onClick={() => onOpenIngest('import')}
                 className="flex items-center justify-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.03] px-2.5 py-1.5 text-xs font-medium text-white/75 transition hover:border-white/25 hover:bg-white/[0.07] hover:text-white whitespace-nowrap"
               >
                 <FileText className="h-3.5 w-3.5 shrink-0" />
-                <span>Ingest Files</span>
+                <span>Capture Hub</span>
               </button>
               <button
                 type="button"
-                onClick={onExportSnapshot}
+                onClick={() => onOpenIngest('export')}
                 className="flex items-center justify-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.03] px-2.5 py-1.5 text-xs font-medium text-white/75 transition hover:border-white/25 hover:bg-white/[0.07] hover:text-white whitespace-nowrap"
-                title="Copy Markdown context snapshot to clipboard"
+                title="Export Brain into portable Markdown (.md)"
               >
                 <Download className="h-3.5 w-3.5 shrink-0" />
                 <span>Export MD</span>
@@ -575,10 +576,10 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
             <div className="flex items-center justify-between pt-1 px-1">
               <button
                 type="button"
-                onClick={() => onOpenGuidedConfig('chatgpt')}
+                onClick={() => onOpenIngest('companion')}
                 className="text-[11px] text-white/50 hover:text-white transition whitespace-nowrap"
               >
-                Connect Web AI & MCP
+                Browser Companion
               </button>
               <button
                 type="button"
@@ -595,9 +596,9 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
           <div className="flex flex-col items-center gap-1.5">
             <button
               type="button"
-              onClick={onExportSnapshot}
+              onClick={() => onOpenIngest('export')}
               className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.06] hover:text-white"
-              title="Export Context Snapshot"
+              title="Export Portable Markdown"
             >
               <Download className="h-4 w-4" />
             </button>

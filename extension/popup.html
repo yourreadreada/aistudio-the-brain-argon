@@ -189,7 +189,9 @@
 
   <div style="margin-top: 10px;">
     <label for="apiUrl" style="font-size: 9.5px; color: #475569;">The Brain Web URL (e.g. http://localhost:3000 or App URL)</label>
-    <input id="apiUrl" value="http://localhost:3000" placeholder="http://localhost:3000 or https://..." style="margin-bottom: 0; padding: 4px 6px; font-size: 10.5px; font-family: monospace;">
+    <input id="apiUrl" value="http://localhost:3000" placeholder="http://localhost:3000 or https://..." style="margin-bottom: 6px; padding: 4px 6px; font-size: 10.5px; font-family: monospace;">
+    <label for="deviceToken" style="font-size: 9.5px; color: #475569;">Device Token (from Capture Hub → Browser Companion)</label>
+    <input id="deviceToken" type="password" value="" placeholder="brn_live_... (optional for local)" style="margin-bottom: 0; padding: 4px 6px; font-size: 10.5px; font-family: monospace;">
   </div>
 
   <script src="popup.js"></script>

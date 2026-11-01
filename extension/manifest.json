@@ -1,11 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Save to Brain",
-  "version": "0.1.0",
-  "description": "One-click save the current AI conversation into your local Brain.",
+  "version": "0.2.0",
+  "description": "One-click capture and inject AI conversations into The Brain memory system.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": [
+    "http://localhost:3000/*",
     "http://localhost:8787/*",
+    "https://*.run.app/*",
     "https://claude.ai/*",
     "https://chatgpt.com/*",
     "https://gemini.google.com/*"
