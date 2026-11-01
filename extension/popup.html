@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {
+    width: 320px;
+    margin: 0;
+    padding: 16px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 13px;
+    background: #060814;
+    color: #e2e8f0;
+    box-sizing: border-box;
+  }
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  }
+  .brand {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: #ffffff;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .badge {
+    font-size: 10px;
+    background: rgba(99, 102, 241, 0.15);
+    color: #a5b4fc;
+    border: 1px solid rgba(99, 102, 241, 0.3);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+  label {
+    display: block;
+    font-size: 11px;
+    color: #94a3b8;
+    margin-bottom: 4px;
+    font-weight: 500;
+  }
+  select, input {
+    width: 100%;
+    background: #0f172a;
+    color: #f8fafc;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    padding: 7px 10px;
+    font-size: 12px;
+    margin-bottom: 12px;
+    box-sizing: border-box;
+    outline: none;
+  }
+  select:focus, input:focus {
+    border-color: #6366f1;
+  }
+  .btn-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 4px;
+  }
+  .btn-primary {
+    width: 100%;
+    padding: 9px 12px;
+    border-radius: 8px;
+    border: none;
+    background: #6366f1;
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  .btn-primary:hover {
+    background: #4f46e5;
+  }
+  .btn-secondary {
+    width: 100%;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    background: rgba(255, 255, 255, 0.05);
+    color: #f1f5f9;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  .btn-secondary:hover {
+    background: rgba(255, 255, 255, 0.1);
+  }
+  button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  #status {
+    margin-top: 12px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    font-size: 11px;
+    line-height: 1.4;
+    display: none;
+  }
+  #status.ok {
+    display: block;
+    background: rgba(16, 185, 129, 0.12);
+    color: #34d399;
+    border: 1px solid rgba(16, 185, 129, 0.25);
+  }
+  #status.err {
+    display: block;
+    background: rgba(239, 68, 68, 0.12);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.25);
+  }
+  #status.info {
+    display: block;
+    background: rgba(99, 102, 241, 0.12);
+    color: #a5b4fc;
+    border: 1px solid rgba(99, 102, 241, 0.25);
+  }
+  .server-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 10.5px;
+    color: #64748b;
+    margin-top: 10px;
+  }
+  .server-status {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    margin-right: 4px;
+    background: #94a3b8;
+  }
+  .server-status.online { background: #10b981; }
+  .server-status.offline { background: #ef4444; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="brand">THE BRAIN</div>
+    <span class="badge">100% Free Companion</span>
+  </div>
+
+  <label for="brainSelect">Active Memory Brain</label>
+  <select id="brainSelect">
+    <option value="coding">coding</option>
+    <option value="college">college</option>
+    <option value="personal">personal</option>
+  </select>
+
+  <div class="btn-group">
+    <!-- 1-Click Inject Memory into Web Chat Input -->
+    <button id="injectBtn" class="btn-primary">
+      Inject Brain Memory into Chat
+    </button>
+
+    <!-- Save Current Web Chat into Brain -->
+    <button id="saveBtn" class="btn-secondary">
+      Save Current Web Chat to Brain
+    </button>
+
+    <!-- Copy formatted context snapshot to clipboard -->
+    <button id="copyBtn" class="btn-secondary">
+      Copy Context Snapshot to Clipboard
+    </button>
+  </div>
+
+  <div id="status"></div>
+
+  <div class="server-row">
+    <span>
+      <span id="serverDot" class="server-status"></span>
+      <span id="serverText">Connecting...</span>
+    </span>
+    <span id="targetSite">ChatGPT / Claude / Gemini</span>
+  </div>
+
+  <div style="margin-top: 10px;">
+    <label for="apiUrl" style="font-size: 9.5px; color: #475569;">The Brain Web URL (e.g. http://localhost:3000 or App URL)</label>
+    <input id="apiUrl" value="http://localhost:3000" placeholder="http://localhost:3000 or https://..." style="margin-bottom: 0; padding: 4px 6px; font-size: 10.5px; font-family: monospace;">
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
