@@ -1,252 +1,338 @@
-# brain
+# The Brain (Argon — Local & Experimental Memory Layer)
 
-A local, multi-source memory that follows you across AI tools — so you stop
-re-explaining the same project, the same topic, the same coding style to
-Claude, GPT, Gemini, and whatever else, every time you switch.
+**The Brain** is a source-aware, persistent personal context and memory layer designed to sit between you and the AI tools you work with.
 
-This is **V1**: the smallest version of the idea that actually works end to
-end. It does one thing — store facts, search them, correct them, and hand
-them to any MCP-compatible AI tool — and does it locally, with nothing to
-host and nothing to maintain.
+The core premise is simple:
 
-## What's in V1
+> **Connect the Brain once → work across different AI tools → carry context and memory between them.**
 
-- **One local SQLite file** (`data/brain.db`) holds everything. No server to
-  run, no account to create.
-- **Brains are just a tag.** Call `remember(brain="coding", ...)` and a
-  "coding" brain exists. Call it with `brain="college"` elsewhere and now
-  there are two. Nothing to configure up front.
-- **Full-text search** (SQLite FTS5) so `recall()` can actually find the
-  relevant fact instead of returning everything.
-- **Every fact remembers its source** (`claude`, `gpt`, `github`, `moodle`,
-  whatever you tag it with), so you can always trace where something came
-  from — the "receipts" idea.
-- **Correction built in.** Any fact can be fixed with `correct(id, new text)`
-  — either by telling the AI in conversation ("no, that's wrong, it's
-  actually X" — the AI calls the tool for you) or by querying `recall()` /
-  `list_facts()` yourself to see the ids and editing directly.
-- **An ingest script** for bulk-loading files: drop markdown chat exports,
-  PDFs, DOCX, XLSX or PPTX into `exports/<source-name>/` and run one command.
+The Brain itself is **not** primarily another AI chatbot. It is the durable context and memory layer that captures conversations, documents, and technical decisions from multiple tools, lets you review and organise them without losing provenance, stores them with full source and document metadata, and exports or injects that context back into your workflows.
 
-## What's deliberately NOT in V1
+---
 
-- **No acting.** Every tool here is read/write to *your own memory*, not to
-  Gmail, Slack, GitHub, etc. The "read-first, act-second" idea means acting
-  comes later, opt-in, per tool — not in the foundation.
-- **No Moodle/Drive/GitHub live connectors.** Those are real integrations
-  (OAuth, APIs) that deserve their own pass. V1 proves the core loop with
-  manually-fed data first.
-- ~~No color-coded UI~~ — added: `brain.web` now serves a live viewer with
-  per-source clusters and click-to-correct.
-- **No smart extraction.** Ingest just chunks raw text — it doesn't ask an
-  LLM to pull out "the facts that matter." That's a good next upgrade, not a
-  V1 requirement.
+## Current Status (Argon Edition)
 
-## Setup
+This repository is the **Argon** implementation of The Brain — the **Local / Experimental Brain** environment used to build, test, and validate local-first persistence, multi-format file extraction, duplicate-safe import review workflows, graph visualization, and browser companion tooling.
 
-```bash
-cd brain
-python3 -m venv .venv
-./.venv/bin/pip install -e .
+### What Currently Exists in This Repository
+
+- **Logical Brain Workspaces**: Separate context namespaces (defaults: `coding`, `college`, `personal`, plus inline creation and deletion of custom Brains).
+- **Source-Aware Constellation & Graph Workspace**: Interactive force-directed neural graph (`InteractiveBrainGraph.tsx`), source cluster view, list/table inspector, global search bar, and slide-over node inspector (`NodeInspector.tsx`).
+- **Capture Hub (`CaptureHubModal.tsx`)**: Unified modal orchestrating four capture and portability workflows:
+  1. **Browser Companion**: Gateway status check, per-browser device token issuance/revocation (`/api/companion/devices`), and extension pairing instructions.
+  2. **Import & Review**: Client-side file/archive extraction feeding directly into `ImportReviewQueue`.
+  3. **Paste Conversation**: Manual transcript or Markdown capture with live duplicate detection, source assignment, and option to stage in the Review Queue or store directly.
+  4. **Portable Export**: Exports any Brain (optionally filtered by AI source) into a portable Markdown (`.md`) snapshot with YAML frontmatter.
+- **Multi-Format Client-Side Extraction (`src/services/fileExtractor.ts`)**:
+  - `.zip` archives (unpacked client-side via `JSZip`, extracting supported inner files and official `conversations.json` exports)
+  - `.json` (ChatGPT `mapping` trees and Claude `chat_messages` arrays)
+  - `.pdf` (page-by-page text extraction via `pdfjs-dist`)
+  - `.docx` (Word raw text extraction via `mammoth`)
+  - `.xlsx` / `.xls` (spreadsheet sheet-to-pipe-table extraction via `xlsx`)
+  - `.pptx` (PowerPoint slide XML `<a:t>` parsing via `JSZip` + `DOMParser`)
+  - `.md`, `.markdown`, `.txt`, `.csv`
+  - `.png`, `.jpg`, `.jpeg`, `.webp` (image metadata & reference node creation)
+- **`ImportReviewQueue` v1 (`src/components/ImportReviewQueue.tsx`)**:
+  - Staged review layer between file extraction and permanent persistence.
+  - Per-item and bulk actions (**Create**, **Merge**, **Replace**, **Skip**, **Retry**).
+  - 5-state duplicate detection (**New**, **Possible duplicate**, **Exact duplicate**, **Related content**, **Unable to determine**) with strict overwrite protection.
+  - Bounded concurrency (`runWithControlledConcurrency`) for bulk operations.
+  - Real determinate progress (`current / total` pages, archive entries, slides, sheets, records, or chunks) when measurable, and honest indeterminate progress (`Processing…`) when single-request HTTP operations do not expose streaming progress.
+  - Responsive layout: structured table on desktop (`lg+`) and adaptive review cards on mobile, tablet, and foldable screens.
+- **Durable Backend-Confirmed Persistence (`src/services/brainStorage.ts` + `server.ts`)**:
+  - Embedded SQLite database (`data/brain.db` via Node `node:sqlite` in `server.ts` and Python `sqlite3` in `src/brain/db.py`).
+  - Queue items transition to `Imported` **only** after the backend confirms persistence (`POST /api/remember` or `POST /api/correct`).
+- **Semantic Chunking & Incremental Diff Merge (`src/services/semanticChunker.ts`)**:
+  - Splits documents and chat transcripts into structured `SemanticSection` blocks (chat turns, headings, slides, sheets, code blocks, paragraphs).
+  - Computes incremental diffs (`detectIncrementalDiff`) and records an auditable `mergeHistory` on each node.
+- **Python MCP Server & CLI Scripts (`src/brain/`)**:
+  - Local Model Context Protocol (MCP) stdio server (`src/brain/server.py`) exposing `remember`, `recall`, `correct`, `forget`, and `list_brains` to Claude Desktop / Claude Code.
+  - CLI bulk-ingestion scripts (`src/brain/ingest.py`, `src/brain/import_export.py`, `src/brain/extract.py`).
+
+---
+
+## Current Workflow
+
+The Brain is built around a six-stage lifecycle:
+
+```text
+CAPTURE → REVIEW → ORGANISE → STORE → RECALL → EXPORT
 ```
 
-## Running it
+1. **CAPTURE**: Collect raw knowledge from files, `.zip` account exports, pasted transcripts, or the Browser Companion extension.
+2. **REVIEW**: Inspect staged items in `ImportReviewQueue` before anything is written to permanent storage. Inspect detected source, item/turn counts, content preview, and duplicate analysis.
+3. **ORGANISE**: Assign or edit the item title, source origin (`claude`, `gpt`, `gemini`, `github`, `moodle`, `cursor`, `local-ai`), destination Brain, tags, and node structure strategy (`Unified`, `Branching`, or `Sliced`).
+4. **STORE**: Execute user-confirmed persistence (`Create`, `Merge`, or `Replace`) against the backend SQLite store. Items are marked `Imported` only after backend confirmation.
+5. **RECALL**: Search, filter by source or file type, inspect semantic sections and merge history in the graph or list view, or query via the MCP server / REST API.
+6. **EXPORT**: Generate a portable Markdown (`.md`) file or context primer to carry your Brain into another AI tool or workspace.
 
-As an MCP server (stdio transport — this is what Claude Desktop / Claude
-Code will launch):
+### Detailed Import & Review Pipeline
 
-```bash
-./.venv/bin/python -m brain.server
+Every file or pasted conversation follows this explicit pipeline:
+
+```text
+File / Transcript
+  → Extract (client-side parser with determinate/indeterminate progress)
+  → Detect source & file type
+  → Check duplicates against destination Brain
+  → Stage in ImportReviewQueue
+  → User resolution (Create / Merge / Replace / Skip)
+  → Persist via backend API (/api/remember or /api/correct)
+  → Confirm durable write
+  → Imported (or Error + Retry)
 ```
 
-To connect it to **Claude Desktop** or **Claude Code**, add it to your MCP
-config (usually `claude_desktop_config.json` or the equivalent for Claude
-Code):
+### Duplicate Detection & Resolution Safety Rules
 
-```json
-{
-  "mcpServers": {
-    "brain": {
-      "command": "/absolute/path/to/brain/.venv/bin/python",
-      "args": ["-m", "brain.server"]
-    }
-  }
-}
+For every queued item, `brainStore.checkExistingFileNode` inspects the destination Brain without modifying existing data and classifies the item into one of five states:
+
+| Duplicate State | Meaning | Default Resolution | Safety Rule |
+| :--- | :--- | :--- | :--- |
+| **New** (`new`) | No matching file path, title, or overlapping content in destination Brain. | `Create` | Safe to create as a new node. |
+| **Exact duplicate** (`exact_duplicate`) | Identical content already exists in destination Brain. | `Skip` | Defaults to `Skip` to prevent redundant nodes; user can still explicitly override. |
+| **Possible duplicate** (`possible_duplicate`) | Matches an existing node's file path, filename, or title with updated/different content. | `Ask user` (`undecided`) | Never auto-overwrites; user chooses `Merge`, `Replace`, `Create`, or `Skip`. |
+| **Related content** (`related_content`) | Different filename/title, but shares partial content or semantic section overlap with an existing node. | `Ask user` (`undecided`) | User chooses whether to `Merge` into the related node, `Create` a separate node, or `Skip`. |
+| **Unable to determine** (`unable_to_determine`) | Empty/unreadable content or unverified state. | `Ask user` (`undecided`) | **Never silently allows Merge or Replace.** Excluded from bulk Merge/Replace; requires explicit per-item confirmation. |
+
+---
+
+## Architecture
+
+The repository combines a TypeScript/React + Express full-stack web application (`server.ts` + `src/`) with a Python MCP & CLI package (`src/brain/`) and a Manifest V3 browser extension (`extension/`):
+
+```text
+/
+├── server.ts                         # Express API gateway + Vite middleware + Node SQLite (data/brain.db)
+├── index.html                        # Web app entry point
+├── package.json                      # Node/React/Vite dependencies and scripts
+├── pyproject.toml / requirements.txt # Python MCP server & CLI extraction dependencies
+├── data/
+│   └── brain.db                      # Local SQLite database file
+├── extension/                        # Manifest V3 Browser Companion extension (Chrome/Edge/Brave)
+│   ├── manifest.json
+│   ├── popup.html
+│   ├── popup.js
+│   └── README.md
+└── src/
+    ├── App.tsx                       # Root application layout, collapsible sidebar, view switching
+    ├── types/
+    │   └── brain.ts                  # Shared TypeScript interfaces (Fact, AISource, DuplicateDetectionState, etc.)
+    ├── services/
+    │   ├── brainStorage.ts           # State store, duplicate detection, durable persistence, Markdown export
+    │   ├── fileExtractor.ts          # Client-side parsers (.zip, .pdf, .docx, .xlsx, .pptx, .json, .md, .txt, .csv)
+    │   └── semanticChunker.ts        # Semantic section parser and incremental diff engine
+    ├── components/
+    │   ├── CaptureHubModal.tsx       # 4-tab Capture Hub workflow orchestrator
+    │   ├── ImportReviewQueue.tsx     # Reusable review/decision queue (single & bulk actions, progress, responsive UI)
+    │   ├── InteractiveBrainGraph.tsx # Force-directed neural graph canvas
+    │   ├── NodeInspector.tsx         # Slide-over fact/document inspector with semantic sections & merge history
+    │   ├── FactPanel.tsx             # List/table memory browser
+    │   ├── McpBridgeModal.tsx        # Claude Desktop MCP configuration generator
+    │   └── ...                       # Header, search, modals, and supporting UI components
+    └── brain/                        # Python MCP server & CLI tools
+        ├── db.py                     # Python SQLite + FTS5 storage layer
+        ├── server.py                 # MCP stdio server (remember, recall, correct, forget, list_brains)
+        ├── extract.py                # Python document & OCR extractor
+        ├── ingest.py                 # CLI directory ingestion tool
+        ├── import_export.py          # CLI ChatGPT/Claude ZIP importer
+        └── web.py                    # Standalone lightweight Python HTTP viewer
 ```
 
-Restart the client, and it'll have four tools available: `remember`,
-`recall`, `correct`, `forget`, and `list_brains`.
+---
 
-## Viewing and correcting it
+## Brain Data Model
 
-Two viewers now exist, both reading/writing the same `brain.db` through the
-same backend:
+The data model in `src/types/brain.ts` and `server.ts` is built around traceable, source-aware knowledge nodes:
 
-**Simple built-in viewer** — the per-source network visualization, no
-install beyond the backend itself:
+### 1. Brain
+A logical workspace/namespace string (e.g., `coding`, `college`, `personal`). Facts belong to a specific Brain so unrelated contexts do not pollute each other.
 
-```bash
-./.venv/bin/python -m brain.web
+### 2. Fact / Knowledge Node (`Fact`)
+A stored unit of knowledge or unified document context persisted in the `facts` SQLite table:
+- `id`: Numeric primary key assigned by the backend database.
+- `brain`: Target Brain workspace name.
+- `content`: Markdown or structured text content.
+- `source`: Origin `AISource` identifier.
+- `tags`: Optional array of lowercase topic tags.
+- `created_at` / `updated_at`: ISO-8601 timestamps.
+
+### 3. Supported Sources (`AISource`)
+Only the following seven sources are defined and color-coded in `SOURCE_PALETTE`:
+- `claude` — **Claude** (Anthropic Claude conversations & reasoning exports)
+- `gpt` — **ChatGPT** (OpenAI ChatGPT conversations & exports)
+- `gemini` — **Gemini** (Google Gemini analysis & research chats)
+- `github` — **GitHub** (Commits, pull requests, issues, code diffs)
+- `moodle` — **Moodle** (Academic syllabi, assignments, lecture slides, grade sheets)
+- `cursor` — **Cursor / Antigravity** (IDE composer sessions & agent logs)
+- `local-ai` — **Local AI / Ollama** (Local LLM runs, Llama/Qwen/Mistral outputs)
+
+### 4. Document Metadata, Semantic Sections & Merge History
+To keep imported files traceable and maintainable rather than fragmenting them into anonymous text snippets, each `Fact` node also supports:
+- `fileType`: `'pdf' | 'docx' | 'xlsx' | 'pptx' | 'code' | 'md' | 'img' | 'chat'`
+- `fileName` & `filePath`: Original file name and relative path (used for deterministic duplicate detection).
+- `documentTitle`: Human-readable document or conversation title.
+- `isDocumentRoot` & `isUnifiedContextNode`: Flags indicating whether the node represents a unified document root.
+- `parentId`: Optional parent `Fact.id` when using the `Branching` ingestion strategy (where a root hub node links to child turn/section nodes).
+- `semanticSectionCount`: Number of structured `SemanticSection` blocks (`chat-turn`, `heading`, `slide`, `sheet`, `code-block`, `paragraph`) parsed from the content.
+- `mergeHistory`: Array of `FactMergeRecord` entries (`timestamp`, `action: 'created' | 'merged' | 'appended' | 'updated'`, `summary`, `previousContentLength`, `newContentLength`) providing an audit trail of how a node evolved over time.
+
+---
+
+## Project Architecture Direction: Local (Argon) vs. Production (GPT)
+
+Development of The Brain is intentionally split across two complementary environments:
+
+| Aspect | Argon Repository (This Repo) | GPT Repository (Cloud Production) |
+| :--- | :--- | :--- |
+| **Role** | **Local / Experimental Brain** | **Cloud / Production Brain** |
+| **Storage & Auth** | Local SQLite (`data/brain.db`) + local cache fallback + local device tokens | Supabase Auth + Supabase Postgres + Vercel authenticated API gateway |
+| **Primary Focus** | Rapid UX iteration, local/offline-first workflows, file extraction, `ImportReviewQueue`, MCP server, browser companion experiments | Multi-tenant cloud security, production authentication, hosted cloud persistence |
+
+### Shared Concepts, Distinct Implementations
+Argon is **not** meant to be blindly overwritten with the cloud production stack, nor is the production stack meant to adopt unvalidated local prototypes. Instead, both versions share core domain concepts and TypeScript contracts (`Brain`, `Fact`, `AISource`, `ImportReviewItem`, `DuplicateDetectionState`, `ImportItemProgress`) while following this lifecycle:
+
+```text
+Argon experiment
+  → Validate behavior, data model & UX locally
+  → Adapt proven contracts to production cloud architecture
+  → Test & deploy
 ```
 
-Open `http://localhost:8787`. Each AI source gets its own cluster around a
-central hub, every fact is a node, click one to edit (`correct()`) or delete
-(`forget()`) it.
+Long-term, this shared contract foundation enables potential **Local Brain ↔ Cloud Brain synchronization** and hybrid offline/online modes.
 
-**Full frontend** — a much more complete React app living in this same
-repo (`src/components/`, `src/services/`, alongside `src/brain/`): pan/zoom
-graph view, list view, global search, tags, a recent-activity log, an
-"Add fact" / "Ingest" flow (now with its own client-side file extraction
-for PDF/XLSX — see `src/services/fileExtractor.ts`), and an MCP-bridge
-panel that generates the exact Claude Desktop config for `brain.server`.
-This one started life as an AI Studio prototype that was explicitly built
-to replicate another product's look — it's been cleaned of that branding
-and copy, and its storage layer (`src/services/brainStorage.ts`) talks to
-this same Python backend (`brain.web`'s API) instead of the browser's
-local storage, so this view, the simple viewer above, and the MCP server
-all see identical data. Tags and the recent-activity log are still a
-local-only convenience layer for now (not yet in the Python schema) — see
-"Where this goes next."
+---
 
-To run it:
+## Browser Companion (`extension/`)
+
+The repository includes an unpacked Chromium Manifest V3 extension in `extension/` ("Save to Brain"):
+
+### How It Works
+1. **Device Token Authentication**:
+   - In the web app, open **Capture Hub → 1. Browser Companion** to issue a per-browser device token (`brn_live_...`) stored in the `companion_devices` SQLite table via `POST /api/companion/devices`.
+   - Paste the Gateway URL (e.g., `http://localhost:3000`) and Device Token into the extension popup (`extension/popup.html`).
+   - All extension API calls attach `Authorization: Bearer <token>`, updating `last_used_at` telemetry on the backend, and tokens can be revoked at any time.
+2. **Active-Tab Conversation Capture**:
+   - Clicking **Save Current Chat to Brain** executes a DOM extraction script (`extractConversation` in `extension/popup.js`) on the active browser tab and sends the formatted Markdown dialogue to `POST /api/ingest`.
+3. **Cross-AI Context Injection**:
+   - Clicking **Inject Brain into Prompt** fetches stored facts for the selected Brain (`GET /api/facts?brain=...`), formats a grounding context block, and injects it into the active chat input box (or copies it to the clipboard as a fallback).
+
+### Current Browser Companion Limitations
+- **Supported Web Hosts**: Host permissions and DOM selectors in `extension/manifest.json` and `extension/popup.js` currently target only **ChatGPT Web** (`https://chatgpt.com/*`), **Claude Web** (`https://claude.ai/*`), and **Google Gemini Web** (`https://gemini.google.com/*`).
+- **DOM Selector Fragility**: Because ChatGPT, Claude, and Gemini web interfaces update their DOM structure frequently, CSS selectors in `extension/popup.js` are best-effort and may require maintenance when providers change their markup.
+- **User-Initiated Only**: Capture and injection only run when the user clicks the extension popup buttons on the active tab; there is no background scraping of closed tabs or unauthorized third-party sites.
+
+---
+
+## Development Principles
+
+All contributions to The Brain follow ten core engineering principles:
+
+1. **Do not create duplicate persistence systems.** Reuse the existing durable storage and backend API pipeline (`persistReviewedItem` / `/api/remember` / `/api/correct`).
+2. **Do not silently overwrite user knowledge.** Duplicate detection must surface conflicts clearly and require explicit user confirmation before replacing or merging ambiguous items.
+3. **Every import should be traceable.** Preserve source (`AISource`), original file name/path, document title, semantic section counts, and merge history.
+4. **Failures should be retryable.** Never optimistically mark an import, merge, or replace operation as `Imported` before backend confirmation. Keep failed items in the queue with their error message and a `Retry` action.
+5. **Bulk operations must remain item-independent.** If 9 items succeed and 1 fails during a bulk action, 9 items must remain `Imported` and 1 item must show `Error + Retry`. Never mark the entire batch as failed or lose user decisions on other items.
+6. **Progress must be real, never fabricated.** Display a determinate percentage (`current / total`) only when the underlying operation reports measurable units (e.g., pages, archive entries, chunks, records). Use an indeterminate indicator (`Processing…`) otherwise.
+7. **Local Argon and cloud GPT should share concepts, not necessarily implementation.** Keep data models and component contracts compatible while respecting Argon's local/experimental architecture.
+8. **Experimental features should be validated before production adoption.** Prove workflows end-to-end in Argon before porting them to the cloud production repository.
+9. **Privacy and user control are first-class requirements.** Users decide what enters their Brain, which destination workspace it belongs to, and when device tokens are revoked or memories are deleted.
+10. **Automatic memory should eventually be intelligent rather than blindly storing everything.** Future automated capture must filter for high-signal, durable context rather than dumping raw noise.
+
+---
+
+## Roadmap / Planned
+
+> **Note:** The items below represent the **planned roadmap** and are **not** yet implemented in the current repository.
+
+### 1. Foundation (Completed / Refining in v1)
+- [x] `ImportReviewQueue` v1 with individual and bulk actions
+- [x] 5-state duplicate and conflict handling with overwrite safeguards
+- [x] Bulk imports with bounded concurrency and real per-item progress
+- [x] Portable Brain Markdown export format
+- [x] Responsive desktop, tablet, mobile, and foldable review UI
+
+### 2. Connectivity (Planned)
+- [ ] Unified AI Connection Framework for provider-specific integrations
+- [ ] Hardened browser extension selectors and live DOM change resilience
+- [ ] Direct read-first connectors for GitHub and Moodle APIs
+- [ ] Streamlined cross-AI context injection templates
+- [ ] Optional automatic sync where provider APIs and terms technically permit
+
+### 3. Memory Intelligence (Planned)
+- [ ] LLM-assisted automatic memory extraction (distilling durable facts from raw chat transcripts)
+- [ ] Configurable memory modes: **Manual** / **Assisted** / **Automatic**
+- [ ] Relevance scoring, confidence indicators, and semantic deduplication
+- [ ] Memory audit log with granular forget, edit, and disable controls
+
+### 4. Privacy & Access Control (Planned)
+- [ ] Explicit per-provider read/write permission scopes
+- [ ] One-click pause for automatic memory capture
+- [ ] Provider disconnect and selective memory purge controls
+
+### 5. Long-Term Direction (Planned)
+- [ ] Bidirectional **Local ↔ Cloud Brain synchronization**
+- [ ] Seamless hybrid/offline mode with conflict-free replication
+- [ ] Persistent context handoff across AI providers
+
+*Important Constraint:* Provider capabilities, browser sandboxing, and platform API policies strictly govern what can be synchronized automatically. The Brain does not promise unrestricted background access to third-party AI conversations.
+
+---
+
+## Known Limitations
+
+- **Single-Request Backend Progress**: Standard JSON `POST /api/remember` and `POST /api/correct` calls do not stream byte-level upload progress; single-node persistence therefore displays an honest indeterminate state (`Processing…`), whereas multi-page extraction (`.pdf`, `.zip`, `.pptx`, `.xlsx`) and multi-chunk/branching persistence display determinate progress (`current / total`).
+- **Scanned Image PDFs in Client-Side Extractor**: The browser-side PDF parser (`pdfjs-dist` in `src/services/fileExtractor.ts`) extracts embedded PDF text layers. Scanned image-only PDFs without a text layer require the Python OCR pipeline (`src/brain/extract.py` with system `tesseract-ocr`).
+- **Recent Activity Log**: The recent activity feed is currently maintained client-side alongside the SQLite-backed `facts` and `companion_devices` tables.
+
+---
+
+## Development & Setup Instructions
+
+### 1. Full-Stack Web Application (Node.js + React + Vite + SQLite)
+
+**Prerequisites**: Node.js v22.5+ (uses the built-in `node:sqlite` module in `server.ts`).
 
 ```bash
-# terminal 1 — the backend, serves the API everything else talks to
-./.venv/bin/python -m brain.web
+# Install dependencies
+npm install
 
-# terminal 2 — the frontend (run from the repo root)
-npm install --legacy-peer-deps   # the pinned vite version needs this flag
+# Start the Express + Vite development server on http://localhost:3000
 npm run dev
 ```
 
-Open the Vite dev server URL it prints (usually `http://localhost:3000`).
-If the backend runs on a different host/port, copy `.env.local.example` to
-`.env.local` and set `VITE_BRAIN_API_URL` accordingly.
-
-## Bulk-importing your actual chat history
-
-Claude.ai and ChatGPT both let you export your entire account's conversation
-history in one shot — Claude: Settings → Privacy → Export data; ChatGPT:
-Settings → Data controls → Export data. Both email you a zip. Point this at
-it and it goes straight into the brain, no manual per-chat copying:
+Additional scripts from `package.json`:
 
 ```bash
-./.venv/bin/python -m brain.import_export --platform claude --zip export.zip --brain coding
-./.venv/bin/python -m brain.import_export --platform chatgpt --zip export.zip --brain coding
+# Type-check the TypeScript codebase
+npm run lint
+
+# Build the production frontend bundle into dist/
+npm run build
+
+# Start the server
+npm start
 ```
 
-Each conversation becomes one fact, source tagged `claude`/`gpt`, and
-re-running it after a fresh export only adds what's new or changed — same
-dedup/merge behavior as the file ingest path. Built against each platform's
-current export shape (Claude: a flat list of conversations; ChatGPT: a
-branching tree of message nodes, since regenerated replies create
-branches — this follows the main branch only). These formats aren't
-guaranteed stable across platform updates; if a run errors out, it's most
-likely a changed field name, not a logic bug.
+The server automatically creates `data/brain.db` on first launch and seeds initial sample nodes if the database is empty.
 
-## Capturing new chats as you go
+### 2. Browser Companion Extension (`extension/`)
 
-The bulk import above handles catching up on history. For every
-conversation *after* that, there's `extension/` — a browser extension with
-one button: save the chat you're currently looking at (Claude, ChatGPT, or
-Gemini) straight into the brain. No export, no file. See
-`extension/README.md` for loading it and — importantly — for the one part
-of it that's an unverified best guess (the per-site selectors that find
-each message on the page).
+1. Open Chrome, Brave, or Edge and navigate to `chrome://extensions`.
+2. Enable **Developer mode** (top-right toggle).
+3. Click **Load unpacked** and select the `extension/` directory in this repository.
+4. Open the web app at `http://localhost:3000`, open **Capture Hub → 1. Browser Companion**, issue a Device Token, and paste the Gateway URL and token into the extension popup.
 
-## Loading files in — chats, and now college material
+### 3. Optional Python MCP Server & CLI Tools (`src/brain/`)
 
-Supported file types: `.md`, `.txt`, `.pdf`, `.docx`, `.xlsx`, `.pptx`.
-Anything else in a source folder is skipped with a note, not an error.
-Each format's text layer gets extracted, and any embedded images (a
-scanned page, a diagram, a photo of a whiteboard) get OCR'd too — so text
-*inside* an image isn't invisible to the brain. OCR only reads text that's
-actually in the image; it won't describe a chart's shape or what's in a
-photo, and handwriting recognition is hit-or-miss. Tables come through as
-pipe-separated rows, each PDF page / sheet / slide becomes its own chunk
-boundary. See `extract.py` for exactly what each format does.
+If you want to connect the local `data/brain.db` to Claude Desktop / Claude Code via MCP or run the Python CLI ingestion scripts:
 
-OCR needs the Tesseract binary installed on your system (not just the pip
-package) — `sudo apt install tesseract-ocr` on Debian/Ubuntu, `brew install
-tesseract` on macOS. Without it, everything else still works; image text
-just won't get picked up.
+```bash
+python3 -m venv .venv
+./.venv/bin/pip install -e .
 
-1. Sort files into one folder per source — same idea whether it's an AI
-   chat export or a Moodle download:
+# Run the MCP stdio server
+./.venv/bin/python -m brain.server
 
-   ```
-   exports/
-     claude/
-       project-x-planning.md
-     gpt/
-       project-x-debugging.md
-     moodle/
-       syllabus.pdf
-       assignment-3.docx
-       marks.xlsx
-       lecture-12.pptx
-   ```
-
-2. Run:
-
-   ```bash
-   ./.venv/bin/python -m brain.ingest --source-dir ./exports --brain coding
-   ```
-
-   Everything gets extracted, chunked into facts, tagged with the folder
-   name as its source (`claude`, `gpt`, `moodle`, ...), and stored in the
-   brain you named. Run it again with `--brain college` for a different
-   export set — e.g. point it at a `moodle/` folder full of downloaded
-   course material.
-
-## Project layout
-
-This is one repo — Python backend and React frontend sit side by side
-under `src/`, not split into separate projects:
-
+# Or run the standalone Python web viewer on http://localhost:8787
+./.venv/bin/python -m brain.web
 ```
-src/
-  brain/              # Python backend
-    db.py             # SQLite storage, full-text search, file dedup/merge
-    server.py         # MCP server — the tools an AI can call
-    ingest.py         # bulk-load files (md/txt/pdf/docx/xlsx/pptx)
-    extract.py        # per-format text + OCR extraction used by ingest.py
-    import_export.py  # parse official Claude/ChatGPT export zips directly in
-    web.py             # local API + the simple built-in viewer below
-    static/
-      index.html      # the simple viewer, wired to real data
-  components/         # the full React app's UI
-  services/
-    brainStorage.ts   # talks to brain.web's API (not localStorage)
-    fileExtractor.ts  # client-side PDF/XLSX/etc. extraction for the Ingest modal
-    semanticChunker.ts
-extension/            # "Save to Brain" browser extension (see its own README)
-data/
-  brain.db            # created on first run, gitignore this
-requirements.txt       # Python deps
-pyproject.toml
-package.json            # frontend deps
-```
-
-## Where this goes next
-
-Roughly in order of what'd matter most:
-
-1. **Try it for real** — connect the MCP server to Claude, bulk-import a
-   real export, see where `recall()` actually falls short (probably: still
-   some awkward fragments on the file-ingest path even with semantic
-   sectioning; worth an LLM pass to extract cleaner facts before storing).
-2. **Fix the extension's selectors against the real, live sites** — see
-   `extension/README.md`. This is the one piece that couldn't be verified
-   end to end while building it.
-3. **More live connectors** (GitHub, Moodle, Drive) using
-   read-first/act-second, same pattern as the chat-export parsers.
-4. **Give tags and recent-activity a real backend home** — right now
-   `src/services/brainStorage.ts` keeps those local-only (localStorage)
-   since the Python schema has no columns for them yet. If they turn out
-   to matter day to day, add a `tags` column and an `activity` table to
-   `db.py` and move them over.
-5. **Real image understanding, not just OCR** — a vision model call per
-   embedded image (what's actually in a chart, a photo, a diagram) would
-   go beyond reading text-in-images, at the cost of an API call per image.
-   Worth it once OCR's limits actually start showing up, not before.

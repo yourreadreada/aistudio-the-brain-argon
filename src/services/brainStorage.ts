@@ -975,10 +975,11 @@ class BrainStorageService {
   /**
    * Checks if an incoming file or conversation matches an existing node in the destination brain,
    * classifying it into:
-   * - 'new'
-   * - 'possible_duplicate'
-   * - 'exact_duplicate'
-   * - 'unable_to_determine'
+   * - 'new'               (New -> Create)
+   * - 'exact_duplicate'   (Exact duplicate -> Skip by default)
+   * - 'possible_duplicate'(Possible duplicate -> Ask user)
+   * - 'related_content'   (Related content -> Ask user / appropriate merge flow)
+   * - 'unable_to_determine' (Unable to determine -> Ask user; never silently Merge or Replace)
    * Does NOT modify any existing content.
    */
   public checkExistingFileNode(
@@ -994,9 +995,10 @@ class BrainStorageService {
         hasDiff: false,
         isIdentical: false,
         newSectionsDetected: 0,
-        recommendedAction: 'skip',
+        recommendedAction: 'ask_user',
         duplicateState: 'unable_to_determine',
-        summary: 'Unable to determine duplicate status (empty content or destination)',
+        summary:
+          'Unable to determine duplicate status — explicit user choice required',
       };
     }
 
@@ -1011,78 +1013,123 @@ class BrainStorageService {
       const incomingTrimmed = content.trim();
       const incomingBody = stripHeader(incomingTrimmed);
 
-      // 1. Check by file path, file name, or title
-      let existingFact = this.findNodeByFilePath(
+      // 1. Check by file path, file name, or document title (same logical file/document)
+      const pathOrTitleMatch = this.findNodeByFilePath(
         resolvedBrain,
         filePath || fileName,
         title
       );
 
-      // 2. If not matched by filename/title, check if any fact in the destination brain has identical content
-      if (!existingFact) {
-        const bFacts = this.facts.filter((f) => f.brain === resolvedBrain);
-        existingFact = bFacts.find((f) => {
-          const fTrimmed = f.content.trim();
-          const fBody = stripHeader(fTrimmed);
-          return (
-            fTrimmed === incomingTrimmed ||
-            (incomingBody.length > 0 && fBody === incomingBody)
-          );
-        });
-      }
+      if (pathOrTitleMatch) {
+        const diff = detectIncrementalDiff(
+          pathOrTitleMatch.content,
+          content,
+          pathOrTitleMatch.fileType,
+          fileName
+        );
+        const isExact =
+          diff.isIdentical ||
+          pathOrTitleMatch.content.trim() === incomingTrimmed ||
+          stripHeader(pathOrTitleMatch.content) === incomingBody;
 
-      // 3. If still not matched, check if any fact in the destination brain has partial content overlap
-      if (!existingFact && incomingBody.length >= 40) {
-        const bFacts = this.facts.filter((f) => f.brain === resolvedBrain);
-        existingFact = bFacts.find((f) => {
-          const fBody = stripHeader(f.content);
-          return (
-            fBody.length >= 40 &&
-            (fBody.includes(incomingBody) || incomingBody.includes(fBody))
-          );
-        });
-      }
-
-      if (!existingFact) {
         return {
-          exists: false,
-          hasDiff: false,
-          isIdentical: false,
-          newSectionsDetected: 0,
-          recommendedAction: 'merge',
-          duplicateState: 'new',
-          summary: `New content for "${resolvedBrain}"`,
+          exists: true,
+          existingFact: pathOrTitleMatch,
+          hasDiff: !isExact && diff.hasNewContent,
+          isIdentical: isExact,
+          newSectionsDetected: isExact ? 0 : Math.max(1, diff.newSections.length),
+          existingSectionsCount: pathOrTitleMatch.semanticSectionCount || 1,
+          summary: isExact
+            ? `Exact duplicate of Node #${pathOrTitleMatch.id} (Skip by default)`
+            : diff.summary ||
+              `Possible duplicate of Node #${pathOrTitleMatch.id} — choose Merge, Replace, or Skip`,
+          recommendedAction: isExact ? 'skip' : 'ask_user',
+          duplicateState: isExact ? 'exact_duplicate' : 'possible_duplicate',
         };
       }
 
-      const diff = detectIncrementalDiff(
-        existingFact.content,
-        content,
-        existingFact.fileType,
-        fileName
-      );
+      const bFacts = this.facts.filter((f) => f.brain === resolvedBrain);
 
-      const isExact =
-        diff.isIdentical ||
-        existingFact.content.trim() === incomingTrimmed ||
-        stripHeader(existingFact.content) === incomingBody;
+      // 2. Check if any fact in the destination brain has identical content (even under a different filename)
+      const exactContentMatch = bFacts.find((f) => {
+        const fTrimmed = f.content.trim();
+        const fBody = stripHeader(fTrimmed);
+        return (
+          fTrimmed === incomingTrimmed ||
+          (incomingBody.length > 0 && fBody === incomingBody)
+        );
+      });
 
-      const duplicateState: DuplicateDetectionState = isExact
-        ? 'exact_duplicate'
-        : 'possible_duplicate';
+      if (exactContentMatch) {
+        return {
+          exists: true,
+          existingFact: exactContentMatch,
+          hasDiff: false,
+          isIdentical: true,
+          newSectionsDetected: 0,
+          existingSectionsCount: exactContentMatch.semanticSectionCount || 1,
+          summary: `Exact duplicate of Node #${exactContentMatch.id} (Skip by default)`,
+          recommendedAction: 'skip',
+          duplicateState: 'exact_duplicate',
+        };
+      }
 
+      // 3. Check for Related Content: partial content overlap or shared semantic sections in destination brain
+      let relatedFact: Fact | undefined = undefined;
+      if (incomingBody.length >= 35) {
+        relatedFact = bFacts.find((f) => {
+          const fBody = stripHeader(f.content);
+          if (fBody.length >= 35 && (fBody.includes(incomingBody) || incomingBody.includes(fBody))) {
+            return true;
+          }
+          // Check if semantic sections share identical turns/headings
+          const relDiff = detectIncrementalDiff(
+            f.content,
+            content,
+            f.fileType,
+            fileName
+          );
+          const totalIncomingSections =
+            relDiff.newSections.length + (relDiff.mergedSectionsCount > 0 ? 1 : 0);
+          return (
+            !relDiff.isIdentical &&
+            relDiff.newSections.length > 0 &&
+            relDiff.mergedSectionsCount > relDiff.newSections.length &&
+            totalIncomingSections > 1 &&
+            f.content.split('\n\n').some((block) => block.trim().length > 40 && incomingBody.includes(block.trim()))
+          );
+        });
+      }
+
+      if (relatedFact) {
+        const diff = detectIncrementalDiff(
+          relatedFact.content,
+          content,
+          relatedFact.fileType,
+          fileName
+        );
+        return {
+          exists: true,
+          existingFact: relatedFact,
+          hasDiff: true,
+          isIdentical: false,
+          newSectionsDetected: Math.max(1, diff.newSections.length),
+          existingSectionsCount: relatedFact.semanticSectionCount || 1,
+          summary: `Related content to Node #${relatedFact.id} — choose Create, Merge, or Skip`,
+          recommendedAction: 'ask_user',
+          duplicateState: 'related_content',
+        };
+      }
+
+      // 4. New content
       return {
-        exists: true,
-        existingFact,
-        hasDiff: !isExact && diff.hasNewContent,
-        isIdentical: isExact,
-        newSectionsDetected: isExact ? 0 : Math.max(1, diff.newSections.length),
-        existingSectionsCount: existingFact.semanticSectionCount || 1,
-        summary: isExact
-          ? `Exact match with Node #${existingFact.id}`
-          : diff.summary || `Matches Node #${existingFact.id} with updated content`,
-        recommendedAction: isExact ? 'skip' : 'merge',
-        duplicateState,
+        exists: false,
+        hasDiff: false,
+        isIdentical: false,
+        newSectionsDetected: 0,
+        recommendedAction: 'create',
+        duplicateState: 'new',
+        summary: `New item — ready to create in "${resolvedBrain}"`,
       };
     } catch {
       return {
@@ -1090,9 +1137,10 @@ class BrainStorageService {
         hasDiff: false,
         isIdentical: false,
         newSectionsDetected: 0,
-        recommendedAction: 'skip',
+        recommendedAction: 'ask_user',
         duplicateState: 'unable_to_determine',
-        summary: 'Unable to determine duplicate status',
+        summary:
+          'Unable to determine duplicate status — explicit user choice required',
       };
     }
   }

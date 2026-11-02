@@ -24,7 +24,12 @@ import {
   SOURCE_PALETTE,
 } from '../types/brain';
 
-export type ReviewResolutionAction = 'create' | 'merge' | 'replace' | 'skip';
+export type ReviewResolutionAction =
+  | 'create'
+  | 'merge'
+  | 'replace'
+  | 'skip'
+  | 'undecided';
 
 export type ReviewItemStatus =
   | 'extracting'
@@ -38,11 +43,13 @@ export type ReviewItemStatus =
   | 'error';
 
 /**
- * Per-item progress state.
+ * Reusable progress model for queue items, large file extraction, bulk imports,
+ * and future background synchronization.
+ *
  * - Use `mode: 'determinate'` ONLY when `current` and `total` come from a real,
- *   measurable operation (e.g. bytes uploaded / total bytes, records processed / total records,
- *   chunks persisted / total chunks, or pages extracted / total pages).
- * - Use `mode: 'indeterminate'` when the underlying backend request does not expose
+ *   measurable operation (e.g. bytes uploaded / total bytes, chunks processed / total chunks,
+ *   records processed / total records, or pages extracted / total pages).
+ * - Use `mode: 'indeterminate'` when the underlying operation does not expose
  *   measurable progress. Never fabricate a percentage.
  */
 export interface ImportItemProgress {
@@ -118,6 +125,30 @@ export interface ImportReviewQueueProps {
 }
 
 /**
+ * Explicit default resolution rules based on duplicate detection state:
+ * - New -> Create
+ * - Exact duplicate -> Skip by default
+ * - Possible duplicate -> Ask user ('undecided')
+ * - Related content -> Ask user ('undecided')
+ * - Unable to determine -> Ask user ('undecided'); never silently Merge or Replace
+ */
+export function getDefaultResolutionForDuplicateState(
+  duplicateState: DuplicateDetectionState
+): ReviewResolutionAction {
+  switch (duplicateState) {
+    case 'new':
+      return 'create';
+    case 'exact_duplicate':
+      return 'skip';
+    case 'possible_duplicate':
+    case 'related_content':
+    case 'unable_to_determine':
+    default:
+      return 'undecided';
+  }
+}
+
+/**
  * Bounded concurrency runner to prevent firing an uncontrolled number of simultaneous
  * backend persistence requests during bulk operations.
  */
@@ -142,12 +173,12 @@ export async function runWithControlledConcurrency<T>(
 /**
  * Evaluates whether a queue item is eligible for a specific bulk or individual action
  * while respecting duplicate detection rules:
- * - 'unable_to_determine' must NEVER silently overwrite destination content during Merge or Replace.
+ * - 'unable_to_determine' must NEVER silently allow Merge or Replace.
  * - 'extracting', 'importing', 'processing', and 'imported' items are not modified by new bulk actions.
  */
 export function isItemEligibleForAction(
   item: ImportReviewItem,
-  action: 'merge' | 'replace' | 'skip'
+  action: 'create' | 'merge' | 'replace' | 'skip'
 ): { eligible: boolean; reason?: string } {
   if (
     item.status === 'extracting' ||
@@ -171,20 +202,24 @@ export function isItemEligibleForAction(
     return { eligible: true };
   }
 
-  // Merge or Replace requires readable text content
+  // Create, Merge, or Replace requires readable text content
   if (!item.text || !item.text.trim()) {
     return {
       eligible: false,
-      reason: 'Cannot merge or replace with empty content.',
+      reason: 'Cannot persist item with empty content.',
     };
   }
 
-  // Duplicate safety rule: never silently overwrite destination data when duplicate state is unknown
+  if (action === 'create') {
+    return { eligible: true };
+  }
+
+  // Duplicate safety rule: Unable to determine must NEVER silently allow Merge or Replace
   if (item.duplicateState === 'unable_to_determine') {
     return {
       eligible: false,
       reason:
-        'Duplicate state is "Unable to determine" — blocked from overwriting destination data.',
+        'Duplicate state is "Unable to determine" — never silently allows Merge or Replace. Choose an explicit action per item.',
     };
   }
 
@@ -195,6 +230,7 @@ const DUPLICATE_BADGE_META: Record<
   DuplicateDetectionState,
   {
     label: string;
+    ruleHint: string;
     className: string;
     dotColor: string;
     textClass: string;
@@ -202,24 +238,35 @@ const DUPLICATE_BADGE_META: Record<
 > = {
   new: {
     label: 'New',
+    ruleHint: 'Default: Create',
     className: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300',
     dotColor: '#34d399',
     textClass: 'text-emerald-300',
   },
   possible_duplicate: {
     label: 'Possible duplicate',
+    ruleHint: 'Ask user: Merge, Replace, or Skip',
     className: 'border-amber-500/35 bg-amber-500/12 text-amber-200',
     dotColor: '#fbbf24',
     textClass: 'text-amber-200',
   },
   exact_duplicate: {
     label: 'Exact duplicate',
+    ruleHint: 'Default: Skip',
     className: 'border-orange-500/35 bg-orange-500/12 text-orange-200',
     dotColor: '#fb923c',
     textClass: 'text-orange-200',
   },
+  related_content: {
+    label: 'Related content',
+    ruleHint: 'Ask user: Merge or Create',
+    className: 'border-sky-500/35 bg-sky-500/12 text-sky-200',
+    dotColor: '#38bdf8',
+    textClass: 'text-sky-200',
+  },
   unable_to_determine: {
     label: 'Unable to determine',
+    ruleHint: 'Ask user — overwrite blocked',
     className: 'border-white/15 bg-white/[0.04] text-white/60',
     dotColor: '#94a3b8',
     textClass: 'text-white/60',
@@ -255,6 +302,10 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
   const [bulkSafeguardNotice, setBulkSafeguardNotice] = useState<string | null>(
     null
   );
+  const [confirmingUnknownAction, setConfirmingUnknownAction] = useState<{
+    itemId: string;
+    action: 'merge' | 'replace';
+  } | null>(null);
 
   // Support both controlled and uncontrolled selection
   const selectedIds =
@@ -325,15 +376,21 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
     const duplicates = items.filter(
       (i) =>
         i.duplicateState === 'possible_duplicate' ||
-        i.duplicateState === 'exact_duplicate'
+        i.duplicateState === 'exact_duplicate' ||
+        i.duplicateState === 'related_content'
     ).length;
-    const pending = items.filter(
+    const ready = items.filter(
       (i) =>
-        i.status !== 'imported' &&
-        i.status !== 'skipped' &&
-        i.status !== 'processing' &&
-        i.status !== 'importing' &&
-        i.status !== 'extracting'
+        i.status === 'ready' ||
+        i.status === 'duplicate_identical' ||
+        i.status === 'duplicate_diff'
+    ).length;
+    const needsDecision = items.filter(
+      (i) =>
+        (i.status === 'ready' ||
+          i.status === 'duplicate_identical' ||
+          i.status === 'duplicate_diff') &&
+        i.resolution === 'undecided'
     ).length;
 
     return {
@@ -343,7 +400,8 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
       failed,
       processing,
       duplicates,
-      pending,
+      ready,
+      needsDecision,
     };
   }, [items]);
 
@@ -411,7 +469,9 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
           blockedUnknownCount === 1 ? 'item has' : 'items have'
         } "Unable to determine" duplicate status and ${
           blockedUnknownCount === 1 ? 'was' : 'were'
-        } not overwritten to protect existing destination data.`
+        } excluded from ${
+          action === 'merge' ? 'Bulk Merge' : 'Bulk Replace'
+        }. Choose an explicit action per item.`
       );
     }
 
@@ -485,21 +545,21 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
         return (
           <span className="inline-flex items-center gap-1.5 mono text-[11px] text-indigo-300">
             <Loader2 className="h-3 w-3 animate-spin shrink-0" />
-            <span>Extracting…</span>
+            <span>Extracting</span>
           </span>
         );
       case 'importing':
         return (
           <span className="inline-flex items-center gap-1.5 mono text-[11px] text-[#9db4ff]">
             <Loader2 className="h-3 w-3 animate-spin shrink-0" />
-            <span>Importing…</span>
+            <span>Importing</span>
           </span>
         );
       case 'processing':
         return (
           <span className="inline-flex items-center gap-1.5 mono text-[11px] text-[#9db4ff]">
             <Loader2 className="h-3 w-3 animate-spin shrink-0" />
-            <span>Processing…</span>
+            <span>Processing</span>
           </span>
         );
       case 'imported':
@@ -523,11 +583,24 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
             <span>Error</span>
           </span>
         );
+      case 'ready':
+      case 'duplicate_identical':
+      case 'duplicate_diff':
       default:
         return (
-          <span className="inline-flex items-center gap-1.5 mono text-[11px] text-white/75">
-            <span className="h-1.5 w-1.5 rounded-full bg-[#9db4ff]" />
-            <span>Pending review</span>
+          <span className="inline-flex items-center gap-1.5 mono text-[11px] text-white/80">
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${
+                item.resolution === 'undecided'
+                  ? 'bg-amber-400'
+                  : 'bg-[#9db4ff]'
+              }`}
+            />
+            <span>
+              {item.resolution === 'undecided'
+                ? 'Ready · Decision needed'
+                : 'Ready'}
+            </span>
           </span>
         );
     }
@@ -537,8 +610,8 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
    * Renders accurate per-item progress feedback:
    * - Determinate percentage & counter ONLY when `progress.mode === 'determinate'`
    *   and `total > 0` (e.g. `482 / 1000 records` or `2 / 5 chunks`).
-   * - Indeterminate indicator (`Processing… [indeterminate]`) when backend operation
-   *   does not provide measurable progress.
+   * - Indeterminate indicator (`Processing…` / `Importing…` / `Extracting…`) when
+   *   the underlying operation does not provide measurable progress.
    */
   const renderItemProgress = (item: ImportReviewItem) => {
     const isActivelyRunning =
@@ -606,10 +679,10 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
       const indeterminateLabel =
         prog?.label ||
         (item.status === 'extracting'
-          ? 'Extracting… [indeterminate]'
+          ? 'Extracting…'
           : item.status === 'importing'
-          ? 'Importing… [indeterminate]'
-          : 'Processing… [indeterminate]');
+          ? 'Importing…'
+          : 'Processing…');
 
       return (
         <div
@@ -639,45 +712,92 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
     const isSkipped = item.status === 'skipped';
     const isError = item.status === 'error';
     const matchedFact = item.nodeCheck?.existingFact;
+    const isUnknownDup = item.duplicateState === 'unable_to_determine';
 
+    const createEligibility = isItemEligibleForAction(item, 'create');
     const mergeEligibility = isItemEligibleForAction(item, 'merge');
     const replaceEligibility = isItemEligibleForAction(item, 'replace');
     const skipEligibility = isItemEligibleForAction(item, 'skip');
+
+    const isConfirmingThisItem =
+      confirmingUnknownAction?.itemId === item.id;
+
+    if (isConfirmingThisItem && confirmingUnknownAction) {
+      return (
+        <div className="flex items-center justify-end gap-1.5 flex-wrap rounded-lg border border-amber-500/35 bg-amber-500/10 px-2.5 py-1.5">
+          <span className="mono text-[10.5px] text-amber-200">
+            Duplicate state unknown. Confirm{' '}
+            <strong>{confirmingUnknownAction.action.toUpperCase()}</strong>?
+          </span>
+          <button
+            type="button"
+            disabled={isBusy}
+            onClick={() => {
+              const act = confirmingUnknownAction.action;
+              setConfirmingUnknownAction(null);
+              if (act === 'merge') onMerge(item);
+              else onReplace(item);
+            }}
+            className="rounded bg-amber-400 px-2 py-0.5 mono text-[10.5px] font-semibold text-black hover:bg-amber-300"
+          >
+            Confirm {confirmingUnknownAction.action}
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmingUnknownAction(null)}
+            className="rounded border border-white/15 bg-black/50 px-2 py-0.5 mono text-[10.5px] text-white/70 hover:text-white"
+          >
+            Cancel
+          </button>
+        </div>
+      );
+    }
 
     return (
       <div className="flex items-center justify-end gap-1.5 flex-wrap">
         {!isCompleted && (
           <>
-            {/* New item Import action */}
-            {item.duplicateState === 'new' && onImportNew && (
+            {/* Create / Import Action (Available for New, Related, Possible Duplicate, or explicit choice on Unknown when text is present) */}
+            {onImportNew && (
               <button
                 type="button"
-                disabled={isBusy || !item.text.trim()}
+                disabled={isBusy || !createEligibility.eligible}
                 onClick={() => onImportNew(item)}
-                className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-semibold transition disabled:opacity-40 ${
+                className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-semibold transition disabled:opacity-35 ${
                   item.resolution === 'create'
                     ? 'bg-emerald-400 text-black hover:bg-emerald-300'
                     : 'border border-emerald-500/30 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20'
                 }`}
-                title="Persist new item to destination Brain"
+                title="Create as a new node in destination Brain without overwriting existing nodes"
               >
                 <Check className="h-3 w-3" />
-                <span>Import</span>
+                <span>Create</span>
               </button>
             )}
 
             {/* Merge Action */}
             <button
               type="button"
-              disabled={isBusy || !mergeEligibility.eligible}
-              onClick={() => onMerge(item)}
-              className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-medium transition disabled:opacity-40 ${
-                item.resolution === 'merge' && item.duplicateState !== 'new'
+              disabled={isBusy || !item.text.trim()}
+              onClick={() => {
+                if (isUnknownDup) {
+                  setConfirmingUnknownAction({
+                    itemId: item.id,
+                    action: 'merge',
+                  });
+                } else {
+                  onMerge(item);
+                }
+              }}
+              className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-medium transition disabled:opacity-35 ${
+                item.resolution === 'merge'
                   ? 'bg-[#9db4ff] text-black font-semibold hover:bg-[#b4c6ff]'
                   : 'border border-white/15 bg-white/[0.04] text-white/85 hover:border-white/30 hover:bg-white/[0.09] hover:text-white'
               }`}
               title={
-                !mergeEligibility.eligible
+                isUnknownDup
+                  ? 'Duplicate status is Unable to determine — requires explicit confirmation before merging'
+                  : !mergeEligibility.eligible
                   ? mergeEligibility.reason
                   : matchedFact
                   ? `Combine imported content with Node #${matchedFact.id} and persist to backend`
@@ -691,15 +811,26 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
             {/* Replace Action */}
             <button
               type="button"
-              disabled={isBusy || !replaceEligibility.eligible}
-              onClick={() => onReplace(item)}
-              className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-medium transition disabled:opacity-40 ${
+              disabled={isBusy || !item.text.trim()}
+              onClick={() => {
+                if (isUnknownDup) {
+                  setConfirmingUnknownAction({
+                    itemId: item.id,
+                    action: 'replace',
+                  });
+                } else {
+                  onReplace(item);
+                }
+              }}
+              className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-medium transition disabled:opacity-35 ${
                 item.resolution === 'replace'
                   ? 'bg-amber-400 text-black font-semibold hover:bg-amber-300'
                   : 'border border-white/15 bg-white/[0.04] text-white/85 hover:border-white/30 hover:bg-white/[0.09] hover:text-white'
               }`}
               title={
-                !replaceEligibility.eligible
+                isUnknownDup
+                  ? 'Duplicate status is Unable to determine — requires explicit confirmation before replacing'
+                  : !replaceEligibility.eligible
                   ? replaceEligibility.reason
                   : matchedFact
                   ? `Replace Node #${matchedFact.id} with imported content and persist to backend`
@@ -715,8 +846,8 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
               type="button"
               disabled={isBusy || !skipEligibility.eligible}
               onClick={() => onSkip(item)}
-              className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-medium transition disabled:opacity-40 ${
-                isSkipped
+              className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-medium transition disabled:opacity-35 ${
+                isSkipped || item.resolution === 'skip'
                   ? 'border border-white/25 bg-white/15 text-white'
                   : 'border border-white/12 bg-black/40 text-white/65 hover:border-white/25 hover:text-white'
               }`}
@@ -794,20 +925,19 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
           <span className="mono text-[11px] tabular-nums text-white/65">
             {metrics.total} {metrics.total === 1 ? 'item' : 'items'}
           </span>
-          {metrics.pending > 0 && (
+          {metrics.ready > 0 && (
             <>
               <span className="text-white/25">·</span>
               <span className="mono text-[11px] tabular-nums text-[#9db4ff]">
-                {metrics.pending} awaiting decision
+                {metrics.ready} ready
               </span>
             </>
           )}
-          {metrics.duplicates > 0 && (
+          {metrics.needsDecision > 0 && (
             <>
               <span className="text-white/25">·</span>
               <span className="mono text-[11px] tabular-nums text-amber-300">
-                {metrics.duplicates}{' '}
-                {metrics.duplicates === 1 ? 'duplicate' : 'duplicates'} flagged
+                {metrics.needsDecision} awaiting decision
               </span>
             </>
           )}
@@ -1026,7 +1156,7 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
             Select files or <code className="mono text-white/75">.zip</code>{' '}
             archives above, or stage a transcript from the Paste Conversation
             tab. Every item is checked for duplicates before you choose to
-            Merge, Replace, or Skip.
+            Create, Merge, Replace, or Skip.
           </p>
         </div>
       ) : (
@@ -1056,10 +1186,10 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
                   <th className="py-2.5 px-3 min-w-[165px]">
                     Status & Progress
                   </th>
-                  <th className="py-2.5 px-3 min-w-[165px]">
+                  <th className="py-2.5 px-3 min-w-[175px]">
                     Duplicate Detection
                   </th>
-                  <th className="py-2.5 pl-3 pr-4 text-right min-w-[240px]">
+                  <th className="py-2.5 pl-3 pr-4 text-right min-w-[260px]">
                     Actions
                   </th>
                 </tr>
@@ -1257,18 +1387,24 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
                             </span>
                           </div>
 
-                          {matchedFact && (
-                            <div className="mt-1 mono text-[10px] text-white/50">
-                              Matches Node{' '}
-                              <strong className="text-white/80">
-                                #{matchedFact.id}
-                              </strong>
-                              {item.duplicateState === 'possible_duplicate' &&
-                              item.nodeCheck?.newSectionsDetected
-                                ? ` (+${item.nodeCheck.newSectionsDetected} new)`
-                                : ''}
-                            </div>
-                          )}
+                          <div className="mt-1 mono text-[10px] text-white/45">
+                            {matchedFact ? (
+                              <span>
+                                Matches Node{' '}
+                                <strong className="text-white/80">
+                                  #{matchedFact.id}
+                                </strong>
+                                {(item.duplicateState ===
+                                  'possible_duplicate' ||
+                                  item.duplicateState === 'related_content') &&
+                                item.nodeCheck?.newSectionsDetected
+                                  ? ` (+${item.nodeCheck.newSectionsDetected} new)`
+                                  : ''}
+                              </span>
+                            ) : (
+                              <span>{dupMeta.ruleHint}</span>
+                            )}
+                          </div>
                         </td>
 
                         {/* 6. ACTIONS */}
@@ -1433,11 +1569,18 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
                           {dupMeta.label}
                         </span>
                       </div>
-                      {matchedFact && (
-                        <div className="mt-0.5 mono text-[10px] text-white/50">
-                          Node <strong className="text-white/80">#{matchedFact.id}</strong>
-                        </div>
-                      )}
+                      <div className="mt-0.5 mono text-[10px] text-white/50">
+                        {matchedFact ? (
+                          <span>
+                            Node{' '}
+                            <strong className="text-white/80">
+                              #{matchedFact.id}
+                            </strong>
+                          </span>
+                        ) : (
+                          <span>{dupMeta.ruleHint}</span>
+                        )}
+                      </div>
                     </div>
                   </div>
 

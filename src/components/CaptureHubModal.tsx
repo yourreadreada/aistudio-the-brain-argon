@@ -43,6 +43,7 @@ import {
   ReviewItemStatus,
   runWithControlledConcurrency,
   isItemEligibleForAction,
+  getDefaultResolutionForDuplicateState,
 } from './ImportReviewQueue';
 
 export type CaptureHubTab = 'companion' | 'import' | 'paste' | 'export';
@@ -180,6 +181,12 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
   /**
    * Evaluates duplicate state in the destination Brain without modifying any existing content.
+   * Explicit resolution rules:
+   * - New -> Create
+   * - Exact duplicate -> Skip by default
+   * - Possible duplicate -> Ask user ('undecided')
+   * - Related content -> Ask user ('undecided')
+   * - Unable to determine -> Ask user ('undecided'); never silently Merge or Replace
    */
   const computeDuplicateEvaluation = (
     text: string,
@@ -197,7 +204,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       return {
         duplicateState: 'unable_to_determine',
         status: hasExtractionError ? 'error' : 'ready',
-        resolution: 'skip',
+        resolution: 'undecided',
       };
     }
 
@@ -217,21 +224,23 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           : 'possible_duplicate'
         : 'new');
 
+    const defaultResolution = getDefaultResolutionForDuplicateState(dupState);
+
     if (dupState === 'exact_duplicate') {
       return {
         nodeCheck,
         duplicateState: 'exact_duplicate',
         status: 'duplicate_identical',
-        resolution: 'skip',
+        resolution: defaultResolution,
       };
     }
 
-    if (dupState === 'possible_duplicate') {
+    if (dupState === 'possible_duplicate' || dupState === 'related_content') {
       return {
         nodeCheck,
-        duplicateState: 'possible_duplicate',
+        duplicateState: dupState,
         status: 'duplicate_diff',
-        resolution: 'merge',
+        resolution: defaultResolution,
       };
     }
 
@@ -240,7 +249,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         nodeCheck,
         duplicateState: 'unable_to_determine',
         status: 'ready',
-        resolution: 'skip',
+        resolution: defaultResolution,
       };
     }
 
@@ -248,7 +257,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       nodeCheck,
       duplicateState: 'new',
       status: 'ready',
-      resolution: 'create',
+      resolution: defaultResolution,
     };
   };
 
@@ -329,18 +338,29 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         q.status !== 'extracting' &&
         q.status !== 'importing' &&
         q.status !== 'processing' &&
-        q.resolution !== 'skip'
+        q.status !== 'error' &&
+        q.resolution !== 'undecided'
+    ).length;
+    const needsDecision = reviewQueue.filter(
+      (q) =>
+        q.status !== 'imported' &&
+        q.status !== 'skipped' &&
+        q.status !== 'extracting' &&
+        q.status !== 'importing' &&
+        q.status !== 'processing' &&
+        q.resolution === 'undecided'
     ).length;
     const duplicates = reviewQueue.filter(
       (q) =>
         q.duplicateState === 'possible_duplicate' ||
-        q.duplicateState === 'exact_duplicate'
+        q.duplicateState === 'exact_duplicate' ||
+        q.duplicateState === 'related_content'
     ).length;
     const totalUnits = reviewQueue.reduce(
       (acc, q) => acc + (q.itemCount || 1),
       0
     );
-    return { total, ready, duplicates, totalUnits };
+    return { total, ready, needsDecision, duplicates, totalUnits };
   }, [reviewQueue]);
 
   if (!isOpen) return null;
@@ -552,21 +572,18 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       return false;
     }
 
-    // Safeguard: never overwrite destination content when duplicateState is unable_to_determine
-    if (
-      (action === 'merge' || action === 'replace') &&
-      item.duplicateState === 'unable_to_determine'
-    ) {
-      const safeguardMsg =
-        'Cannot merge or replace when duplicate status is "Unable to determine". Destination content was not modified.';
+    // Safeguard: never overwrite if content is empty
+    if (!item.text || !item.text.trim()) {
+      const emptyMsg =
+        'Cannot persist item with empty content. Destination content was not modified.';
       setReviewQueue((prev) =>
         prev.map((q) =>
           q.id === item.id
             ? {
                 ...q,
                 status: 'error',
-                errorMessage: safeguardMsg,
-                statusMessage: safeguardMsg,
+                errorMessage: emptyMsg,
+                statusMessage: emptyMsg,
                 progress: undefined,
               }
             : q
@@ -719,13 +736,13 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   };
 
   const handleRetryItem = async (item: ImportReviewItem): Promise<boolean> => {
-    const retryAction =
+    const retryAction: 'create' | 'merge' | 'replace' =
       item.lastAttemptedAction ||
-      (item.resolution === 'skip'
-        ? item.duplicateState === 'new'
-          ? 'create'
-          : 'merge'
-        : item.resolution);
+      (item.resolution === 'merge'
+        ? 'merge'
+        : item.resolution === 'replace'
+        ? 'replace'
+        : 'create');
     return await executeItemPersistence(item, retryAction);
   };
 
@@ -755,6 +772,11 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       return;
     }
 
+    const eligibleItems = itemsToProcess.filter(
+      (item) => isItemEligibleForAction(item, action).eligible
+    );
+    if (eligibleItems.length === 0) return;
+
     setIsCommitting(true);
     setCommitBanner(null);
 
@@ -763,7 +785,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
     try {
       await runWithControlledConcurrency(
-        itemsToProcess,
+        eligibleItems,
         BULK_CONCURRENCY_LIMIT,
         async (item) => {
           const ok = await executeItemPersistence(item, action);
@@ -803,7 +825,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         item.status !== 'importing' &&
         item.status !== 'processing' &&
         item.status !== 'imported' &&
-        item.status !== 'skipped'
+        item.status !== 'skipped' &&
+        item.resolution !== 'undecided'
     );
     if (actionable.length === 0) return;
 
@@ -820,12 +843,16 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     }[] = [];
 
     for (const item of actionable) {
-      if (
-        item.resolution === 'skip' ||
-        item.duplicateState === 'unable_to_determine'
-      ) {
+      if (item.resolution === 'skip') {
         handleSkipItem(item);
         skippedCount++;
+        continue;
+      }
+
+      if (
+        item.duplicateState === 'unable_to_determine' &&
+        (item.resolution === 'merge' || item.resolution === 'replace')
+      ) {
         continue;
       }
 
@@ -856,10 +883,20 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       setIsCommitting(false);
     }
 
+    const undecidedRemaining = reviewQueue.filter(
+      (item) =>
+        item.status !== 'imported' &&
+        item.status !== 'skipped' &&
+        item.resolution === 'undecided'
+    ).length;
+
     const parts: string[] = [];
     if (succeededCount > 0) parts.push(`${succeededCount} imported`);
     if (skippedCount > 0) parts.push(`${skippedCount} skipped`);
     if (failedCount > 0) parts.push(`${failedCount} failed (retry available)`);
+    if (undecidedRemaining > 0) {
+      parts.push(`${undecidedRemaining} awaiting explicit user decision`);
+    }
 
     setCommitBanner({
       type:
@@ -867,6 +904,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           ? succeededCount > 0
             ? 'warning'
             : 'error'
+          : undecidedRemaining > 0
+          ? 'warning'
           : 'success',
       text: `Queue run complete: ${parts.join(' · ')}.`,
     });

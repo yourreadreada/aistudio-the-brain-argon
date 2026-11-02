@@ -211,6 +211,7 @@ export type DuplicateDetectionState =
   | 'new'
   | 'possible_duplicate'
   | 'exact_duplicate'
+  | 'related_content'
   | 'unable_to_determine';
 
 export interface ExistingFileNodeCheck {
@@ -221,7 +222,7 @@ export interface ExistingFileNodeCheck {
   newSectionsDetected: number;
   existingSectionsCount?: number;
   summary?: string;
-  recommendedAction: 'merge' | 'skip' | 'replace';
+  recommendedAction: 'create' | 'merge' | 'skip' | 'replace' | 'ask_user';
   duplicateState?: DuplicateDetectionState;
 }
 
