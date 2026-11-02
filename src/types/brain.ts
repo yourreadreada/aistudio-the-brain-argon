@@ -207,6 +207,12 @@ export interface FactMergeRecord {
   newContentLength?: number;
 }
 
+export type DuplicateDetectionState =
+  | 'new'
+  | 'possible_duplicate'
+  | 'exact_duplicate'
+  | 'unable_to_determine';
+
 export interface ExistingFileNodeCheck {
   exists: boolean;
   existingFact?: Fact;
@@ -216,6 +222,7 @@ export interface ExistingFileNodeCheck {
   existingSectionsCount?: number;
   summary?: string;
   recommendedAction: 'merge' | 'skip' | 'replace';
+  duplicateState?: DuplicateDetectionState;
 }
 
 export interface IngestOperationResult {

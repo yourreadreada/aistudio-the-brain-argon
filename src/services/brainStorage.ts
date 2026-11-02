@@ -5,6 +5,7 @@ import {
   IngestStrategy,
   MergeStrategy,
   ExistingFileNodeCheck,
+  DuplicateDetectionState,
   IngestOperationResult,
   SemanticSection,
   DEFAULT_BRAINS,
@@ -18,9 +19,24 @@ import {
   detectIncrementalDiff,
 } from './semanticChunker';
 
-// Talks to the real Python backend (brain.web) when running, with
-// automatic graceful offline fallback to local storage so the web preview
-// remains immediately functional and interactive even before `python -m brain.web` is started.
+export interface CompanionDeviceRecord {
+  id: string;
+  name: string;
+  token_prefix: string;
+  browser: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export interface GatewayStatusInfo {
+  online?: boolean;
+  reachable?: boolean;
+  database?: string;
+  factsCount: number;
+  brainsCount?: number;
+  companionDevicesCount: number;
+}
+
 const API_BASE = (import.meta as any).env?.VITE_BRAIN_API_URL !== undefined ? (import.meta as any).env.VITE_BRAIN_API_URL : '';
 
 const STORAGE_KEY_FACTS = 'brain_local_facts_v1';
@@ -903,70 +919,512 @@ class BrainStorageService {
   }
 
   /**
-   * Finds an existing fact node for a file path or file name in a specific brain.
+   * Finds an existing fact node for a file path, file name, or title in a specific brain.
    */
-  public findNodeByFilePath(brain: string, filePathOrName: string): Fact | undefined {
-    if (!filePathOrName) return undefined;
-    const cleanTarget = filePathOrName.trim().toLowerCase();
-    const targetBaseName = cleanTarget.split(/[\\/]/).pop() || cleanTarget;
-
-    const bFacts = this.facts.filter((f) => f.brain === brain.trim().toLowerCase());
-
-    // 1. Exact filePath match
-    let match = bFacts.find((f) => f.filePath && f.filePath.toLowerCase() === cleanTarget);
-    if (match) return match;
-
-    // 2. Exact fileName match
-    match = bFacts.find((f) => f.fileName && f.fileName.toLowerCase() === targetBaseName);
-    if (match) return match;
-
-    // 3. DocumentTitle match
-    const titleWithoutExt = targetBaseName.replace(/\.[^/.]+$/, '');
-    match = bFacts.find(
-      (f) => f.documentTitle && f.documentTitle.toLowerCase() === titleWithoutExt
+  public findNodeByFilePath(
+    brain: string,
+    filePathOrName: string,
+    title?: string
+  ): Fact | undefined {
+    if (!brain) return undefined;
+    const bFacts = this.facts.filter(
+      (f) => f.brain === brain.trim().toLowerCase()
     );
-    if (match) return match;
+    if (bFacts.length === 0) return undefined;
+
+    if (filePathOrName) {
+      const cleanTarget = filePathOrName.trim().toLowerCase();
+      const targetBaseName = cleanTarget.split(/[\\/]/).pop() || cleanTarget;
+
+      // 1. Exact filePath match
+      let match = bFacts.find(
+        (f) => f.filePath && f.filePath.toLowerCase() === cleanTarget
+      );
+      if (match) return match;
+
+      // 2. Exact fileName match
+      match = bFacts.find(
+        (f) => f.fileName && f.fileName.toLowerCase() === targetBaseName
+      );
+      if (match) return match;
+
+      // 3. DocumentTitle match from filename
+      const titleWithoutExt = targetBaseName.replace(/\.[^/.]+$/, '');
+      match = bFacts.find(
+        (f) =>
+          f.documentTitle &&
+          f.documentTitle.toLowerCase() === titleWithoutExt
+      );
+      if (match) return match;
+    }
+
+    if (title && title.trim()) {
+      const cleanTitle = title.trim().toLowerCase();
+      const match = bFacts.find(
+        (f) =>
+          (f.documentTitle && f.documentTitle.toLowerCase() === cleanTitle) ||
+          (f.fileName &&
+            f.fileName.replace(/\.[^/.]+$/, '').toLowerCase() === cleanTitle)
+      );
+      if (match) return match;
+    }
 
     return undefined;
   }
 
   /**
-   * Checks if an incoming file matches an existing node, analyzing semantic diffs
-   * for intelligent incremental updates without creating redundant split nodes.
+   * Checks if an incoming file or conversation matches an existing node in the destination brain,
+   * classifying it into:
+   * - 'new'
+   * - 'possible_duplicate'
+   * - 'exact_duplicate'
+   * - 'unable_to_determine'
+   * Does NOT modify any existing content.
    */
   public checkExistingFileNode(
     brain: string,
     fileName: string,
     content: string,
-    filePath?: string
+    filePath?: string,
+    title?: string
   ): ExistingFileNodeCheck {
-    const existingFact = this.findNodeByFilePath(brain, filePath || fileName);
-    if (!existingFact) {
+    if (!brain || !brain.trim() || !content || !content.trim()) {
       return {
         exists: false,
         hasDiff: false,
         isIdentical: false,
         newSectionsDetected: 0,
-        recommendedAction: 'merge',
+        recommendedAction: 'skip',
+        duplicateState: 'unable_to_determine',
+        summary: 'Unable to determine duplicate status (empty content or destination)',
       };
     }
 
-    const diff = detectIncrementalDiff(
-      existingFact.content,
-      content,
-      existingFact.fileType,
-      fileName
+    try {
+      const resolvedBrain = brain.trim().toLowerCase();
+      const stripHeader = (raw: string) =>
+        raw
+          .trim()
+          .replace(/^#\s+[^\n]+\n+/, '')
+          .trim();
+
+      const incomingTrimmed = content.trim();
+      const incomingBody = stripHeader(incomingTrimmed);
+
+      // 1. Check by file path, file name, or title
+      let existingFact = this.findNodeByFilePath(
+        resolvedBrain,
+        filePath || fileName,
+        title
+      );
+
+      // 2. If not matched by filename/title, check if any fact in the destination brain has identical content
+      if (!existingFact) {
+        const bFacts = this.facts.filter((f) => f.brain === resolvedBrain);
+        existingFact = bFacts.find((f) => {
+          const fTrimmed = f.content.trim();
+          const fBody = stripHeader(fTrimmed);
+          return (
+            fTrimmed === incomingTrimmed ||
+            (incomingBody.length > 0 && fBody === incomingBody)
+          );
+        });
+      }
+
+      // 3. If still not matched, check if any fact in the destination brain has partial content overlap
+      if (!existingFact && incomingBody.length >= 40) {
+        const bFacts = this.facts.filter((f) => f.brain === resolvedBrain);
+        existingFact = bFacts.find((f) => {
+          const fBody = stripHeader(f.content);
+          return (
+            fBody.length >= 40 &&
+            (fBody.includes(incomingBody) || incomingBody.includes(fBody))
+          );
+        });
+      }
+
+      if (!existingFact) {
+        return {
+          exists: false,
+          hasDiff: false,
+          isIdentical: false,
+          newSectionsDetected: 0,
+          recommendedAction: 'merge',
+          duplicateState: 'new',
+          summary: `New content for "${resolvedBrain}"`,
+        };
+      }
+
+      const diff = detectIncrementalDiff(
+        existingFact.content,
+        content,
+        existingFact.fileType,
+        fileName
+      );
+
+      const isExact =
+        diff.isIdentical ||
+        existingFact.content.trim() === incomingTrimmed ||
+        stripHeader(existingFact.content) === incomingBody;
+
+      const duplicateState: DuplicateDetectionState = isExact
+        ? 'exact_duplicate'
+        : 'possible_duplicate';
+
+      return {
+        exists: true,
+        existingFact,
+        hasDiff: !isExact && diff.hasNewContent,
+        isIdentical: isExact,
+        newSectionsDetected: isExact ? 0 : Math.max(1, diff.newSections.length),
+        existingSectionsCount: existingFact.semanticSectionCount || 1,
+        summary: isExact
+          ? `Exact match with Node #${existingFact.id}`
+          : diff.summary || `Matches Node #${existingFact.id} with updated content`,
+        recommendedAction: isExact ? 'skip' : 'merge',
+        duplicateState,
+      };
+    } catch {
+      return {
+        exists: false,
+        hasDiff: false,
+        isIdentical: false,
+        newSectionsDetected: 0,
+        recommendedAction: 'skip',
+        duplicateState: 'unable_to_determine',
+        summary: 'Unable to determine duplicate status',
+      };
+    }
+  }
+
+  /**
+   * Backend-confirmed persistence for ImportReviewQueue actions ('create' | 'merge' | 'replace').
+   * Does NOT optimistically mark items as imported: awaits backend HTTP confirmation before
+   * mutating local state, and throws an Error if backend persistence fails.
+   */
+  public async persistReviewedItem(params: {
+    action: 'create' | 'merge' | 'replace';
+    brain: string;
+    source: AISource;
+    title: string;
+    content: string;
+    fileName?: string;
+    filePath?: string;
+    fileType?: FactFileType;
+    tags?: string[];
+    targetFactId?: number;
+  }): Promise<IngestOperationResult> {
+    const rawText = (params.content || '').trim();
+    if (!rawText) {
+      throw new Error('Cannot persist empty content.');
+    }
+
+    const resolvedBrain = (params.brain || '').trim().toLowerCase();
+    if (!resolvedBrain) {
+      throw new Error('Destination Brain is required.');
+    }
+
+    const effectiveFileName =
+      params.fileName ||
+      (params.title
+        ? `${params.title.trim().replace(/[^a-zA-Z0-9_-]+/g, '_').toLowerCase()}.md`
+        : 'imported_item.md');
+    const effectivePath = params.filePath || effectiveFileName;
+    const resolvedType =
+      params.fileType || inferFileTypeFromExtension(effectiveFileName);
+    const cleanTitle =
+      params.title?.trim() || effectiveFileName.replace(/\.[^/.]+$/, '');
+
+    const formattedText =
+      cleanTitle && !rawText.startsWith(`# ${cleanTitle}`) && !rawText.startsWith('# ')
+        ? `# ${cleanTitle}\n\n${rawText}`
+        : rawText;
+
+    // Locate target existing node for merge / replace
+    const existingFact =
+      (params.targetFactId !== undefined
+        ? this.getFactById(params.targetFactId)
+        : undefined) ||
+      this.findNodeByFilePath(resolvedBrain, effectivePath, cleanTitle) ||
+      this.checkExistingFileNode(
+        resolvedBrain,
+        effectiveFileName,
+        rawText,
+        effectivePath,
+        cleanTitle
+      ).existingFact;
+
+    // Build headers including optional companion token if configured
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    try {
+      const savedToken = localStorage.getItem('brain_active_device_token');
+      if (savedToken) {
+        headers['Authorization'] = `Bearer ${savedToken}`;
+      }
+    } catch {}
+
+    // CASE 1: MERGE into existing destination node
+    if (params.action === 'merge' && existingFact) {
+      const diff = detectIncrementalDiff(
+        existingFact.content,
+        formattedText,
+        resolvedType,
+        effectiveFileName
+      );
+
+      // Combine existing content with imported content even if sections overlapped
+      const mergedContent = diff.isIdentical
+        ? existingFact.content
+        : diff.hasNewContent
+        ? diff.mergedContent
+        : `${existingFact.content.trim()}\n\n${rawText}`;
+
+      const parsed = parseSemanticSections(
+        mergedContent,
+        resolvedType,
+        effectiveFileName
+      );
+      const mergedTags = Array.from(
+        new Set([...(existingFact.tags || []), ...(params.tags || [])])
+      );
+      const mergeRecord = {
+        timestamp: new Date().toISOString(),
+        action: 'merged' as const,
+        summary:
+          diff.summary ||
+          `Merged imported content from ${effectiveFileName} into Node #${existingFact.id}`,
+        previousContentLength: existingFact.content.length,
+        newContentLength: mergedContent.length,
+      };
+      const nextMergeHistory = [
+        mergeRecord,
+        ...(existingFact.mergeHistory || []),
+      ];
+
+      const res = await fetch(`${API_BASE}/api/correct`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          id: existingFact.id,
+          content: mergedContent,
+          tags: mergedTags,
+          fileName: existingFact.fileName || effectiveFileName,
+          filePath: existingFact.filePath || effectivePath,
+          fileType: existingFact.fileType || resolvedType,
+          documentTitle: existingFact.documentTitle || cleanTitle,
+          semanticSectionCount: parsed.sections.length,
+          mergeHistory: nextMergeHistory,
+          isDocumentRoot: true,
+          isUnifiedContextNode: true,
+        }),
+      });
+
+      if (!res.ok) {
+        let errDetail = `HTTP ${res.status}`;
+        try {
+          const errJson = await res.json();
+          if (errJson?.error) errDetail = errJson.error;
+        } catch {}
+        throw new Error(`Merge persistence failed (${errDetail})`);
+      }
+
+      const data = await res.json();
+      if (!data?.ok) {
+        throw new Error('Backend did not confirm merge update.');
+      }
+
+      // Update local state only after backend confirms
+      existingFact.content = mergedContent;
+      existingFact.updated_at = data.updated_at || new Date().toISOString();
+      existingFact.tags = mergedTags;
+      existingFact.fileName = existingFact.fileName || effectiveFileName;
+      existingFact.filePath = existingFact.filePath || effectivePath;
+      existingFact.fileType = existingFact.fileType || resolvedType;
+      existingFact.documentTitle = existingFact.documentTitle || cleanTitle;
+      existingFact.isDocumentRoot = true;
+      existingFact.isUnifiedContextNode = true;
+      existingFact.semanticSectionCount = parsed.sections.length;
+      existingFact.mergeHistory = nextMergeHistory;
+
+      this.saveLocalFacts();
+      this.recordActivity(existingFact, 'modified');
+      this.notify();
+
+      return {
+        fact: existingFact,
+        action: 'merged',
+        message: `Merged into Node #${existingFact.id} in "${resolvedBrain}"`,
+        sectionsCount: parsed.sections.length,
+        isExistingNode: true,
+        previousId: existingFact.id,
+      };
+    }
+
+    // CASE 2: REPLACE existing destination node content
+    if (params.action === 'replace' && existingFact) {
+      const parsed = parseSemanticSections(
+        formattedText,
+        resolvedType,
+        effectiveFileName
+      );
+      const nextTags =
+        params.tags && params.tags.length > 0
+          ? Array.from(new Set(params.tags))
+          : existingFact.tags || [];
+      const replaceRecord = {
+        timestamp: new Date().toISOString(),
+        action: 'updated' as const,
+        summary: `Replaced content with ${effectiveFileName} (${parsed.sections.length} sections)`,
+        previousContentLength: existingFact.content.length,
+        newContentLength: formattedText.length,
+      };
+      const nextMergeHistory = [
+        replaceRecord,
+        ...(existingFact.mergeHistory || []),
+      ];
+
+      const res = await fetch(`${API_BASE}/api/correct`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          id: existingFact.id,
+          content: formattedText,
+          tags: nextTags,
+          fileName: effectiveFileName,
+          filePath: effectivePath,
+          fileType: resolvedType,
+          documentTitle: cleanTitle,
+          semanticSectionCount: parsed.sections.length,
+          mergeHistory: nextMergeHistory,
+          isDocumentRoot: true,
+          isUnifiedContextNode: true,
+        }),
+      });
+
+      if (!res.ok) {
+        let errDetail = `HTTP ${res.status}`;
+        try {
+          const errJson = await res.json();
+          if (errJson?.error) errDetail = errJson.error;
+        } catch {}
+        throw new Error(`Replace persistence failed (${errDetail})`);
+      }
+
+      const data = await res.json();
+      if (!data?.ok) {
+        throw new Error('Backend did not confirm replacement.');
+      }
+
+      // Update local state only after backend confirms
+      existingFact.content = formattedText;
+      existingFact.source = params.source;
+      existingFact.updated_at = data.updated_at || new Date().toISOString();
+      existingFact.tags = nextTags;
+      existingFact.fileName = effectiveFileName;
+      existingFact.filePath = effectivePath;
+      existingFact.fileType = resolvedType;
+      existingFact.documentTitle = cleanTitle;
+      existingFact.isDocumentRoot = true;
+      existingFact.isUnifiedContextNode = true;
+      existingFact.semanticSectionCount = parsed.sections.length;
+      existingFact.mergeHistory = nextMergeHistory;
+
+      this.saveLocalFacts();
+      this.recordActivity(existingFact, 'modified');
+      this.notify();
+
+      return {
+        fact: existingFact,
+        action: 'updated',
+        message: `Replaced Node #${existingFact.id} in "${resolvedBrain}"`,
+        sectionsCount: parsed.sections.length,
+        isExistingNode: true,
+        previousId: existingFact.id,
+      };
+    }
+
+    // CASE 3: CREATE new node in destination Brain (for 'create', or 'merge'/'replace' when no destination node exists yet)
+    const parsed = parseSemanticSections(
+      formattedText,
+      resolvedType,
+      effectiveFileName
     );
+    const nowIso = new Date().toISOString();
+    const initialHistory = [
+      {
+        timestamp: nowIso,
+        action: 'created' as const,
+        summary: `Imported ${effectiveFileName} (${parsed.sections.length} sections)`,
+        newContentLength: formattedText.length,
+      },
+    ];
+
+    const res = await fetch(`${API_BASE}/api/remember`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        brain: resolvedBrain,
+        content: formattedText,
+        source: params.source,
+        fileName: effectiveFileName,
+        filePath: effectivePath,
+        fileType: resolvedType,
+        tags: params.tags || [],
+        isDocumentRoot: true,
+        isUnifiedContextNode: true,
+        documentTitle: cleanTitle,
+        semanticSectionCount: parsed.sections.length,
+        mergeHistory: initialHistory,
+      }),
+    });
+
+    if (!res.ok) {
+      let errDetail = `HTTP ${res.status}`;
+      try {
+        const errJson = await res.json();
+        if (errJson?.error) errDetail = errJson.error;
+      } catch {}
+      throw new Error(`Import persistence failed (${errDetail})`);
+    }
+
+    const savedFact: Fact = await res.json();
+    if (!savedFact || typeof savedFact.id !== 'number') {
+      throw new Error('Invalid confirmation payload from backend.');
+    }
+
+    const confirmedFact: Fact = {
+      ...savedFact,
+      brain: resolvedBrain,
+      content: formattedText,
+      source: params.source,
+      fileName: effectiveFileName,
+      filePath: effectivePath,
+      fileType: resolvedType,
+      tags: params.tags || [],
+      isDocumentRoot: true,
+      isUnifiedContextNode: true,
+      documentTitle: cleanTitle,
+      semanticSectionCount: parsed.sections.length,
+      mergeHistory: initialHistory,
+    };
+
+    this.createBrain(resolvedBrain);
+    this.facts = [
+      confirmedFact,
+      ...this.facts.filter((f) => f.id !== confirmedFact.id),
+    ];
+    this.saveLocalFacts();
+    this.recordActivity(confirmedFact, 'created');
+    this.notify();
 
     return {
-      exists: true,
-      existingFact,
-      hasDiff: diff.hasNewContent,
-      isIdentical: diff.isIdentical,
-      newSectionsDetected: diff.newSections.length,
-      existingSectionsCount: existingFact.semanticSectionCount || 1,
-      summary: diff.summary,
-      recommendedAction: diff.isIdentical ? 'skip' : 'merge',
+      fact: confirmedFact,
+      action: 'created',
+      message: `Imported as Node #${confirmedFact.id} in "${resolvedBrain}"`,
+      sectionsCount: parsed.sections.length,
+      isExistingNode: false,
     };
   }
 
@@ -1406,12 +1864,7 @@ class BrainStorageService {
     return lines.join('\n').trim() + '\n';
   }
 
-  public async checkGatewayStatus(): Promise<{
-    reachable: boolean;
-    database: string;
-    factsCount: number;
-    companionDevicesCount: number;
-  }> {
+  public async checkGatewayStatus(): Promise<GatewayStatusInfo> {
     try {
       const res = await fetch(`${API_BASE}/api/status`, {
         signal: AbortSignal.timeout(2500),
@@ -1421,18 +1874,22 @@ class BrainStorageService {
       this.backendReachable = true;
       this.backendChecked = true;
       return {
+        online: true,
         reachable: true,
         database: data.database || 'sqlite-embedded',
         factsCount: data.factsCount ?? this.facts.length,
+        brainsCount: Array.isArray(data.brains) ? data.brains.length : this.getBrains().length,
         companionDevicesCount: data.companionDevicesCount ?? 0,
       };
     } catch {
       this.backendReachable = false;
       this.backendChecked = true;
       return {
+        online: false,
         reachable: false,
         database: 'local-storage-fallback',
         factsCount: this.facts.length,
+        brainsCount: this.getBrains().length,
         companionDevicesCount: 0,
       };
     }

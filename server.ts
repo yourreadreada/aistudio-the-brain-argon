@@ -454,68 +454,149 @@ app.get('/api/recall', (req, res) => {
 
 // 5. Store / Remember Fact API
 app.post('/api/remember', (req, res) => {
-  const {
-    brain,
-    content,
-    source,
-    file_name,
-    fileName,
-    file_path,
-    filePath,
-    file_type,
-    fileType,
-    tags,
-  } = req.body;
-  if (!brain || !content || !source) {
-    return res.status(400).json({ error: 'brain, content and source required' });
+  try {
+    const {
+      brain,
+      content,
+      source,
+      file_name,
+      fileName,
+      file_path,
+      filePath,
+      file_type,
+      fileType,
+      tags,
+      isDocumentRoot,
+      isUnifiedContextNode,
+      documentTitle,
+      semanticSectionCount,
+      mergeHistory,
+      parentId,
+    } = req.body;
+    if (!brain || !content || !source) {
+      return res.status(400).json({ error: 'brain, content, and source are required' });
+    }
+
+    const now = new Date().toISOString();
+    const resolvedFileName = fileName || file_name || null;
+    const resolvedFilePath = filePath || file_path || resolvedFileName;
+    const resolvedFileType = fileType || file_type || null;
+    const tagsJson = Array.isArray(tags) ? JSON.stringify(tags) : '[]';
+    const mergeHistoryJson = Array.isArray(mergeHistory) ? JSON.stringify(mergeHistory) : null;
+
+    const insert = db.prepare(`
+      INSERT INTO facts (
+        brain, content, source, file_name, file_path, file_type, tags_json,
+        parent_id, is_document_root, is_unified_context_node, document_title,
+        semantic_section_count, merge_history_json, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const result = insert.run(
+      brain.trim().toLowerCase(),
+      content.trim(),
+      source.trim(),
+      resolvedFileName,
+      resolvedFilePath,
+      resolvedFileType,
+      tagsJson,
+      parentId ?? null,
+      isDocumentRoot ? 1 : 0,
+      isUnifiedContextNode ? 1 : 0,
+      documentTitle || null,
+      semanticSectionCount ?? null,
+      mergeHistoryJson,
+      now,
+      now
+    );
+
+    const newFact = db.prepare('SELECT * FROM facts WHERE id = ?').get(result.lastInsertRowid);
+    res.json(serializeFactRow(newFact));
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to persist fact' });
   }
-
-  const now = new Date().toISOString();
-  const resolvedFileName = fileName || file_name || null;
-  const resolvedFilePath = filePath || file_path || resolvedFileName;
-  const resolvedFileType = fileType || file_type || null;
-  const tagsJson = Array.isArray(tags) ? JSON.stringify(tags) : '[]';
-
-  const insert = db.prepare(`
-    INSERT INTO facts (brain, content, source, file_name, file_path, file_type, tags_json, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const result = insert.run(
-    brain.trim().toLowerCase(),
-    content.trim(),
-    source.trim(),
-    resolvedFileName,
-    resolvedFilePath,
-    resolvedFileType,
-    tagsJson,
-    now,
-    now
-  );
-
-  const newFact = db.prepare('SELECT * FROM facts WHERE id = ?').get(result.lastInsertRowid);
-  res.json(serializeFactRow(newFact));
 });
 
-// 6. Correct Fact API
+// 6. Correct / Update Fact API
 app.post('/api/correct', (req, res) => {
-  const { id, content, tags } = req.body;
-  if (id === undefined || (!content && !Array.isArray(tags))) {
-    return res.status(400).json({ error: 'id and content or tags required' });
-  }
-  const now = new Date().toISOString();
-  if (content && Array.isArray(tags)) {
-    db.prepare('UPDATE facts SET content = ?, tags_json = ?, updated_at = ? WHERE id = ?').run(
-      content.trim(),
-      JSON.stringify(tags),
+  try {
+    const {
+      id,
+      content,
+      tags,
+      fileName,
+      filePath,
+      fileType,
+      documentTitle,
+      semanticSectionCount,
+      mergeHistory,
+      isDocumentRoot,
+      isUnifiedContextNode,
+    } = req.body;
+    if (id === undefined || (!content && !Array.isArray(tags))) {
+      return res.status(400).json({ error: 'id and content or tags are required' });
+    }
+
+    const existing = db.prepare('SELECT * FROM facts WHERE id = ?').get(Number(id)) as any;
+    if (!existing) {
+      return res.status(404).json({ error: `Destination node #${id} not found on backend` });
+    }
+
+    const now = new Date().toISOString();
+    const nextContent = typeof content === 'string' ? content.trim() : existing.content;
+    const nextTagsJson = Array.isArray(tags) ? JSON.stringify(tags) : existing.tags_json;
+    const nextFileName = fileName !== undefined ? fileName : existing.file_name;
+    const nextFilePath = filePath !== undefined ? filePath : existing.file_path;
+    const nextFileType = fileType !== undefined ? fileType : existing.file_type;
+    const nextDocTitle = documentTitle !== undefined ? documentTitle : existing.document_title;
+    const nextSectionCount =
+      semanticSectionCount !== undefined ? semanticSectionCount : existing.semantic_section_count;
+    const nextMergeHistoryJson = Array.isArray(mergeHistory)
+      ? JSON.stringify(mergeHistory)
+      : existing.merge_history_json;
+    const nextIsDocRoot =
+      isDocumentRoot !== undefined ? (isDocumentRoot ? 1 : 0) : existing.is_document_root;
+    const nextIsUnified =
+      isUnifiedContextNode !== undefined
+        ? isUnifiedContextNode
+          ? 1
+          : 0
+        : existing.is_unified_context_node;
+
+    db.prepare(`
+      UPDATE facts
+      SET content = ?,
+          tags_json = ?,
+          file_name = ?,
+          file_path = ?,
+          file_type = ?,
+          document_title = ?,
+          semantic_section_count = ?,
+          merge_history_json = ?,
+          is_document_root = ?,
+          is_unified_context_node = ?,
+          updated_at = ?
+      WHERE id = ?
+    `).run(
+      nextContent,
+      nextTagsJson,
+      nextFileName,
+      nextFilePath,
+      nextFileType,
+      nextDocTitle,
+      nextSectionCount,
+      nextMergeHistoryJson,
+      nextIsDocRoot,
+      nextIsUnified,
       now,
       Number(id)
     );
-  } else if (content) {
-    db.prepare('UPDATE facts SET content = ?, updated_at = ? WHERE id = ?').run(content.trim(), now, Number(id));
-  } else if (Array.isArray(tags)) {
-    db.prepare('UPDATE facts SET tags_json = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(tags), now, Number(id));
+
+    const updatedRow = db.prepare('SELECT * FROM facts WHERE id = ?').get(Number(id));
+    res.json({ ok: true, id: Number(id), updated_at: now, fact: serializeFactRow(updatedRow) });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to update fact on backend' });
   }
-  res.json({ ok: true, id, updated_at: now });
 });
 
 // 7. Forget / Delete Fact API
