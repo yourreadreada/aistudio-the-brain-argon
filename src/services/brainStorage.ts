@@ -673,6 +673,201 @@ class BrainStorageService {
     return fact;
   }
 
+  /**
+   * Creates a local fact and waits for the backend to confirm its durable save.
+   * This is intentionally separate from remember(), which retains its offline-first
+   * fire-and-forget behavior for legacy UI flows.
+   */
+  private async rememberDurably(
+    brain: string,
+    content: string,
+    source: AISource,
+    fileName?: string,
+    fileType?: FactFileType,
+    tags?: string[],
+    filePath?: string
+  ): Promise<Fact> {
+    const response = await fetch(`${API_BASE}/api/remember`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        brain: brain.trim().toLowerCase(),
+        content: content.trim(),
+        source,
+        fileName,
+        filePath,
+        fileType,
+        tags: tags || [],
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Backend save failed (HTTP ${response.status})`);
+    }
+
+    const saved = (await response.json()) as Fact;
+    if (!saved || typeof saved.id !== 'number') {
+      throw new Error('Backend did not return a saved fact ID');
+    }
+
+    const fact: Fact = {
+      ...saved,
+      brain: saved.brain || brain.trim().toLowerCase(),
+      content: saved.content || content.trim(),
+      source: saved.source || source,
+      fileName: saved.fileName || fileName,
+      filePath: saved.filePath || filePath,
+      fileType: saved.fileType || fileType,
+      tags: saved.tags || tags || [],
+    };
+
+    this.facts.unshift(fact);
+    this.createBrain(fact.brain);
+    this.saveLocalFacts();
+    this.recordActivity(fact, 'created');
+    this.notify();
+    return fact;
+  }
+
+  /**
+   * Save an imported semantic document and resolve only after the backend confirms
+   * its write. Existing local objects are restored if an update cannot be persisted.
+   */
+  public async ingestSemanticFileDurably(
+    brain: string,
+    source: AISource,
+    rawText: string,
+    fileName?: string,
+    filePath?: string,
+    fileType?: FactFileType,
+    tags?: string[],
+    mergeStrategy: MergeStrategy = 'auto-merge'
+  ): Promise<IngestOperationResult> {
+    const text = rawText.trim();
+    if (!text) throw new Error('Cannot ingest empty text');
+
+    const resolvedBrain = brain.trim().toLowerCase();
+    const effectivePath = filePath || fileName || 'document.md';
+    const effectiveFileName = fileName || effectivePath.split(/[\\\\/]/).pop() || 'document.md';
+    const resolvedType = fileType || inferFileTypeFromExtension(effectiveFileName);
+    const existingFact = this.findNodeByFilePath(resolvedBrain, effectivePath);
+
+    if (existingFact) {
+      const diff = detectIncrementalDiff(existingFact.content, text, resolvedType, effectiveFileName);
+      if (diff.isIdentical && mergeStrategy !== 'replace') {
+        return {
+          fact: existingFact,
+          action: 'unchanged',
+          message: `Identical content detected for "${effectiveFileName}". Existing node #${existingFact.id} was preserved.`,
+          sectionsCount: existingFact.semanticSectionCount || 1,
+          isExistingNode: true,
+          previousId: existingFact.id,
+        };
+      }
+
+      if (mergeStrategy === 'auto-merge' || mergeStrategy === 'replace') {
+        const previousSnapshot: Fact = {
+          ...existingFact,
+          tags: existingFact.tags ? [...existingFact.tags] : [],
+          mergeHistory: existingFact.mergeHistory ? [...existingFact.mergeHistory] : [],
+        };
+        const parsed = parseSemanticSections(
+          mergeStrategy === 'replace' ? text : diff.mergedContent,
+          resolvedType,
+          effectiveFileName
+        );
+        const nextContent = mergeStrategy === 'replace' ? text : diff.mergedContent;
+        const now = new Date().toISOString();
+        const nextTags = tags?.length
+          ? Array.from(new Set([...(existingFact.tags || []), ...tags]))
+          : existingFact.tags || [];
+
+        const response = await fetch(`${API_BASE}/api/correct`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: existingFact.id, content: nextContent, tags: nextTags }),
+        });
+        if (!response.ok) {
+          throw new Error(`Backend update failed (HTTP ${response.status})`);
+        }
+        const confirmation = await response.json();
+        if (!confirmation?.ok || Number(confirmation.id) !== existingFact.id) {
+          throw new Error('Backend did not confirm the updated fact');
+        }
+
+        existingFact.content = nextContent;
+        existingFact.updated_at = confirmation.updated_at || now;
+        existingFact.tags = nextTags;
+        existingFact.isUnifiedContextNode = true;
+        existingFact.isDocumentRoot = true;
+        existingFact.semanticSectionCount = parsed.sections.length;
+        existingFact.fileName = existingFact.fileName || effectiveFileName;
+        existingFact.filePath = existingFact.filePath || effectivePath;
+        existingFact.documentTitle = existingFact.documentTitle || effectiveFileName.replace(/\\.[^/.]+$/, '');
+        existingFact.mergeHistory = [
+          {
+            timestamp: now,
+            action: mergeStrategy === 'replace' ? 'updated' : 'merged',
+            summary: mergeStrategy === 'replace'
+              ? `Replaced content with updated file (${parsed.sections.length} semantic sections)`
+              : diff.summary,
+            previousContentLength: previousSnapshot.content.length,
+            newContentLength: nextContent.length,
+          },
+          ...(existingFact.mergeHistory || []),
+        ];
+        this.saveLocalFacts();
+        this.recordActivity(existingFact, 'modified');
+        this.notify();
+
+        return {
+          fact: existingFact,
+          action: mergeStrategy === 'replace' ? 'updated' : 'merged',
+          message: mergeStrategy === 'replace'
+            ? `Replaced content of node #${existingFact.id} with revised file context.`
+            : diff.summary,
+          sectionsCount: parsed.sections.length,
+          isExistingNode: true,
+          previousId: existingFact.id,
+        };
+      }
+    }
+
+    const parsed = parseSemanticSections(text, resolvedType, effectiveFileName);
+    const cleanTitle = parsed.title || effectiveFileName.replace(/\\.[^/.]+$/, '');
+    const savedFact = await this.rememberDurably(
+      resolvedBrain,
+      text,
+      source,
+      effectiveFileName,
+      resolvedType,
+      tags,
+      effectivePath
+    );
+    savedFact.isDocumentRoot = true;
+    savedFact.isUnifiedContextNode = true;
+    savedFact.documentTitle = cleanTitle;
+    savedFact.semanticSectionCount = parsed.sections.length;
+    savedFact.mergeHistory = [
+      {
+        timestamp: savedFact.created_at,
+        action: 'created',
+        summary: `Unified coherent context node initialized from ${effectiveFileName} (${parsed.sections.length} semantic sections)`,
+        newContentLength: text.length,
+      },
+    ];
+    this.saveLocalFacts();
+    this.notify();
+
+    return {
+      fact: savedFact,
+      action: 'created',
+      message: `Created unified coherent context node #${savedFact.id} with ${parsed.sections.length} semantic sections.`,
+      sectionsCount: parsed.sections.length,
+      isExistingNode: false,
+    };
+  }
+
   public correct(id: number, newContent: string): boolean {
     const fact = this.facts.find((f) => f.id === id);
     if (!fact) return false;
