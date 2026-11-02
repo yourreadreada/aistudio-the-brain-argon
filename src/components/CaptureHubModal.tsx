@@ -464,104 +464,106 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     if (expandedPreviewId === id) setExpandedPreviewId(null);
   };
 
-  const handleCommitReviewQueue = () => {
+  const handleCommitReviewQueue = async () => {
     const actionable = reviewQueue.filter(
       (item) => item.status !== 'extracting' && item.status !== 'imported'
     );
     if (actionable.length === 0) return;
 
     setIsCommitting(true);
+    setCommitBanner(null);
     let createdCount = 0;
     let mergedCount = 0;
     let replacedCount = 0;
     let skippedCount = 0;
+    let failedCount = 0;
 
-    const updatedQueue = reviewQueue.map((item) => {
-      if (item.status === 'extracting' || item.status === 'imported') {
-        return item;
-      }
-
+    for (const item of actionable) {
       if (item.resolution === 'skip' || !item.text.trim()) {
         skippedCount++;
-        return {
-          ...item,
-          status: 'skipped' as ReviewItemStatus,
-          statusMessage: 'Skipped by user resolution',
-        };
+        setReviewQueue((prev) => prev.map((queued) => queued.id === item.id
+          ? { ...queued, status: 'skipped', statusMessage: 'Skipped by user resolution' }
+          : queued));
+        continue;
       }
 
-      const detectedType = inferFileTypeFromExtension(
-        item.extension || item.fileName
-      );
-      const formattedContent =
-        item.title.trim() &&
-        !item.text.trim().startsWith(`# ${item.title.trim()}`)
-          ? `# ${item.title.trim()}\n\n${item.text}`
-          : item.text;
+      setReviewQueue((prev) => prev.map((queued) => queued.id === item.id
+        ? { ...queued, status: 'importing', statusMessage: 'Saving to backend…' }
+        : queued));
 
-      if (
-        ingestStrategy === 'semantic' ||
-        ingestStrategy === 'single' ||
-        item.resolution === 'merge' ||
-        item.resolution === 'replace'
-      ) {
-        const mergeMode =
-          item.resolution === 'replace' ? 'replace' : 'auto-merge';
-        const res = brainStore.ingestSemanticFile(
-          item.destinationBrain,
-          item.source,
-          formattedContent,
-          item.fileName,
-          item.fileName,
-          detectedType,
-          item.tags,
-          mergeMode
-        );
-        if (res.action === 'merged') {
-          if (item.resolution === 'replace') replacedCount++;
-          else mergedCount++;
-        } else if (res.action === 'unchanged') {
-          skippedCount++;
+      const detectedType = inferFileTypeFromExtension(item.extension || item.fileName);
+      const formattedContent = item.title.trim() && !item.text.trim().startsWith(`# ${item.title.trim()}`)
+        ? `# ${item.title.trim()}\\n\\n${item.text}`
+        : item.text;
+
+      try {
+        if (
+          ingestStrategy === 'semantic' ||
+          ingestStrategy === 'single' ||
+          item.resolution === 'merge' ||
+          item.resolution === 'replace'
+        ) {
+          const mergeMode = item.resolution === 'replace' ? 'replace' : 'auto-merge';
+          const result = await brainStore.ingestSemanticFileDurably(
+            item.destinationBrain,
+            item.source,
+            formattedContent,
+            item.fileName,
+            item.fileName,
+            detectedType,
+            item.tags,
+            mergeMode
+          );
+
+          if (result.action === 'merged') mergedCount++;
+          else if (result.action === 'updated') replacedCount++;
+          else if (result.action === 'unchanged') skippedCount++;
+          else createdCount++;
+
+          setReviewQueue((prev) => prev.map((queued) => queued.id === item.id
+            ? {
+                ...queued,
+                status: 'imported',
+                statusMessage: result.action === 'unchanged'
+                  ? 'Already present in backend; no duplicate created'
+                  : 'Backend confirmed durable save',
+              }
+            : queued));
         } else {
-          createdCount++;
+          // Legacy chunk/branching strategies still use their existing local-first API.
+          // Do not claim cloud persistence for these strategies until they gain a durable batch API.
+          const count = onIngest(
+            item.destinationBrain,
+            item.source,
+            formattedContent,
+            chunkSize,
+            item.fileName,
+            detectedType,
+            ingestStrategy
+          );
+          createdCount += count;
+          setReviewQueue((prev) => prev.map((queued) => queued.id === item.id
+            ? { ...queued, status: 'imported', statusMessage: 'Stored locally (legacy ingestion strategy)' }
+            : queued));
         }
-      } else {
-        const count = onIngest(
-          item.destinationBrain,
-          item.source,
-          formattedContent,
-          chunkSize,
-          item.fileName,
-          detectedType,
-          ingestStrategy
-        );
-        createdCount += count;
+      } catch (error) {
+        failedCount++;
+        const message = error instanceof Error ? error.message : 'Unknown save error';
+        setReviewQueue((prev) => prev.map((queued) => queued.id === item.id
+          ? { ...queued, status: 'error', statusMessage: `Save failed: ${message}. Retry by committing again.` }
+          : queued));
       }
+    }
 
-      return {
-        ...item,
-        status: 'imported' as ReviewItemStatus,
-        statusMessage:
-          item.resolution === 'merge'
-            ? 'Incrementally merged into existing node'
-            : item.resolution === 'replace'
-            ? 'Replaced existing node content in-place'
-            : 'Stored in Brain',
-      };
-    });
-
-    setReviewQueue(updatedQueue);
     setIsCommitting(false);
-
     const summarySegments: string[] = [];
     if (createdCount > 0) summarySegments.push(`${createdCount} created`);
     if (mergedCount > 0) summarySegments.push(`${mergedCount} merged`);
     if (replacedCount > 0) summarySegments.push(`${replacedCount} replaced`);
     if (skippedCount > 0) summarySegments.push(`${skippedCount} skipped`);
+    if (failedCount > 0) summarySegments.push(`${failedCount} failed — retry available`);
 
-    setCommitBanner(
-      `Import queue processed: ${summarySegments.join(' · ') || 'Complete'}.`
-    );
+    setCommitBanner(`Import queue processed: ${summarySegments.join(' · ') || 'No changes'}.`);
   };
 
   // --- Workflow 3: Paste Conversation Handlers ---
@@ -622,7 +624,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     setActiveTab('import');
   };
 
-  const handleStorePasteDirectly = () => {
+  const handleStorePasteDirectly = async () => {
     if (!pasteContent.trim()) return;
     const cleanTitle =
       pasteTitle.trim() ||
@@ -636,24 +638,28 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
     const formattedText = pasteContent.trim().startsWith('# ')
       ? pasteContent
-      : `# ${cleanTitle}\n\n${pasteContent}`;
+      : `# ${cleanTitle}\\n\\n${pasteContent}`;
 
-    const res = brainStore.ingestSemanticFile(
-      pasteBrain,
-      pasteSource,
-      formattedText,
-      fileName,
-      fileName,
-      'chat',
-      parsedTags,
-      'auto-merge'
-    );
-
-    setPasteStatusBanner(res.message);
-    setPasteTitle('');
-    setPasteContent('');
-    setPasteTagsInput('');
-    setTimeout(() => setPasteStatusBanner(null), 3500);
+    try {
+      const result = await brainStore.ingestSemanticFileDurably(
+        pasteBrain,
+        pasteSource,
+        formattedText,
+        fileName,
+        fileName,
+        'chat',
+        parsedTags,
+        'auto-merge'
+      );
+      setPasteStatusBanner(result.message);
+      setPasteTitle('');
+      setPasteContent('');
+      setPasteTagsInput('');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown save error';
+      setPasteStatusBanner(`Save failed: ${message}. Your text is still here; retry when the backend is available.`);
+    }
+    setTimeout(() => setPasteStatusBanner(null), 5000);
   };
 
   // --- Workflow 4: Export Handlers ---
@@ -1492,7 +1498,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                                 <input
                                   type="text"
                                   value={item.title}
-                                  disabled={item.status === 'imported'}
+                                  disabled={item.status === 'imported' || item.status === 'importing'}
                                   onChange={(e) =>
                                     handleUpdateQueueItem(item.id, {
                                       title: e.target.value,
@@ -1591,6 +1597,9 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                                   <span className="text-emerald-400">
                                     Ready · New Node
                                   </span>
+                                )}
+                                {item.status === 'importing' && (
+                                  <span className="text-indigo-300">Saving to backend…</span>
                                 )}
                                 {item.status === 'duplicate_identical' && (
                                   <span className="text-amber-300">
