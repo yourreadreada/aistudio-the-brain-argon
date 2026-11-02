@@ -1113,6 +1113,15 @@ class BrainStorageService {
     fileType?: FactFileType;
     tags?: string[];
     targetFactId?: number;
+    strategy?: IngestStrategy;
+    chunkSize?: number;
+    onProgress?: (progress: {
+      mode: 'determinate' | 'indeterminate';
+      current?: number;
+      total?: number;
+      unit?: string;
+      label?: string;
+    }) => void;
   }): Promise<IngestOperationResult> {
     const rawText = (params.content || '').trim();
     if (!rawText) {
@@ -1167,6 +1176,11 @@ class BrainStorageService {
 
     // CASE 1: MERGE into existing destination node
     if (params.action === 'merge' && existingFact) {
+      params.onProgress?.({
+        mode: 'indeterminate',
+        label: 'Merging with destination node… [indeterminate]',
+      });
+
       const diff = detectIncrementalDiff(
         existingFact.content,
         formattedText,
@@ -1264,6 +1278,11 @@ class BrainStorageService {
 
     // CASE 2: REPLACE existing destination node content
     if (params.action === 'replace' && existingFact) {
+      params.onProgress?.({
+        mode: 'indeterminate',
+        label: 'Replacing destination node… [indeterminate]',
+      });
+
       const parsed = parseSemanticSections(
         formattedText,
         resolvedType,
@@ -1345,7 +1364,143 @@ class BrainStorageService {
       };
     }
 
-    // CASE 3: CREATE new node in destination Brain (for 'create', or 'merge'/'replace' when no destination node exists yet)
+    // CASE 3: Multi-chunk or branching creation with measurable determinate chunk progress
+    const strategy = params.strategy || 'semantic';
+    if (strategy === 'chunk') {
+      const targetChunkSize = Math.max(200, params.chunkSize || 1200);
+      const paragraphs = formattedText
+        .split('\n\n')
+        .map((p) => p.trim())
+        .filter(Boolean);
+      const chunks: string[] = [];
+      let current = '';
+      for (const para of paragraphs) {
+        if (current && current.length + para.length + 2 > targetChunkSize) {
+          chunks.push(current);
+          current = para;
+        } else {
+          current = current ? `${current}\n\n${para}` : para;
+        }
+      }
+      if (current) chunks.push(current);
+
+      if (chunks.length > 1) {
+        let firstFact: Fact | null = null;
+        for (let i = 0; i < chunks.length; i++) {
+          params.onProgress?.({
+            mode: 'determinate',
+            current: i,
+            total: chunks.length,
+            unit: 'chunks',
+            label: 'Persisting chunks',
+          });
+          const savedChunk = await this.rememberDurably(
+            resolvedBrain,
+            chunks[i],
+            params.source,
+            effectiveFileName,
+            resolvedType,
+            params.tags,
+            effectivePath
+          );
+          if (!firstFact) firstFact = savedChunk;
+          params.onProgress?.({
+            mode: 'determinate',
+            current: i + 1,
+            total: chunks.length,
+            unit: 'chunks',
+            label: 'Persisting chunks',
+          });
+        }
+
+        return {
+          fact: firstFact!,
+          action: 'created',
+          message: `Imported ${chunks.length} chunks into "${resolvedBrain}" (starting at Node #${firstFact!.id})`,
+          sectionsCount: chunks.length,
+          isExistingNode: false,
+        };
+      }
+    }
+
+    if (strategy === 'branching') {
+      const parsedBranch = parseSemanticSections(
+        formattedText,
+        resolvedType,
+        effectiveFileName
+      );
+      const sections = parsedBranch.sections.filter((s) => s.content.trim());
+      if (sections.length > 1) {
+        const totalRecords = 1 + sections.length;
+        params.onProgress?.({
+          mode: 'determinate',
+          current: 0,
+          total: totalRecords,
+          unit: 'records',
+          label: 'Persisting branching nodes',
+        });
+        const previewSnippet =
+          rawText.length > 300 ? rawText.slice(0, 300) + '...' : rawText;
+        const rootFact = await this.rememberDurably(
+          resolvedBrain,
+          `[Document: ${cleanTitle}]\n${previewSnippet}`,
+          params.source,
+          effectiveFileName,
+          resolvedType,
+          [...(params.tags || []), 'document-hub'],
+          effectivePath
+        );
+        rootFact.isDocumentRoot = true;
+        rootFact.isUnifiedContextNode = true;
+        rootFact.documentTitle = cleanTitle;
+        rootFact.semanticSectionCount = sections.length;
+
+        params.onProgress?.({
+          mode: 'determinate',
+          current: 1,
+          total: totalRecords,
+          unit: 'records',
+          label: 'Persisting branching nodes',
+        });
+
+        for (let i = 0; i < sections.length; i++) {
+          const childFact = await this.rememberDurably(
+            resolvedBrain,
+            sections[i].content.trim(),
+            params.source,
+            effectiveFileName,
+            resolvedType,
+            params.tags,
+            effectivePath
+          );
+          childFact.parentId = rootFact.id;
+          params.onProgress?.({
+            mode: 'determinate',
+            current: i + 2,
+            total: totalRecords,
+            unit: 'records',
+            label: 'Persisting branching nodes',
+          });
+        }
+        this.saveLocalFacts();
+        this.notify();
+
+        return {
+          fact: rootFact,
+          action: 'created',
+          message: `Imported Hub Node #${rootFact.id} + ${sections.length} branch nodes in "${resolvedBrain}"`,
+          sectionsCount: sections.length,
+          isExistingNode: false,
+        };
+      }
+    }
+
+    // CASE 4: CREATE single unified node in destination Brain (indeterminate progress during single HTTP request)
+    params.onProgress?.({
+      mode: 'indeterminate',
+      label: 'Processing… [indeterminate]',
+    });
+
     const parsed = parseSemanticSections(
       formattedText,
       resolvedType,

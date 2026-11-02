@@ -105,15 +105,29 @@ function countMarkdownSectionsOrTurns(text: string): { count: number; label: str
   return { count: Math.max(1, paras.length), label: paras.length === 1 ? 'block' : 'blocks' };
 }
 
+export interface ExtractionProgressInfo {
+  mode: 'determinate' | 'indeterminate';
+  phase: 'extracting';
+  current?: number;
+  total?: number;
+  unit?: string;
+  label?: string;
+}
+
+export type ExtractionProgressCallback = (info: ExtractionProgressInfo) => void;
+
 /**
  * Unpacks a file or a .zip archive into one or more ExtractedFileResult items for the Review Queue.
  */
-export async function extractItemsFromFile(file: File): Promise<ExtractedFileResult[]> {
+export async function extractItemsFromFile(
+  file: File,
+  onProgress?: ExtractionProgressCallback
+): Promise<ExtractedFileResult[]> {
   const ext = '.' + (file.name.split('.').pop() || '').toLowerCase();
   if (ext === '.zip') {
-    return await extractZipArchive(file);
+    return await extractZipArchive(file, onProgress);
   }
-  const single = await extractTextFromFile(file);
+  const single = await extractTextFromFile(file, onProgress);
   return [single];
 }
 
@@ -121,7 +135,10 @@ export async function extractItemsFromFile(file: File): Promise<ExtractedFileRes
  * Extracts plain text from a single file:
  * PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), Markdown (.md), Text (.txt), JSON chat exports, ZIP, or Images.
  */
-export async function extractTextFromFile(file: File): Promise<ExtractedFileResult> {
+export async function extractTextFromFile(
+  file: File,
+  onProgress?: ExtractionProgressCallback
+): Promise<ExtractedFileResult> {
   const fileName = file.name;
   const title = cleanTitleFromFileName(fileName);
   const extension = '.' + (fileName.split('.').pop() || '').toLowerCase();
@@ -131,7 +148,7 @@ export async function extractTextFromFile(file: File): Promise<ExtractedFileResu
   try {
     // 0. If a .zip file is passed to single-file extractor, combine or return first summary
     if (extension === '.zip') {
-      const items = await extractZipArchive(file);
+      const items = await extractZipArchive(file, onProgress);
       if (items.length === 0) {
         return {
           title,
@@ -160,6 +177,11 @@ export async function extractTextFromFile(file: File): Promise<ExtractedFileResu
 
     // 1. Markdown, Plain Text, or CSV
     if (['.md', '.markdown', '.txt', '.csv'].includes(extension)) {
+      onProgress?.({
+        mode: 'indeterminate',
+        phase: 'extracting',
+        label: 'Reading text file…',
+      });
       const text = (await file.text()).trim();
       const detectedSource = detectSourceFromFileName(fileName, text);
       const stats = countMarkdownSectionsOrTurns(text);
@@ -179,10 +201,15 @@ export async function extractTextFromFile(file: File): Promise<ExtractedFileResu
 
     // 2. JSON Chat Exports (ChatGPT conversations.json, Claude conversations.json, or structured memory)
     if (extension === '.json') {
+      onProgress?.({
+        mode: 'indeterminate',
+        phase: 'extracting',
+        label: 'Parsing JSON export…',
+      });
       const rawText = await file.text();
       try {
         const parsed = JSON.parse(rawText);
-        const extracted = extractChatFromJson(parsed, fileName);
+        const extracted = extractChatFromJson(parsed, fileName, onProgress);
         return {
           title: extracted.title || title,
           fileName,
@@ -212,26 +239,31 @@ export async function extractTextFromFile(file: File): Promise<ExtractedFileResu
 
     // 3. PDF Documents
     if (extension === '.pdf') {
-      return await extractPdf(file, initialSource);
+      return await extractPdf(file, initialSource, onProgress);
     }
 
     // 4. Microsoft Word Documents (.docx)
     if (extension === '.docx') {
-      return await extractDocx(file, initialSource);
+      return await extractDocx(file, initialSource, onProgress);
     }
 
     // 5. Microsoft Excel Spreadsheets (.xlsx, .xls)
     if (['.xlsx', '.xls'].includes(extension)) {
-      return await extractXlsx(file, initialSource);
+      return await extractXlsx(file, initialSource, onProgress);
     }
 
     // 6. Microsoft PowerPoint Presentations (.pptx)
     if (extension === '.pptx') {
-      return await extractPptx(file, initialSource);
+      return await extractPptx(file, initialSource, onProgress);
     }
 
     // 7. Images
     if (['.png', '.jpg', '.jpeg', '.webp'].includes(extension)) {
+      onProgress?.({
+        mode: 'indeterminate',
+        phase: 'extracting',
+        label: 'Inspecting image metadata…',
+      });
       return await extractImageInfo(file, initialSource);
     }
 
@@ -262,28 +294,51 @@ export async function extractTextFromFile(file: File): Promise<ExtractedFileResu
 /**
  * Unpacks a .zip archive using JSZip and extracts all supported inner files or conversation exports.
  */
-async function extractZipArchive(zipFile: File): Promise<ExtractedFileResult[]> {
+async function extractZipArchive(
+  zipFile: File,
+  onProgress?: ExtractionProgressCallback
+): Promise<ExtractedFileResult[]> {
+  onProgress?.({
+    mode: 'indeterminate',
+    phase: 'extracting',
+    label: 'Reading ZIP archive index…',
+  });
   const JSZipModule = await import('jszip');
   const JSZip = (JSZipModule as any).default || JSZipModule;
   const arrayBuffer = await zipFile.arrayBuffer();
   const zip = await JSZip.loadAsync(arrayBuffer);
 
   const results: ExtractedFileResult[] = [];
-  const entries = Object.keys(zip.files);
+  const allEntries = Object.keys(zip.files);
 
-  for (const relativePath of entries) {
+  // Filter supported entries first so we have a real, measurable total count
+  const validPaths = allEntries.filter((relativePath) => {
     const zipEntry = zip.files[relativePath];
-    if (!zipEntry || zipEntry.dir) continue;
-    // Skip macOS metadata / hidden files
+    if (!zipEntry || zipEntry.dir) return false;
     if (relativePath.includes('__MACOSX') || relativePath.split('/').pop()?.startsWith('.')) {
-      continue;
+      return false;
     }
-
     const baseName = relativePath.split('/').pop() || relativePath;
     const ext = '.' + (baseName.split('.').pop() || '').toLowerCase();
+    return SUPPORTED_FILE_EXTENSIONS.includes(ext) && ext !== '.zip';
+  });
 
-    if (!SUPPORTED_FILE_EXTENSIONS.includes(ext) || ext === '.zip') {
-      continue;
+  const totalFiles = validPaths.length;
+
+  for (let idx = 0; idx < validPaths.length; idx++) {
+    const relativePath = validPaths[idx];
+    const zipEntry = zip.files[relativePath];
+    const baseName = relativePath.split('/').pop() || relativePath;
+
+    if (totalFiles > 0) {
+      onProgress?.({
+        mode: 'determinate',
+        phase: 'extracting',
+        current: idx + 1,
+        total: totalFiles,
+        unit: totalFiles === 1 ? 'file' : 'files',
+        label: `Unpacking ${baseName}`,
+      });
     }
 
     try {
@@ -306,7 +361,16 @@ async function extractZipArchive(zipFile: File): Promise<ExtractedFileResult[]> 
 }
 
 // PDF Extraction (Lazy-loaded)
-async function extractPdf(file: File, detectedSource: AISource): Promise<ExtractedFileResult> {
+async function extractPdf(
+  file: File,
+  detectedSource: AISource,
+  onProgress?: ExtractionProgressCallback
+): Promise<ExtractedFileResult> {
+  onProgress?.({
+    mode: 'indeterminate',
+    phase: 'extracting',
+    label: 'Loading PDF document…',
+  });
   const pdfjsLib = await import('pdfjs-dist');
   try {
     pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs`;
@@ -320,6 +384,14 @@ async function extractPdf(file: File, detectedSource: AISource): Promise<Extract
   const pageTexts: string[] = [];
 
   for (let i = 1; i <= numPages; i++) {
+    onProgress?.({
+      mode: 'determinate',
+      phase: 'extracting',
+      current: i,
+      total: numPages,
+      unit: numPages === 1 ? 'page' : 'pages',
+      label: 'Extracting PDF pages',
+    });
     try {
       const page = await pdf.getPage(i);
       const content = await page.getTextContent();
@@ -355,7 +427,16 @@ async function extractPdf(file: File, detectedSource: AISource): Promise<Extract
 }
 
 // Word (.docx) Extraction (Lazy-loaded)
-async function extractDocx(file: File, detectedSource: AISource): Promise<ExtractedFileResult> {
+async function extractDocx(
+  file: File,
+  detectedSource: AISource,
+  onProgress?: ExtractionProgressCallback
+): Promise<ExtractedFileResult> {
+  onProgress?.({
+    mode: 'indeterminate',
+    phase: 'extracting',
+    label: 'Extracting Word document…',
+  });
   const mammothModule = await import('mammoth');
   const mammoth = (mammothModule as any).default || mammothModule;
   const arrayBuffer = await file.arrayBuffer();
@@ -378,14 +459,33 @@ async function extractDocx(file: File, detectedSource: AISource): Promise<Extrac
 }
 
 // Excel (.xlsx, .xls) Extraction (Lazy-loaded)
-async function extractXlsx(file: File, detectedSource: AISource): Promise<ExtractedFileResult> {
+async function extractXlsx(
+  file: File,
+  detectedSource: AISource,
+  onProgress?: ExtractionProgressCallback
+): Promise<ExtractedFileResult> {
+  onProgress?.({
+    mode: 'indeterminate',
+    phase: 'extracting',
+    label: 'Reading workbook…',
+  });
   const XLSX = await import('xlsx');
   const arrayBuffer = await file.arrayBuffer();
   const workbook = XLSX.read(arrayBuffer, { type: 'array' });
   const sheetNames = workbook.SheetNames || [];
   const parts: string[] = [];
 
-  sheetNames.forEach((sheetName) => {
+  sheetNames.forEach((sheetName, idx) => {
+    if (sheetNames.length > 0) {
+      onProgress?.({
+        mode: 'determinate',
+        phase: 'extracting',
+        current: idx + 1,
+        total: sheetNames.length,
+        unit: sheetNames.length === 1 ? 'sheet' : 'sheets',
+        label: 'Extracting sheets',
+      });
+    }
     const worksheet = workbook.Sheets[sheetName];
     if (!worksheet) return;
 
@@ -423,7 +523,16 @@ async function extractXlsx(file: File, detectedSource: AISource): Promise<Extrac
 }
 
 // PowerPoint (.pptx) Extraction (Lazy-loaded)
-async function extractPptx(file: File, detectedSource: AISource): Promise<ExtractedFileResult> {
+async function extractPptx(
+  file: File,
+  detectedSource: AISource,
+  onProgress?: ExtractionProgressCallback
+): Promise<ExtractedFileResult> {
+  onProgress?.({
+    mode: 'indeterminate',
+    phase: 'extracting',
+    label: 'Reading presentation slides…',
+  });
   const JSZipModule = await import('jszip');
   const JSZip = (JSZipModule as any).default || JSZipModule;
   const arrayBuffer = await file.arrayBuffer();
@@ -442,6 +551,14 @@ async function extractPptx(file: File, detectedSource: AISource): Promise<Extrac
   const parser = new DOMParser();
 
   for (let i = 0; i < slideFiles.length; i++) {
+    onProgress?.({
+      mode: 'determinate',
+      phase: 'extracting',
+      current: i + 1,
+      total: slideFiles.length,
+      unit: slideFiles.length === 1 ? 'slide' : 'slides',
+      label: 'Extracting slides',
+    });
     const slideXml = await zip.file(slideFiles[i])?.async('string');
     if (!slideXml) continue;
 
@@ -519,7 +636,8 @@ async function extractImageInfo(file: File, detectedSource: AISource): Promise<E
 // Helper to extract clean conversation logs from ChatGPT or Claude JSON exports
 function extractChatFromJson(
   data: any,
-  fileName: string
+  fileName: string,
+  onProgress?: ExtractionProgressCallback
 ): {
   text: string;
   conversationCount: number;
@@ -530,8 +648,19 @@ function extractChatFromJson(
     const convoLogs: string[] = [];
     let detectedSource: AISource | undefined = undefined;
     let firstTitle: string | undefined = undefined;
+    const totalRecords = data.length;
 
     data.forEach((convo: any, idx: number) => {
+      if (totalRecords > 1) {
+        onProgress?.({
+          mode: 'determinate',
+          phase: 'extracting',
+          current: idx + 1,
+          total: totalRecords,
+          unit: 'records',
+          label: 'Parsing conversations',
+        });
+      }
       const title = convo.title || convo.name || `Conversation ${idx + 1}`;
       if (!firstTitle && (convo.title || convo.name)) {
         firstTitle = convo.title || convo.name;
@@ -587,3 +716,4 @@ function extractChatFromJson(
     conversationCount: 1,
   };
 }
+

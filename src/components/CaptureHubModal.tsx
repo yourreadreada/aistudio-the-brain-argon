@@ -38,14 +38,18 @@ import {
 import {
   ImportReviewQueue,
   ImportReviewItem,
+  ImportItemProgress,
   ReviewResolutionAction,
   ReviewItemStatus,
+  runWithControlledConcurrency,
+  isItemEligibleForAction,
 } from './ImportReviewQueue';
 
 export type CaptureHubTab = 'companion' | 'import' | 'paste' | 'export';
 
 export type {
   ImportReviewItem as ReviewQueueItem,
+  ImportItemProgress,
   ReviewResolutionAction,
   ReviewItemStatus,
 };
@@ -76,6 +80,8 @@ const WORKFLOW_STEPS = [
   'RECALL',
   'EXPORT',
 ] as const;
+
+const BULK_CONCURRENCY_LIMIT = 3;
 
 export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   isOpen,
@@ -114,6 +120,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
   // --- Workflow 2: Import Files & Review Queue State ---
   const [reviewQueue, setReviewQueue] = useState<ImportReviewItem[]>([]);
+  const [selectedQueueIds, setSelectedQueueIds] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
   const [commitBanner, setCommitBanner] = useState<{
@@ -249,6 +256,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   const revalidateQueueItem = (item: ImportReviewItem): ImportReviewItem => {
     if (
       item.status === 'extracting' ||
+      item.status === 'importing' ||
       item.status === 'processing' ||
       item.status === 'imported'
     ) {
@@ -319,6 +327,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         q.status !== 'imported' &&
         q.status !== 'skipped' &&
         q.status !== 'extracting' &&
+        q.status !== 'importing' &&
         q.status !== 'processing' &&
         q.resolution !== 'skip'
     ).length;
@@ -401,17 +410,42 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         duplicateState: 'unable_to_determine',
         resolution: 'create',
         tags: [],
+        progress: {
+          mode: 'indeterminate',
+          phase: 'extracting',
+          label: 'Extracting… [indeterminate]',
+        },
       };
 
       setReviewQueue((prev) => [...prev, placeholderItem]);
 
       try {
         const extractedItems: ExtractedFileResult[] =
-          await extractItemsFromFile(file);
+          await extractItemsFromFile(file, (progInfo) => {
+            setReviewQueue((prev) =>
+              prev.map((item) =>
+                item.id === placeholderId
+                  ? {
+                      ...item,
+                      progress: {
+                        mode: progInfo.mode,
+                        phase: 'extracting',
+                        current: progInfo.current,
+                        total: progInfo.total,
+                        unit: progInfo.unit,
+                        label: progInfo.label,
+                      },
+                    }
+                  : item
+              )
+            );
+          });
+
         const mappedItems: ImportReviewItem[] = extractedItems.map(
           (ext, idx) => {
             const hasErr = ext.status === 'error' || !ext.text.trim();
-            const itemTitle = ext.title || ext.fileName.replace(/\.[^/.]+$/, '');
+            const itemTitle =
+              ext.title || ext.fileName.replace(/\.[^/.]+$/, '');
             const evalRes = computeDuplicateEvaluation(
               ext.text,
               ext.fileName,
@@ -440,6 +474,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               nodeCheck: evalRes.nodeCheck,
               resolution: evalRes.resolution,
               tags: ext.archiveParent ? ['archive-import'] : [],
+              progress: undefined,
             };
           }
         );
@@ -460,6 +495,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                   errorMessage: err?.message || 'Failed to parse file',
                   statusMessage: err?.message || 'Failed to parse file',
                   resolution: 'skip',
+                  progress: undefined,
                 }
               : item
           )
@@ -494,27 +530,60 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
   const handleRemoveQueueItem = (id: string) => {
     setReviewQueue((prev) => prev.filter((item) => item.id !== id));
+    setSelectedQueueIds((prev) => prev.filter((selId) => selId !== id));
   };
 
   /**
    * Executes a single item persistence action ('create' | 'merge' | 'replace')
-   * against the backend. Never optimistically marks as Imported.
+   * against the backend.
+   * - Never optimistically marks as Imported.
+   * - Reports determinate progress ONLY when multi-chunk/record operations provide real counts;
+   *   otherwise uses indeterminate progress ('Processing… [indeterminate]').
    */
   const executeItemPersistence = async (
     item: ImportReviewItem,
     action: 'create' | 'merge' | 'replace'
   ): Promise<boolean> => {
-    if (item.status === 'processing' || item.status === 'extracting') {
+    if (
+      item.status === 'processing' ||
+      item.status === 'importing' ||
+      item.status === 'extracting'
+    ) {
       return false;
     }
 
-    // Mark item as processing and record attempted action
+    // Safeguard: never overwrite destination content when duplicateState is unable_to_determine
+    if (
+      (action === 'merge' || action === 'replace') &&
+      item.duplicateState === 'unable_to_determine'
+    ) {
+      const safeguardMsg =
+        'Cannot merge or replace when duplicate status is "Unable to determine". Destination content was not modified.';
+      setReviewQueue((prev) =>
+        prev.map((q) =>
+          q.id === item.id
+            ? {
+                ...q,
+                status: 'error',
+                errorMessage: safeguardMsg,
+                statusMessage: safeguardMsg,
+                progress: undefined,
+              }
+            : q
+        )
+      );
+      return false;
+    }
+
+    const activeStatus: ReviewItemStatus =
+      action === 'create' ? 'importing' : 'processing';
+
     setReviewQueue((prev) =>
       prev.map((q) =>
         q.id === item.id
           ? {
               ...q,
-              status: 'processing',
+              status: activeStatus,
               resolution: action,
               lastAttemptedAction: action,
               errorMessage: undefined,
@@ -524,6 +593,14 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                   : action === 'replace'
                   ? 'Replacing destination node on backend…'
                   : 'Persisting new node to backend…',
+              progress: {
+                mode: 'indeterminate',
+                phase: action === 'create' ? 'importing' : 'processing',
+                label:
+                  action === 'create'
+                    ? 'Importing… [indeterminate]'
+                    : 'Processing… [indeterminate]',
+              },
             }
           : q
       )
@@ -540,6 +617,27 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         filePath: item.fileName,
         tags: item.tags,
         targetFactId: item.nodeCheck?.existingFact?.id,
+        strategy: ingestStrategy,
+        chunkSize,
+        onProgress: (prog) => {
+          setReviewQueue((prev) =>
+            prev.map((q) =>
+              q.id === item.id
+                ? {
+                    ...q,
+                    progress: {
+                      mode: prog.mode,
+                      phase: action === 'create' ? 'importing' : 'processing',
+                      current: prog.current,
+                      total: prog.total,
+                      unit: prog.unit,
+                      label: prog.label,
+                    },
+                  }
+                : q
+            )
+          );
+        },
       });
 
       // Only mark as Imported AFTER backend confirmation succeeds
@@ -552,6 +650,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 resolution: action,
                 errorMessage: undefined,
                 statusMessage: result.message,
+                progress: undefined,
               }
             : q
         )
@@ -570,6 +669,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 errorMessage: message,
                 statusMessage: message,
                 lastAttemptedAction: action,
+                progress: undefined,
               }
             : q
         )
@@ -578,20 +678,30 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     }
   };
 
-  const handleMergeItem = async (item: ImportReviewItem) => {
-    await executeItemPersistence(item, 'merge');
+  const handleMergeItem = async (item: ImportReviewItem): Promise<boolean> => {
+    return await executeItemPersistence(item, 'merge');
   };
 
-  const handleReplaceItem = async (item: ImportReviewItem) => {
-    await executeItemPersistence(item, 'replace');
+  const handleReplaceItem = async (
+    item: ImportReviewItem
+  ): Promise<boolean> => {
+    return await executeItemPersistence(item, 'replace');
   };
 
-  const handleImportNewItem = async (item: ImportReviewItem) => {
-    await executeItemPersistence(item, 'create');
+  const handleImportNewItem = async (
+    item: ImportReviewItem
+  ): Promise<boolean> => {
+    return await executeItemPersistence(item, 'create');
   };
 
   const handleSkipItem = (item: ImportReviewItem) => {
-    if (item.status === 'processing' || item.status === 'extracting') return;
+    if (
+      item.status === 'processing' ||
+      item.status === 'importing' ||
+      item.status === 'extracting'
+    ) {
+      return;
+    }
     setReviewQueue((prev) =>
       prev.map((q) =>
         q.id === item.id
@@ -601,13 +711,14 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               resolution: 'skip',
               errorMessage: undefined,
               statusMessage: 'Skipped — destination not modified',
+              progress: undefined,
             }
           : q
       )
     );
   };
 
-  const handleRetryItem = async (item: ImportReviewItem) => {
+  const handleRetryItem = async (item: ImportReviewItem): Promise<boolean> => {
     const retryAction =
       item.lastAttemptedAction ||
       (item.resolution === 'skip'
@@ -615,13 +726,81 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           ? 'create'
           : 'merge'
         : item.resolution);
-    await executeItemPersistence(item, retryAction);
+    return await executeItemPersistence(item, retryAction);
+  };
+
+  // --- Bulk Action Handlers (Reusing single-item persistence + Controlled Concurrency) ---
+  const handleBulkAction = async (
+    itemsToProcess: ImportReviewItem[],
+    action: 'merge' | 'replace' | 'skip'
+  ) => {
+    if (itemsToProcess.length === 0) return;
+
+    if (action === 'skip') {
+      let skippedCount = 0;
+      for (const item of itemsToProcess) {
+        if (isItemEligibleForAction(item, 'skip').eligible) {
+          handleSkipItem(item);
+          skippedCount++;
+        }
+      }
+      if (skippedCount > 0) {
+        setCommitBanner({
+          type: 'success',
+          text: `Bulk Skip complete: ${skippedCount} ${
+            skippedCount === 1 ? 'item' : 'items'
+          } marked as Skipped.`,
+        });
+      }
+      return;
+    }
+
+    setIsCommitting(true);
+    setCommitBanner(null);
+
+    let succeededCount = 0;
+    let failedCount = 0;
+
+    try {
+      await runWithControlledConcurrency(
+        itemsToProcess,
+        BULK_CONCURRENCY_LIMIT,
+        async (item) => {
+          const ok = await executeItemPersistence(item, action);
+          if (ok) {
+            succeededCount++;
+          } else {
+            failedCount++;
+          }
+        }
+      );
+    } finally {
+      setIsCommitting(false);
+    }
+
+    const label = action === 'merge' ? 'Bulk Merge' : 'Bulk Replace';
+    const summaryParts: string[] = [];
+    if (succeededCount > 0) summaryParts.push(`${succeededCount} imported`);
+    if (failedCount > 0) {
+      summaryParts.push(`${failedCount} failed (retry available)`);
+    }
+
+    setCommitBanner({
+      type:
+        failedCount > 0
+          ? succeededCount > 0
+            ? 'warning'
+            : 'error'
+          : 'success',
+      text: `${label} finished: ${summaryParts.join(' · ')}.`,
+    });
   };
 
   const handleCommitReviewQueue = async () => {
     const actionable = reviewQueue.filter(
       (item) =>
         item.status !== 'extracting' &&
+        item.status !== 'importing' &&
         item.status !== 'processing' &&
         item.status !== 'imported' &&
         item.status !== 'skipped'
@@ -635,8 +814,16 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     let skippedCount = 0;
     let failedCount = 0;
 
+    const toPersist: {
+      item: ImportReviewItem;
+      action: 'create' | 'merge' | 'replace';
+    }[] = [];
+
     for (const item of actionable) {
-      if (item.resolution === 'skip') {
+      if (
+        item.resolution === 'skip' ||
+        item.duplicateState === 'unable_to_determine'
+      ) {
         handleSkipItem(item);
         skippedCount++;
         continue;
@@ -649,15 +836,25 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           ? 'replace'
           : 'create';
 
-      const ok = await executeItemPersistence(item, actionToRun);
-      if (ok) {
-        succeededCount++;
-      } else {
-        failedCount++;
-      }
+      toPersist.push({ item, action: actionToRun });
     }
 
-    setIsCommitting(false);
+    try {
+      await runWithControlledConcurrency(
+        toPersist,
+        BULK_CONCURRENCY_LIMIT,
+        async ({ item, action }) => {
+          const ok = await executeItemPersistence(item, action);
+          if (ok) {
+            succeededCount++;
+          } else {
+            failedCount++;
+          }
+        }
+      );
+    } finally {
+      setIsCommitting(false);
+    }
 
     const parts: string[] = [];
     if (succeededCount > 0) parts.push(`${succeededCount} imported`);
@@ -770,6 +967,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         filePath: fileName,
         tags: parsedTags,
         targetFactId: pasteDuplicateCheck?.existingFact?.id,
+        strategy: ingestStrategy,
+        chunkSize,
       });
 
       setPasteStatusBanner({ type: 'success', text: res.message });
@@ -817,9 +1016,9 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       />
 
       {/* Modal Container */}
-      <div className="relative flex h-[92vh] w-full max-w-5xl flex-col rounded-2xl border border-white/15 bg-[#050711] text-white shadow-2xl overflow-hidden">
+      <div className="relative flex h-[92vh] w-full max-w-6xl flex-col rounded-2xl border border-white/15 bg-[#050711] text-white shadow-2xl overflow-hidden">
         {/* Top Header Bar with Lifecycle Breadcrumb */}
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 bg-[#070a17] px-5 py-3.5 shrink-0">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 bg-[#070a17] px-4 sm:px-5 py-3.5 shrink-0">
           <div className="flex items-center gap-3">
             <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/15 bg-white/[0.06]">
               <BrainLogo size={18} />
@@ -934,7 +1133,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         </div>
 
         {/* 4-Workflow Navigation Bar */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 border-b border-white/10 bg-[#060914] px-4 shrink-0">
+        <div className="grid grid-cols-2 sm:grid-cols-4 border-b border-white/10 bg-[#060914] px-2 sm:px-4 shrink-0">
           <button
             type="button"
             onClick={() => setActiveTab('companion')}
@@ -1016,7 +1215,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         </div>
 
         {/* Main Scrollable Content Area */}
-        <div className="flex-1 overflow-y-auto p-5 md:p-6 scrollbar-thin">
+        <div className="flex-1 overflow-y-auto p-3.5 sm:p-5 md:p-6 scrollbar-thin">
           {/* ===============================================================
               WORKFLOW 1: BROWSER COMPANION
              =============================================================== */}
@@ -1126,7 +1325,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                     <span>Device Token Management</span>
                   </h3>
                   <p className="mt-0.5 text-xs text-white/50">
-                    Issue per-browser tokens to authenticate the Browser Companion extension without exposing personal credentials.
+                    Issue per-browser tokens to authenticate the Browser
+                    Companion extension without exposing personal credentials.
                   </p>
                 </div>
 
@@ -1172,7 +1372,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                   <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-4 space-y-2">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-semibold text-emerald-200">
-                        Device Token Created for "{newlyIssuedToken.name}" — Copy Now
+                        Device Token Created for "{newlyIssuedToken.name}" —
+                        Copy Now
                       </span>
                       <button
                         type="button"
@@ -1183,7 +1384,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                       </button>
                     </div>
                     <p className="text-[11px] text-emerald-200/80">
-                      Paste this token into the "Device Token" field inside the Browser Companion extension popup:
+                      Paste this token into the "Device Token" field inside the
+                      Browser Companion extension popup:
                     </p>
                     <div className="flex items-center gap-2">
                       <code className="mono flex-1 rounded-lg border border-emerald-500/30 bg-black/60 px-3 py-2 text-xs text-emerald-300 select-all">
@@ -1192,7 +1394,10 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                       <button
                         type="button"
                         onClick={() =>
-                          handleCopyText('issued-token', newlyIssuedToken.token)
+                          handleCopyText(
+                            'issued-token',
+                            newlyIssuedToken.token
+                          )
                         }
                         className="flex items-center gap-1.5 rounded-lg bg-emerald-400 px-3.5 py-2 text-xs font-semibold text-black hover:bg-emerald-300 transition"
                       >
@@ -1214,7 +1419,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
                 {devices.length === 0 ? (
                   <div className="rounded-lg border border-white/8 bg-black/30 py-6 text-center text-xs text-white/45">
-                    No companion device tokens issued yet. Create a token above to pair your browser extension.
+                    No companion device tokens issued yet. Create a token above
+                    to pair your browser extension.
                   </div>
                 ) : (
                   <div className="overflow-x-auto rounded-lg border border-white/10 bg-black/40">
@@ -1250,7 +1456,9 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                                   {new Date(dev.last_used_at).toLocaleString()}
                                 </span>
                               ) : (
-                                <span className="text-white/35">Never used</span>
+                                <span className="text-white/35">
+                                  Never used
+                                </span>
                               )}
                             </td>
                             <td className="py-2.5 px-3 text-right">
@@ -1285,7 +1493,9 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                   <p className="text-xs text-white/60 leading-relaxed">
                     The unpacked Chrome/Edge extension in{' '}
                     <code className="mono text-white/85">/extension</code>{' '}
-                    captures live conversation turns from the active browser tab and injects recalled Brain context directly into the prompt input on:
+                    captures live conversation turns from the active browser tab
+                    and injects recalled Brain context directly into the prompt
+                    input on:
                   </p>
                   <ul className="space-y-2 text-xs">
                     <li className="flex items-center justify-between rounded-lg border border-white/8 bg-black/30 px-3 py-2">
@@ -1325,9 +1535,10 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                     </span>
                   </div>
                   <p className="text-xs text-white/60 leading-relaxed">
-                    Sources without direct browser DOM hooks are captured via the{' '}
-                    <strong>Import & Review</strong> tab or{' '}
-                    <strong>Paste Conversation</strong> tab using real client-side parsers:
+                    Sources without direct browser DOM hooks are captured via
+                    the <strong>Import & Review</strong> tab or{' '}
+                    <strong>Paste Conversation</strong> tab using real
+                    client-side parsers:
                   </p>
                   <ul className="space-y-2 text-xs">
                     <li className="flex items-center justify-between rounded-lg border border-white/8 bg-black/30 px-3 py-2">
@@ -1376,7 +1587,10 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                   onDrop={(e) => {
                     e.preventDefault();
                     setIsDragging(false);
-                    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                    if (
+                      e.dataTransfer.files &&
+                      e.dataTransfer.files.length > 0
+                    ) {
                       handleFilesSelected(e.dataTransfer.files);
                     }
                   }}
@@ -1409,10 +1623,23 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                     </div>
                   </div>
                   <p className="mt-2.5 text-xs font-semibold text-white">
-                    Select or drop files and .ZIP export archives to stage in the Review Queue
+                    Select or drop files and .ZIP export archives to stage in
+                    the Review Queue
                   </p>
                   <p className="mt-1 text-[11px] text-white/50 max-w-md">
-                    Unpacks <span className="mono text-white/80">.zip</span> archives client-side and extracts <span className="mono text-white/80">conversations.json</span> (ChatGPT/Claude), <span className="mono text-white/80">.pdf</span>, <span className="mono text-white/80">.docx</span>, <span className="mono text-white/80">.pptx</span>, <span className="mono text-white/80">.xlsx</span>, <span className="mono text-white/80">.md</span>, <span className="mono text-white/80">.txt</span>, <span className="mono text-white/80">.csv</span>.
+                    Unpacks <span className="mono text-white/80">.zip</span>{' '}
+                    archives client-side and extracts{' '}
+                    <span className="mono text-white/80">
+                      conversations.json
+                    </span>{' '}
+                    (ChatGPT/Claude),{' '}
+                    <span className="mono text-white/80">.pdf</span>,{' '}
+                    <span className="mono text-white/80">.docx</span>,{' '}
+                    <span className="mono text-white/80">.pptx</span>,{' '}
+                    <span className="mono text-white/80">.xlsx</span>,{' '}
+                    <span className="mono text-white/80">.md</span>,{' '}
+                    <span className="mono text-white/80">.txt</span>,{' '}
+                    <span className="mono text-white/80">.csv</span>.
                   </p>
                 </div>
 
@@ -1432,7 +1659,9 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                       </span>
                     </div>
                     <p className="mt-0.5 text-[11px] text-white/45">
-                      Duplicate detection never modifies existing content automatically. Choose Merge, Replace, or Skip per item below.
+                      Duplicate detection never modifies existing content
+                      automatically. Choose Merge, Replace, or Skip individually
+                      or in bulk below.
                     </p>
                   </div>
 
@@ -1531,19 +1760,28 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 </div>
               )}
 
-              {/* Reusable ImportReviewQueue Component */}
+              {/* Reusable ImportReviewQueue Component with Bulk Selection & Per-Item Progress */}
               <ImportReviewQueue
                 items={reviewQueue}
                 destinations={brains}
                 isBatchProcessing={isCommitting}
+                concurrencyLimit={BULK_CONCURRENCY_LIMIT}
+                selectedIds={selectedQueueIds}
+                onSelectionChange={setSelectedQueueIds}
                 onMerge={handleMergeItem}
                 onReplace={handleReplaceItem}
                 onSkip={handleSkipItem}
                 onRetry={handleRetryItem}
                 onImportNew={handleImportNewItem}
+                onBulkMerge={(items) => handleBulkAction(items, 'merge')}
+                onBulkReplace={(items) => handleBulkAction(items, 'replace')}
+                onBulkSkip={(items) => handleBulkAction(items, 'skip')}
                 onUpdateItem={handleUpdateQueueItem}
                 onRemoveItem={handleRemoveQueueItem}
-                onClearQueue={() => setReviewQueue([])}
+                onClearQueue={() => {
+                  setReviewQueue([]);
+                  setSelectedQueueIds([]);
+                }}
               />
             </div>
           )}
@@ -1657,7 +1895,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                         <strong className="mono">
                           #{pasteDuplicateCheck.existingFact.id}
                         </strong>{' '}
-                        in "{pasteBrain}". Stage in Review Queue to choose Merge, Replace, or Skip.
+                        in "{pasteBrain}". Stage in Review Queue to choose
+                        Merge, Replace, or Skip.
                       </span>
                     </div>
                   </div>
@@ -1839,7 +2078,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         </div>
 
         {/* Modal Footer */}
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/10 bg-[#070a17] px-5 py-3.5 shrink-0">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/10 bg-[#070a17] px-4 sm:px-5 py-3.5 shrink-0">
           <div className="mono text-xs text-white/55">
             {activeTab === 'companion' && (
               <span>
@@ -1860,14 +2099,14 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
             )}
             {activeTab === 'import' && (
               <span className="tabular-nums">
-                {queueMetrics.total} queued · {queueMetrics.totalUnits} total
-                conversations/documents · {queueMetrics.ready} actionable
+                {queueMetrics.total} queued · {selectedQueueIds.length} selected
+                · {queueMetrics.ready} actionable
               </span>
             )}
             {activeTab === 'paste' && (
               <span className="tabular-nums">
-                Target Brain: <strong className="text-white">{pasteBrain}</strong>{' '}
-                · Source:{' '}
+                Target Brain:{' '}
+                <strong className="text-white">{pasteBrain}</strong> · Source:{' '}
                 <strong className="text-white">
                   {SOURCE_PALETTE[pasteSource].name}
                 </strong>
@@ -1875,8 +2114,9 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
             )}
             {activeTab === 'export' && (
               <span className="tabular-nums">
-                Exporting <strong className="text-white">{exportNodeCount}</strong>{' '}
-                memory nodes from "{exportBrain}"
+                Exporting{' '}
+                <strong className="text-white">{exportNodeCount}</strong> memory
+                nodes from "{exportBrain}"
               </span>
             )}
           </div>
