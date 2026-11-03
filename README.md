@@ -61,30 +61,39 @@ CAPTURE → REVIEW → ORGANISE → STORE → RECALL → EXPORT
 
 1. **CAPTURE**: Collect raw knowledge from files, `.zip` account exports, pasted transcripts, or the Browser Companion extension.
 2. **REVIEW**: Inspect staged items in `ImportReviewQueue` before anything is written to permanent storage. Inspect detected source, item/turn counts, content preview, and duplicate analysis.
-3. **ORGANISE**: Assign or edit the item title, source origin (`claude`, `gpt`, `gemini`, `github`, `moodle`, `cursor`, `local-ai`), destination Brain, tags, and node structure strategy (`Unified`, `Branching`, or `Sliced`).
-4. **STORE**: Execute user-confirmed persistence (`Create`, `Merge`, or `Replace`) against the backend SQLite store. Items are marked `Imported` only after backend confirmation.
+3. **ORGANISE**: Assign or edit the item title, filename, file path, source origin (`claude`, `gpt`, `gemini`, `github`, `moodle`, `cursor`, `local-ai`), destination Brain, tags, and node structure strategy (`Unified`, `Branching`, or `Sliced`).
+4. **STORE**: Execute user-confirmed persistence (`Create`, `Merge`, or `Replace`) against the backend SQLite store (or local cache fallback when running offline). Items are marked `imported` **only** after persistence actually succeeds.
 5. **RECALL**: Search, filter by source or file type, inspect semantic sections and merge history in the graph or list view, or query via the MCP server / REST API.
 6. **EXPORT**: Generate a portable Markdown (`.md`) file or context primer to carry your Brain into another AI tool or workspace.
 
-### Detailed Import & Review Pipeline
+### Detailed Import & Review Flow
 
-Every file or pasted conversation follows this explicit pipeline:
+Every imported file or pasted conversation follows this end-to-end flow:
 
 ```text
-File / Transcript
-  → Extract (client-side parser with determinate/indeterminate progress)
-  → Detect source & file type
-  → Check duplicates against destination Brain
-  → Stage in ImportReviewQueue
-  → User resolution (Create / Merge / Replace / Skip)
-  → Persist via backend API (/api/remember or /api/correct)
-  → Confirm durable write
-  → Imported (or Error + Retry)
+File
+→ Extract
+→ Detect source/type
+→ Check duplicates
+→ Review
+→ User resolution
+→ Persist
+→ Confirm
+→ Imported
 ```
 
-### Duplicate Detection & Resolution Safety Rules
+### Explicit Queue States & Duplicate Safety Rules
 
-For every queued item, `brainStore.checkExistingFileNode` inspects the destination Brain without modifying existing data and classifies the item into one of five states:
+`ImportReviewQueue` tracks each item through seven explicit lifecycle states:
+- `extracting` — Client-side parser is unpacking/reading the file or archive.
+- `ready` — Extracted and evaluated against the destination Brain; awaiting or ready for user resolution.
+- `importing` — Creating new node(s) in durable storage.
+- `processing` — Merging or replacing an existing node in durable storage.
+- `imported` — Durable persistence succeeded and was confirmed.
+- `skipped` — Explicitly skipped by the user; destination Brain untouched.
+- `error` — Extraction or persistence failed; error message preserved with per-item and batch `Retry`.
+
+Duplicate and conflict state is automatically re-checked whenever relevant fields change (`destinationBrain`, `fileName`, `filePath`, `title`, `text` content, or when new nodes are persisted into the destination Brain):
 
 | Duplicate State | Meaning | Default Resolution | Safety Rule |
 | :--- | :--- | :--- | :--- |
@@ -92,7 +101,7 @@ For every queued item, `brainStore.checkExistingFileNode` inspects the destinati
 | **Exact duplicate** (`exact_duplicate`) | Identical content already exists in destination Brain. | `Skip` | Defaults to `Skip` to prevent redundant nodes; user can still explicitly override. |
 | **Possible duplicate** (`possible_duplicate`) | Matches an existing node's file path, filename, or title with updated/different content. | `Ask user` (`undecided`) | Never auto-overwrites; user chooses `Merge`, `Replace`, `Create`, or `Skip`. |
 | **Related content** (`related_content`) | Different filename/title, but shares partial content or semantic section overlap with an existing node. | `Ask user` (`undecided`) | User chooses whether to `Merge` into the related node, `Create` a separate node, or `Skip`. |
-| **Unable to determine** (`unable_to_determine`) | Empty/unreadable content or unverified state. | `Ask user` (`undecided`) | **Never silently allows Merge or Replace.** Excluded from bulk Merge/Replace; requires explicit per-item confirmation. |
+| **Unable to determine** (`unable_to_determine`) | Empty/unreadable content or unverified state. | `Ask user` (`undecided`) | **Never silently allows Merge or Replace.** Merge and Replace are blocked; user must choose a safe resolution (`Create` or `Skip`) or provide readable content. |
 
 ---
 
@@ -182,14 +191,17 @@ To keep imported files traceable and maintainable rather than fragmenting them i
 
 Development of The Brain is intentionally split across two complementary environments:
 
+- **Argon = Local / Experimental Brain**
+- **GPT = Cloud / Production Brain**
+
 | Aspect | Argon Repository (This Repo) | GPT Repository (Cloud Production) |
 | :--- | :--- | :--- |
 | **Role** | **Local / Experimental Brain** | **Cloud / Production Brain** |
-| **Storage & Auth** | Local SQLite (`data/brain.db`) + local cache fallback + local device tokens | Supabase Auth + Supabase Postgres + Vercel authenticated API gateway |
-| **Primary Focus** | Rapid UX iteration, local/offline-first workflows, file extraction, `ImportReviewQueue`, MCP server, browser companion experiments | Multi-tenant cloud security, production authentication, hosted cloud persistence |
+| **Storage & Auth** | Local SQLite (`data/brain.db`) + local/offline cache fallback + local device tokens | Supabase Auth + Supabase Postgres + Vercel authenticated API gateway |
+| **Primary Focus** | Complete behavioral reference for Capture Hub & `ImportReviewQueue`, local/offline experimentation, multi-format extraction, MCP server, browser companion | Multi-tenant cloud security, production authentication, hosted cloud persistence |
 
-### Shared Concepts, Distinct Implementations
-Argon is **not** meant to be blindly overwritten with the cloud production stack, nor is the production stack meant to adopt unvalidated local prototypes. Instead, both versions share core domain concepts and TypeScript contracts (`Brain`, `Fact`, `AISource`, `ImportReviewItem`, `DuplicateDetectionState`, `ImportItemProgress`) while following this lifecycle:
+### Shared Concepts, Compatible Behavior
+The implementation between Argon and GPT can differ (local SQLite/offline store vs. cloud Supabase), but the domain concepts, state machine, duplicate safety rules, and user-facing behavior remain compatible. Argon's Capture Hub and `ImportReviewQueue` serve as the complete behavioral reference implementation.
 
 ```text
 Argon experiment

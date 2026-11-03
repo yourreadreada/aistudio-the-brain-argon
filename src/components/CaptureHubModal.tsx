@@ -15,6 +15,10 @@ import {
   KeyRound,
   ArrowRight,
   X,
+  GitMerge,
+  Replace,
+  SkipForward,
+  RotateCcw,
 } from 'lucide-react';
 import {
   AISource,
@@ -23,6 +27,11 @@ import {
   ExistingFileNodeCheck,
   DuplicateDetectionState,
   SOURCE_PALETTE,
+  ReviewResolutionAction,
+  ReviewItemStatus,
+  ImportItemProgress,
+  ImportReviewItem,
+  BatchExecutionProgress,
 } from '../types/brain';
 import {
   brainStore,
@@ -34,13 +43,10 @@ import {
   extractItemsFromFile,
   ExtractedFileResult,
   SUPPORTED_FILE_EXTENSIONS,
+  inferFileTypeFromExtension,
 } from '../services/fileExtractor';
 import {
   ImportReviewQueue,
-  ImportReviewItem,
-  ImportItemProgress,
-  ReviewResolutionAction,
-  ReviewItemStatus,
   runWithControlledConcurrency,
   isItemEligibleForAction,
   getDefaultResolutionForDuplicateState,
@@ -62,6 +68,11 @@ export interface CaptureHubModalProps {
   brains: string[];
   initialTab?: CaptureHubTab;
   onCreateBrain?: (name: string) => void;
+  onImportComplete?: (summary: {
+    imported: number;
+    skipped: number;
+    failed: number;
+  }) => void;
   onIngest: (
     brain: string,
     source: AISource,
@@ -91,12 +102,14 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   brains,
   initialTab = 'import',
   onCreateBrain,
+  onImportComplete,
 }) => {
   const [activeTab, setActiveTab] = useState<CaptureHubTab>(initialTab);
   const [defaultBrain, setDefaultBrain] = useState<string>(currentBrain);
   const [ingestStrategy, setIngestStrategy] =
     useState<IngestStrategy>('semantic');
   const [chunkSize, setChunkSize] = useState<number>(1200);
+  const [storeRevision, setStoreRevision] = useState<number>(0);
 
   // Inline brain creation inside Capture Hub
   const [isCreatingBrain, setIsCreatingBrain] = useState(false);
@@ -124,6 +137,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   const [selectedQueueIds, setSelectedQueueIds] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
+  const [batchProgress, setBatchProgress] =
+    useState<BatchExecutionProgress | null>(null);
   const [commitBanner, setCommitBanner] = useState<{
     type: 'success' | 'warning' | 'error';
     text: string;
@@ -132,13 +147,19 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
   // --- Workflow 3: Paste Conversation State ---
   const [pasteTitle, setPasteTitle] = useState('');
+  const [pasteFileNameInput, setPasteFileNameInput] = useState('');
   const [pasteSource, setPasteSource] = useState<AISource>('claude');
   const [pasteBrain, setPasteBrain] = useState<string>(currentBrain);
   const [pasteTagsInput, setPasteTagsInput] = useState('');
   const [pasteContent, setPasteContent] = useState('');
+  const [pasteResolution, setPasteResolution] =
+    useState<ReviewResolutionAction>('create');
   const [isStoringPaste, setIsStoringPaste] = useState(false);
+  const [pasteErrorRetryAction, setPasteErrorRetryAction] = useState<
+    'create' | 'merge' | 'replace' | null
+  >(null);
   const [pasteStatusBanner, setPasteStatusBanner] = useState<{
-    type: 'success' | 'error';
+    type: 'success' | 'warning' | 'error';
     text: string;
   } | null>(null);
 
@@ -151,6 +172,131 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     useState<boolean>(true);
   const [exportGroupBySource, setExportGroupBySource] = useState<boolean>(true);
   const [exportCopied, setExportCopied] = useState(false);
+
+  /**
+   * Evaluates duplicate state in the destination Brain without modifying any existing content.
+   * Explicit resolution rules:
+   * - New -> Create
+   * - Exact duplicate -> Skip by default
+   * - Possible duplicate -> Ask user ('undecided')
+   * - Related content -> Ask user ('undecided')
+   * - Unable to determine -> Ask user ('undecided'); never silently Merge or Replace
+   */
+  const computeDuplicateEvaluation = (
+    text: string,
+    fileName: string,
+    targetBrain: string,
+    title?: string,
+    hasExtractionError?: boolean,
+    filePath?: string
+  ): {
+    nodeCheck?: ExistingFileNodeCheck;
+    duplicateState: DuplicateDetectionState;
+    status: ReviewItemStatus;
+    resolution: ReviewResolutionAction;
+  } => {
+    if (hasExtractionError || !text || !text.trim() || !targetBrain) {
+      return {
+        duplicateState: 'unable_to_determine',
+        status: hasExtractionError ? 'error' : 'ready',
+        resolution: 'undecided',
+      };
+    }
+
+    const effectivePath = (filePath || fileName || '').trim();
+    const effectiveFileName = (fileName || effectivePath || 'untitled.md').trim();
+
+    const nodeCheck = brainStore.checkExistingFileNode(
+      targetBrain,
+      effectivePath,
+      text,
+      effectiveFileName,
+      title
+    );
+
+    const dupState: DuplicateDetectionState =
+      nodeCheck.duplicateState ||
+      (nodeCheck.exists
+        ? nodeCheck.isIdentical
+          ? 'exact_duplicate'
+          : 'possible_duplicate'
+        : 'new');
+
+    const defaultResolution = getDefaultResolutionForDuplicateState(dupState);
+
+    return {
+      nodeCheck,
+      duplicateState: dupState,
+      status: 'ready',
+      resolution: defaultResolution,
+    };
+  };
+
+  // Re-evaluate duplicate check when an item's destination brain, filename, filePath, title, or content changes
+  const revalidateQueueItem = (item: ImportReviewItem): ImportReviewItem => {
+    if (
+      item.status === 'extracting' ||
+      item.status === 'importing' ||
+      item.status === 'processing' ||
+      item.status === 'imported'
+    ) {
+      return item;
+    }
+    const evalResult = computeDuplicateEvaluation(
+      item.text,
+      item.fileName,
+      item.destinationBrain,
+      item.title,
+      false,
+      item.filePath || item.fileName
+    );
+    return {
+      ...item,
+      nodeCheck: evalResult.nodeCheck,
+      duplicateState: evalResult.duplicateState,
+      status: evalResult.status,
+      resolution: evalResult.resolution,
+      statusMessage: evalResult.nodeCheck?.summary,
+      errorMessage: undefined,
+    };
+  };
+
+  // Subscribe to brainStore updates so queue duplicate checks stay fresh when nodes are added/modified
+  useEffect(() => {
+    const unsubscribe = brainStore.subscribe(() => {
+      setStoreRevision((r) => r + 1);
+      setReviewQueue((prev) =>
+        prev.map((item) => {
+          if (item.status !== 'ready') return item;
+          const evalResult = computeDuplicateEvaluation(
+            item.text,
+            item.fileName,
+            item.destinationBrain,
+            item.title,
+            false,
+            item.filePath || item.fileName
+          );
+          const preserveUserResolution =
+            item.resolution !== 'undecided' &&
+            !(
+              evalResult.duplicateState === 'unable_to_determine' &&
+              (item.resolution === 'merge' || item.resolution === 'replace')
+            ) &&
+            item.duplicateState === evalResult.duplicateState;
+          return {
+            ...item,
+            nodeCheck: evalResult.nodeCheck,
+            duplicateState: evalResult.duplicateState,
+            statusMessage: evalResult.nodeCheck?.summary || item.statusMessage,
+            resolution: preserveUserResolution
+              ? item.resolution
+              : evalResult.resolution,
+          };
+        })
+      );
+    });
+    return unsubscribe;
+  }, []);
 
   // Sync currentBrain when modal opens
   useEffect(() => {
@@ -179,130 +325,36 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     }
   };
 
-  /**
-   * Evaluates duplicate state in the destination Brain without modifying any existing content.
-   * Explicit resolution rules:
-   * - New -> Create
-   * - Exact duplicate -> Skip by default
-   * - Possible duplicate -> Ask user ('undecided')
-   * - Related content -> Ask user ('undecided')
-   * - Unable to determine -> Ask user ('undecided'); never silently Merge or Replace
-   */
-  const computeDuplicateEvaluation = (
-    text: string,
-    fileName: string,
-    targetBrain: string,
-    title?: string,
-    hasExtractionError?: boolean
-  ): {
-    nodeCheck?: ExistingFileNodeCheck;
-    duplicateState: DuplicateDetectionState;
-    status: ReviewItemStatus;
-    resolution: ReviewResolutionAction;
-  } => {
-    if (hasExtractionError || !text || !text.trim() || !targetBrain) {
-      return {
-        duplicateState: 'unable_to_determine',
-        status: hasExtractionError ? 'error' : 'ready',
-        resolution: 'undecided',
-      };
-    }
-
-    const nodeCheck = brainStore.checkExistingFileNode(
-      targetBrain,
-      fileName,
-      text,
-      fileName,
-      title
-    );
-
-    const dupState: DuplicateDetectionState =
-      nodeCheck.duplicateState ||
-      (nodeCheck.exists
-        ? nodeCheck.isIdentical
-          ? 'exact_duplicate'
-          : 'possible_duplicate'
-        : 'new');
-
-    const defaultResolution = getDefaultResolutionForDuplicateState(dupState);
-
-    if (dupState === 'exact_duplicate') {
-      return {
-        nodeCheck,
-        duplicateState: 'exact_duplicate',
-        status: 'duplicate_identical',
-        resolution: defaultResolution,
-      };
-    }
-
-    if (dupState === 'possible_duplicate' || dupState === 'related_content') {
-      return {
-        nodeCheck,
-        duplicateState: dupState,
-        status: 'duplicate_diff',
-        resolution: defaultResolution,
-      };
-    }
-
-    if (dupState === 'unable_to_determine') {
-      return {
-        nodeCheck,
-        duplicateState: 'unable_to_determine',
-        status: 'ready',
-        resolution: defaultResolution,
-      };
-    }
-
-    return {
-      nodeCheck,
-      duplicateState: 'new',
-      status: 'ready',
-      resolution: defaultResolution,
-    };
-  };
-
-  // Re-evaluate duplicate check when an item's destination brain or title/filename changes
-  const revalidateQueueItem = (item: ImportReviewItem): ImportReviewItem => {
-    if (
-      item.status === 'extracting' ||
-      item.status === 'importing' ||
-      item.status === 'processing' ||
-      item.status === 'imported'
-    ) {
-      return item;
-    }
-    const evalResult = computeDuplicateEvaluation(
-      item.text,
-      item.fileName,
-      item.destinationBrain,
-      item.title,
-      false
-    );
-    return {
-      ...item,
-      nodeCheck: evalResult.nodeCheck,
-      duplicateState: evalResult.duplicateState,
-      status: evalResult.status,
-      resolution: evalResult.resolution,
-      errorMessage: undefined,
-    };
-  };
-
-  // Live duplicate check for Paste tab
-  const pasteDuplicateCheck = useMemo(() => {
-    if (!pasteContent.trim()) return null;
+  // Live duplicate evaluation for Paste tab
+  const pasteEvaluation = useMemo(() => {
     const syntheticFileName =
+      pasteFileNameInput.trim() ||
       (pasteTitle.trim()
-        ? pasteTitle.trim().replace(/[^a-zA-Z0-9_-]+/g, '_').toLowerCase()
-        : 'pasted_conversation') + '.md';
-    return brainStore.checkExistingFileNode(
-      pasteBrain,
-      syntheticFileName,
+        ? pasteTitle.trim().replace(/[^a-zA-Z0-9_-]+/g, '_').toLowerCase() +
+          '.md'
+        : 'pasted_conversation.md');
+
+    return computeDuplicateEvaluation(
       pasteContent,
       syntheticFileName,
-      pasteTitle.trim()
+      pasteBrain,
+      pasteTitle.trim() || undefined,
+      false,
+      syntheticFileName
     );
-  }, [pasteContent, pasteTitle, pasteBrain]);
+  }, [
+    pasteContent,
+    pasteTitle,
+    pasteFileNameInput,
+    pasteBrain,
+    storeRevision,
+  ]);
+
+  // Keep pasteResolution synced to safe defaults when paste duplicate state changes
+  useEffect(() => {
+    setPasteResolution(pasteEvaluation.resolution);
+    setPasteErrorRetryAction(null);
+  }, [pasteEvaluation.duplicateState, pasteBrain]);
 
   // Live Markdown preview for Export tab
   const exportedMarkdown = useMemo(() => {
@@ -317,6 +369,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     exportGroupBySource,
     exportSourceFilter,
     isOpen,
+    storeRevision,
   ]);
 
   const exportNodeCount = useMemo(() => {
@@ -326,29 +379,19 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       exportSourceFilter === 'all' ? null : exportSourceFilter,
       null
     ).length;
-  }, [exportBrain, exportSourceFilter, isOpen]);
+  }, [exportBrain, exportSourceFilter, isOpen, storeRevision]);
 
   // Queue metrics (declared before early return)
   const queueMetrics = useMemo(() => {
     const total = reviewQueue.length;
+    const imported = reviewQueue.filter((q) => q.status === 'imported').length;
+    const skipped = reviewQueue.filter((q) => q.status === 'skipped').length;
+    const failed = reviewQueue.filter((q) => q.status === 'error').length;
     const ready = reviewQueue.filter(
-      (q) =>
-        q.status !== 'imported' &&
-        q.status !== 'skipped' &&
-        q.status !== 'extracting' &&
-        q.status !== 'importing' &&
-        q.status !== 'processing' &&
-        q.status !== 'error' &&
-        q.resolution !== 'undecided'
+      (q) => q.status === 'ready' && q.resolution !== 'undecided'
     ).length;
     const needsDecision = reviewQueue.filter(
-      (q) =>
-        q.status !== 'imported' &&
-        q.status !== 'skipped' &&
-        q.status !== 'extracting' &&
-        q.status !== 'importing' &&
-        q.status !== 'processing' &&
-        q.resolution === 'undecided'
+      (q) => q.status === 'ready' && q.resolution === 'undecided'
     ).length;
     const duplicates = reviewQueue.filter(
       (q) =>
@@ -360,7 +403,16 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       (acc, q) => acc + (q.itemCount || 1),
       0
     );
-    return { total, ready, needsDecision, duplicates, totalUnits };
+    return {
+      total,
+      imported,
+      skipped,
+      failed,
+      ready,
+      needsDecision,
+      duplicates,
+      totalUnits,
+    };
   }, [reviewQueue]);
 
   if (!isOpen) return null;
@@ -371,15 +423,35 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     setTimeout(() => setCopiedKey(null), 2000);
   };
 
+  const handleDefaultBrainChange = (nextBrain: string) => {
+    const previousBrain = defaultBrain;
+    setDefaultBrain(nextBrain);
+    setPasteBrain(nextBrain);
+    setExportBrain(nextBrain);
+    // Re-evaluate queued items that were targeting the previous default brain and haven't been imported yet
+    setReviewQueue((prev) =>
+      prev.map((item) => {
+        if (
+          item.status === 'ready' &&
+          item.destinationBrain === previousBrain
+        ) {
+          return revalidateQueueItem({
+            ...item,
+            destinationBrain: nextBrain,
+          });
+        }
+        return item;
+      })
+    );
+  };
+
   const handleCreateNewBrainInline = (e: React.FormEvent) => {
     e.preventDefault();
     const cleaned = newBrainInput.trim().toLowerCase();
     if (!cleaned) return;
     brainStore.createBrain(cleaned);
     if (onCreateBrain) onCreateBrain(cleaned);
-    setDefaultBrain(cleaned);
-    setPasteBrain(cleaned);
-    setExportBrain(cleaned);
+    handleDefaultBrainChange(cleaned);
     setNewBrainInput('');
     setIsCreatingBrain(false);
   };
@@ -415,11 +487,18 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       const placeholderId = `rq-${Date.now()}-${Math.random()
         .toString(36)
         .slice(2, 7)}`;
+      const ext = '.' + (file.name.split('.').pop()?.toLowerCase() || 'txt');
+      const relativePath =
+        (file as File & { webkitRelativePath?: string }).webkitRelativePath ||
+        file.name;
+
       const placeholderItem: ImportReviewItem = {
         id: placeholderId,
         title: file.name.replace(/\.[^/.]+$/, ''),
         fileName: file.name,
-        extension: '.' + (file.name.split('.').pop()?.toLowerCase() || 'txt'),
+        filePath: relativePath,
+        fileType: inferFileTypeFromExtension(ext),
+        extension: ext,
         sizeBytes: file.size,
         text: '',
         source: 'claude',
@@ -428,12 +507,12 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         itemUnitLabel: 'document',
         status: 'extracting',
         duplicateState: 'unable_to_determine',
-        resolution: 'create',
+        resolution: 'undecided',
         tags: [],
         progress: {
           mode: 'indeterminate',
           phase: 'extracting',
-          label: 'Extracting… [indeterminate]',
+          label: 'Extracting…',
         },
       };
 
@@ -462,38 +541,45 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           });
 
         const mappedItems: ImportReviewItem[] = extractedItems.map(
-          (ext, idx) => {
-            const hasErr = ext.status === 'error' || !ext.text.trim();
+          (extItem, idx) => {
+            const hasErr = extItem.status === 'error' || !extItem.text.trim();
             const itemTitle =
-              ext.title || ext.fileName.replace(/\.[^/.]+$/, '');
+              extItem.title || extItem.fileName.replace(/\.[^/.]+$/, '');
+            const effectiveFilePath = extItem.filePath || extItem.fileName;
             const evalRes = computeDuplicateEvaluation(
-              ext.text,
-              ext.fileName,
+              extItem.text,
+              extItem.fileName,
               defaultBrain,
               itemTitle,
-              hasErr
+              hasErr,
+              effectiveFilePath
             );
             return {
               id: `${placeholderId}-${idx}`,
               title: itemTitle,
-              fileName: ext.fileName,
-              archiveParent: ext.archiveParent,
-              extension: ext.extension,
-              sizeBytes: ext.sizeBytes,
-              text: ext.text,
-              source: ext.detectedSource,
+              fileName: extItem.fileName,
+              filePath: effectiveFilePath,
+              fileType:
+                extItem.fileType ||
+                inferFileTypeFromExtension(extItem.extension),
+              archiveParent: extItem.archiveParent,
+              extension: extItem.extension,
+              sizeBytes: extItem.sizeBytes,
+              text: extItem.text,
+              source: extItem.detectedSource,
               destinationBrain: defaultBrain,
-              itemCount: ext.pageOrItemCount || 1,
-              itemUnitLabel: ext.itemUnitLabel || 'document',
+              itemCount: extItem.pageOrItemCount || 1,
+              itemUnitLabel: extItem.itemUnitLabel || 'document',
               status: evalRes.status,
-              statusMessage: ext.statusMessage || evalRes.nodeCheck?.summary,
+              statusMessage:
+                extItem.statusMessage || evalRes.nodeCheck?.summary,
               errorMessage: hasErr
-                ? ext.statusMessage || 'Unable to extract readable text'
+                ? extItem.statusMessage || 'Unable to extract readable text'
                 : undefined,
               duplicateState: evalRes.duplicateState,
               nodeCheck: evalRes.nodeCheck,
               resolution: evalRes.resolution,
-              tags: ext.archiveParent ? ['archive-import'] : [],
+              tags: extItem.archiveParent ? ['archive-import'] : [],
               progress: undefined,
             };
           }
@@ -514,7 +600,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                   duplicateState: 'unable_to_determine',
                   errorMessage: err?.message || 'Failed to parse file',
                   statusMessage: err?.message || 'Failed to parse file',
-                  resolution: 'skip',
+                  resolution: 'undecided',
                   progress: undefined,
                 }
               : item
@@ -529,7 +615,15 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     patch: Partial<
       Pick<
         ImportReviewItem,
-        'title' | 'source' | 'destinationBrain' | 'resolution' | 'tags'
+        | 'title'
+        | 'fileName'
+        | 'filePath'
+        | 'text'
+        | 'source'
+        | 'destinationBrain'
+        | 'resolution'
+        | 'tags'
+        | 'simulateFailureOnce'
       >
     >
   ) => {
@@ -539,7 +633,10 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         const updated: ImportReviewItem = { ...item, ...patch };
         if (
           patch.destinationBrain !== undefined ||
-          patch.title !== undefined
+          patch.title !== undefined ||
+          patch.fileName !== undefined ||
+          patch.filePath !== undefined ||
+          patch.text !== undefined
         ) {
           return revalidateQueueItem(updated);
         }
@@ -557,8 +654,9 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
    * Executes a single item persistence action ('create' | 'merge' | 'replace')
    * against the backend.
    * - Never optimistically marks as Imported.
+   * - Never allows Merge or Replace when duplicateState === 'unable_to_determine'.
    * - Reports determinate progress ONLY when multi-chunk/record operations provide real counts;
-   *   otherwise uses indeterminate progress ('Processing… [indeterminate]').
+   *   otherwise uses indeterminate progress.
    */
   const executeItemPersistence = async (
     item: ImportReviewItem,
@@ -569,6 +667,29 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       item.status === 'importing' ||
       item.status === 'extracting'
     ) {
+      return false;
+    }
+
+    // Strict Duplicate Safety Rule: NEVER allow Merge or Replace if duplicate state is Unable to determine
+    if (
+      item.duplicateState === 'unable_to_determine' &&
+      (action === 'merge' || action === 'replace')
+    ) {
+      const blockedMsg =
+        'Duplicate status cannot be determined — Merge and Replace are blocked for safety. Choose Create or Skip, or provide readable content.';
+      setReviewQueue((prev) =>
+        prev.map((q) =>
+          q.id === item.id
+            ? {
+                ...q,
+                status: 'error',
+                errorMessage: blockedMsg,
+                statusMessage: blockedMsg,
+                progress: undefined,
+              }
+            : q
+        )
+      );
       return false;
     }
 
@@ -606,17 +727,15 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               errorMessage: undefined,
               statusMessage:
                 action === 'merge'
-                  ? 'Merging with destination node on backend…'
+                  ? 'Merging with destination node…'
                   : action === 'replace'
-                  ? 'Replacing destination node on backend…'
-                  : 'Persisting new node to backend…',
+                  ? 'Replacing destination node…'
+                  : 'Persisting new node to Brain…',
               progress: {
                 mode: 'indeterminate',
                 phase: action === 'create' ? 'importing' : 'processing',
                 label:
-                  action === 'create'
-                    ? 'Importing… [indeterminate]'
-                    : 'Processing… [indeterminate]',
+                  action === 'create' ? 'Importing…' : 'Processing…',
               },
             }
           : q
@@ -631,11 +750,14 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         title: item.title,
         content: item.text,
         fileName: item.fileName,
-        filePath: item.fileName,
+        filePath: item.filePath || item.fileName,
+        fileType:
+          item.fileType || inferFileTypeFromExtension(item.extension),
         tags: item.tags,
         targetFactId: item.nodeCheck?.existingFact?.id,
         strategy: ingestStrategy,
         chunkSize,
+        simulateFailure: Boolean(item.simulateFailureOnce),
         onProgress: (prog) => {
           setReviewQueue((prev) =>
             prev.map((q) =>
@@ -657,7 +779,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         },
       });
 
-      // Only mark as Imported AFTER backend confirmation succeeds
+      // Only mark as Imported AFTER backend/local persistence succeeds
       setReviewQueue((prev) =>
         prev.map((q) =>
           q.id === item.id
@@ -665,6 +787,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 ...q,
                 status: 'imported',
                 resolution: action,
+                simulateFailureOnce: false,
                 errorMessage: undefined,
                 statusMessage: result.message,
                 progress: undefined,
@@ -676,13 +799,15 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     } catch (err: any) {
       const message =
         err?.message ||
-        'Backend persistence failed. Existing content was not modified.';
+        'Persistence failed. Existing content was not modified.';
       setReviewQueue((prev) =>
         prev.map((q) =>
           q.id === item.id
             ? {
                 ...q,
                 status: 'error',
+                // Clear one-shot simulated failure flag so subsequent Retry succeeds
+                simulateFailureOnce: false,
                 errorMessage: message,
                 statusMessage: message,
                 lastAttemptedAction: action,
@@ -696,19 +821,37 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   };
 
   const handleMergeItem = async (item: ImportReviewItem): Promise<boolean> => {
-    return await executeItemPersistence(item, 'merge');
+    const ok = await executeItemPersistence(item, 'merge');
+    onImportComplete?.({
+      imported: ok ? 1 : 0,
+      skipped: 0,
+      failed: ok ? 0 : 1,
+    });
+    return ok;
   };
 
   const handleReplaceItem = async (
     item: ImportReviewItem
   ): Promise<boolean> => {
-    return await executeItemPersistence(item, 'replace');
+    const ok = await executeItemPersistence(item, 'replace');
+    onImportComplete?.({
+      imported: ok ? 1 : 0,
+      skipped: 0,
+      failed: ok ? 0 : 1,
+    });
+    return ok;
   };
 
   const handleImportNewItem = async (
     item: ImportReviewItem
   ): Promise<boolean> => {
-    return await executeItemPersistence(item, 'create');
+    const ok = await executeItemPersistence(item, 'create');
+    onImportComplete?.({
+      imported: ok ? 1 : 0,
+      skipped: 0,
+      failed: ok ? 0 : 1,
+    });
+    return ok;
   };
 
   const handleSkipItem = (item: ImportReviewItem) => {
@@ -743,7 +886,84 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         : item.resolution === 'replace'
         ? 'replace'
         : 'create');
-    return await executeItemPersistence(item, retryAction);
+    // Ensure simulateFailureOnce is cleared on retry
+    const cleanItem: ImportReviewItem = {
+      ...item,
+      simulateFailureOnce: false,
+    };
+    const ok = await executeItemPersistence(cleanItem, retryAction);
+    onImportComplete?.({
+      imported: ok ? 1 : 0,
+      skipped: 0,
+      failed: ok ? 0 : 1,
+    });
+    return ok;
+  };
+
+  const handleRetryAllFailed = async (failedItems: ImportReviewItem[]) => {
+    if (failedItems.length === 0 || isCommitting) return;
+    setIsCommitting(true);
+    setCommitBanner(null);
+
+    let succeededCount = 0;
+    let failedCount = 0;
+    let completedCount = 0;
+    let activeWorkers = 0;
+    const totalToRun = failedItems.length;
+
+    setBatchProgress({
+      actionLabel: 'Retry Failed Items',
+      completed: 0,
+      total: totalToRun,
+      activeCount: Math.min(BULK_CONCURRENCY_LIMIT, totalToRun),
+    });
+
+    try {
+      await runWithControlledConcurrency(
+        failedItems,
+        BULK_CONCURRENCY_LIMIT,
+        async (item) => {
+          activeWorkers++;
+          setBatchProgress({
+            actionLabel: 'Retry Failed Items',
+            completed: completedCount,
+            total: totalToRun,
+            activeCount: activeWorkers,
+          });
+          try {
+            const ok = await handleRetryItem(item);
+            if (ok) succeededCount++;
+            else failedCount++;
+          } finally {
+            activeWorkers--;
+            completedCount++;
+            setBatchProgress({
+              actionLabel: 'Retry Failed Items',
+              completed: completedCount,
+              total: totalToRun,
+              activeCount: activeWorkers,
+            });
+          }
+        }
+      );
+    } finally {
+      setBatchProgress(null);
+      setIsCommitting(false);
+    }
+
+    const parts: string[] = [];
+    if (succeededCount > 0) parts.push(`${succeededCount} imported`);
+    if (failedCount > 0) parts.push(`${failedCount} failed (retry available)`);
+
+    setCommitBanner({
+      type:
+        failedCount > 0
+          ? succeededCount > 0
+            ? 'warning'
+            : 'error'
+          : 'success',
+      text: `Retry finished: ${parts.join(' · ')}.`,
+    });
   };
 
   // --- Bulk Action Handlers (Reusing single-item persistence + Controlled Concurrency) ---
@@ -768,6 +988,11 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
             skippedCount === 1 ? 'item' : 'items'
           } marked as Skipped.`,
         });
+        onImportComplete?.({
+          imported: 0,
+          skipped: skippedCount,
+          failed: 0,
+        });
       }
       return;
     }
@@ -782,25 +1007,54 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
     let succeededCount = 0;
     let failedCount = 0;
+    let completedCount = 0;
+    let activeWorkers = 0;
+    const totalToRun = eligibleItems.length;
+    const label = action === 'merge' ? 'Bulk Merge' : 'Bulk Replace';
+
+    setBatchProgress({
+      actionLabel: label,
+      completed: 0,
+      total: totalToRun,
+      activeCount: Math.min(BULK_CONCURRENCY_LIMIT, totalToRun),
+    });
 
     try {
       await runWithControlledConcurrency(
         eligibleItems,
         BULK_CONCURRENCY_LIMIT,
         async (item) => {
-          const ok = await executeItemPersistence(item, action);
-          if (ok) {
-            succeededCount++;
-          } else {
-            failedCount++;
+          activeWorkers++;
+          setBatchProgress({
+            actionLabel: label,
+            completed: completedCount,
+            total: totalToRun,
+            activeCount: activeWorkers,
+          });
+          try {
+            const ok = await executeItemPersistence(item, action);
+            if (ok) {
+              succeededCount++;
+            } else {
+              failedCount++;
+            }
+          } finally {
+            activeWorkers--;
+            completedCount++;
+            setBatchProgress({
+              actionLabel: label,
+              completed: completedCount,
+              total: totalToRun,
+              activeCount: activeWorkers,
+            });
           }
         }
       );
     } finally {
+      setBatchProgress(null);
       setIsCommitting(false);
     }
 
-    const label = action === 'merge' ? 'Bulk Merge' : 'Bulk Replace';
     const summaryParts: string[] = [];
     if (succeededCount > 0) summaryParts.push(`${succeededCount} imported`);
     if (failedCount > 0) {
@@ -816,17 +1070,17 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           : 'success',
       text: `${label} finished: ${summaryParts.join(' · ')}.`,
     });
+
+    onImportComplete?.({
+      imported: succeededCount,
+      skipped: 0,
+      failed: failedCount,
+    });
   };
 
   const handleCommitReviewQueue = async () => {
     const actionable = reviewQueue.filter(
-      (item) =>
-        item.status !== 'extracting' &&
-        item.status !== 'importing' &&
-        item.status !== 'processing' &&
-        item.status !== 'imported' &&
-        item.status !== 'skipped' &&
-        item.resolution !== 'undecided'
+      (item) => item.status === 'ready' && item.resolution !== 'undecided'
     );
     if (actionable.length === 0) return;
 
@@ -866,28 +1120,57 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       toPersist.push({ item, action: actionToRun });
     }
 
+    const totalToRun = toPersist.length;
+    let completedCount = 0;
+    let activeWorkers = 0;
+
+    if (totalToRun > 0) {
+      setBatchProgress({
+        actionLabel: 'Queue Import',
+        completed: 0,
+        total: totalToRun,
+        activeCount: Math.min(BULK_CONCURRENCY_LIMIT, totalToRun),
+      });
+    }
+
     try {
       await runWithControlledConcurrency(
         toPersist,
         BULK_CONCURRENCY_LIMIT,
         async ({ item, action }) => {
-          const ok = await executeItemPersistence(item, action);
-          if (ok) {
-            succeededCount++;
-          } else {
-            failedCount++;
+          activeWorkers++;
+          setBatchProgress({
+            actionLabel: 'Queue Import',
+            completed: completedCount,
+            total: totalToRun,
+            activeCount: activeWorkers,
+          });
+          try {
+            const ok = await executeItemPersistence(item, action);
+            if (ok) {
+              succeededCount++;
+            } else {
+              failedCount++;
+            }
+          } finally {
+            activeWorkers--;
+            completedCount++;
+            setBatchProgress({
+              actionLabel: 'Queue Import',
+              completed: completedCount,
+              total: totalToRun,
+              activeCount: activeWorkers,
+            });
           }
         }
       );
     } finally {
+      setBatchProgress(null);
       setIsCommitting(false);
     }
 
     const undecidedRemaining = reviewQueue.filter(
-      (item) =>
-        item.status !== 'imported' &&
-        item.status !== 'skipped' &&
-        item.resolution === 'undecided'
+      (item) => item.status === 'ready' && item.resolution === 'undecided'
     ).length;
 
     const parts: string[] = [];
@@ -907,7 +1190,15 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           : undecidedRemaining > 0
           ? 'warning'
           : 'success',
-      text: `Queue run complete: ${parts.join(' · ')}.`,
+      text: `Batch result (${
+        succeededCount + skippedCount + failedCount
+      } processed): ${parts.join(' · ')}.`,
+    });
+
+    onImportComplete?.({
+      imported: succeededCount,
+      skipped: skippedCount,
+      failed: failedCount,
     });
   };
 
@@ -937,6 +1228,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       pasteTitle.trim() ||
       `${SOURCE_PALETTE[pasteSource].name} Conversation (${new Date().toLocaleDateString()})`;
     const fileName =
+      pasteFileNameInput.trim() ||
       cleanTitle.replace(/[^a-zA-Z0-9_-]+/g, '_').toLowerCase() + '.md';
     const units = countConversationUnits(pasteContent);
     const parsedTags = pasteTagsInput
@@ -949,13 +1241,19 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       fileName,
       pasteBrain,
       cleanTitle,
-      false
+      false,
+      fileName
     );
+
+    const chosenResolution =
+      pasteResolution !== 'undecided' ? pasteResolution : evalRes.resolution;
 
     const newItem: ImportReviewItem = {
       id: `paste-${Date.now()}`,
       title: cleanTitle,
       fileName,
+      filePath: fileName,
+      fileType: 'chat',
       extension: '.md',
       sizeBytes: new Blob([pasteContent]).size,
       text: pasteContent,
@@ -968,26 +1266,63 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         evalRes.nodeCheck?.summary || 'Staged from manual conversation paste',
       duplicateState: evalRes.duplicateState,
       nodeCheck: evalRes.nodeCheck,
-      resolution: evalRes.resolution,
+      resolution: chosenResolution,
       tags: parsedTags,
     };
 
     setReviewQueue((prev) => [newItem, ...prev]);
     setPasteTitle('');
+    setPasteFileNameInput('');
     setPasteContent('');
     setPasteTagsInput('');
     setActiveTab('import');
   };
 
-  const handleStorePasteDirectly = async () => {
+  const handleExecutePasteResolution = async (
+    explicitAction?: 'create' | 'merge' | 'replace' | 'skip'
+  ) => {
     if (!pasteContent.trim() || isStoringPaste) return;
+
+    const chosen =
+      explicitAction ||
+      (pasteResolution === 'undecided' ? null : pasteResolution);
+
+    if (!chosen) {
+      setPasteStatusBanner({
+        type: 'warning',
+        text: 'Duplicate detected: Please choose an explicit resolution (Create, Merge, Replace, or Skip) or Stage in Review Queue.',
+      });
+      return;
+    }
+
+    if (chosen === 'skip') {
+      setPasteStatusBanner({
+        type: 'warning',
+        text: `Skipped pasted conversation — "${pasteBrain}" was not modified.`,
+      });
+      return;
+    }
+
+    if (
+      pasteEvaluation.duplicateState === 'unable_to_determine' &&
+      (chosen === 'merge' || chosen === 'replace')
+    ) {
+      setPasteStatusBanner({
+        type: 'error',
+        text: 'Duplicate status cannot be determined — Merge and Replace are blocked for safety.',
+      });
+      return;
+    }
+
     setIsStoringPaste(true);
     setPasteStatusBanner(null);
+    setPasteErrorRetryAction(null);
 
     const cleanTitle =
       pasteTitle.trim() ||
       `${SOURCE_PALETTE[pasteSource].name} Conversation (${new Date().toLocaleDateString()})`;
     const fileName =
+      pasteFileNameInput.trim() ||
       cleanTitle.replace(/[^a-zA-Z0-9_-]+/g, '_').toLowerCase() + '.md';
     const parsedTags = pasteTagsInput
       .split(',')
@@ -995,30 +1330,36 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       .filter(Boolean);
 
     try {
-      const action = pasteDuplicateCheck?.exists ? 'merge' : 'create';
       const res = await brainStore.persistReviewedItem({
-        action,
+        action: chosen,
         brain: pasteBrain,
         source: pasteSource,
         title: cleanTitle,
         content: pasteContent,
         fileName,
         filePath: fileName,
+        fileType: 'chat',
         tags: parsedTags,
-        targetFactId: pasteDuplicateCheck?.existingFact?.id,
+        targetFactId: pasteEvaluation.nodeCheck?.existingFact?.id,
         strategy: ingestStrategy,
         chunkSize,
       });
 
       setPasteStatusBanner({ type: 'success', text: res.message });
       setPasteTitle('');
+      setPasteFileNameInput('');
       setPasteContent('');
       setPasteTagsInput('');
+      onImportComplete?.({ imported: 1, skipped: 0, failed: 0 });
     } catch (err: any) {
+      setPasteErrorRetryAction(chosen);
       setPasteStatusBanner({
         type: 'error',
-        text: err?.message || 'Failed to persist conversation to backend.',
+        text:
+          err?.message ||
+          'Failed to persist conversation to backend. Your content is preserved below — click Retry to try again.',
       });
+      onImportComplete?.({ imported: 0, skipped: 0, failed: 1 });
     } finally {
       setIsStoringPaste(false);
     }
@@ -1027,7 +1368,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   // --- Workflow 4: Export Handlers ---
   const handleDownloadMarkdown = () => {
     const blob = new Blob([exportedMarkdown], {
-      type: 'text/markdown;charset=utf-8',
+      type: 'text/markdown;charset-utf-8',
     });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1047,7 +1388,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-1.5 sm:p-4 overflow-x-hidden">
       {/* Backdrop */}
       <div
         onClick={onClose}
@@ -1055,20 +1396,20 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       />
 
       {/* Modal Container */}
-      <div className="relative flex h-[92vh] w-full max-w-6xl flex-col rounded-2xl border border-white/15 bg-[#050711] text-white shadow-2xl overflow-hidden">
+      <div className="relative flex h-[94vh] sm:h-[92vh] w-full max-w-6xl flex-col rounded-2xl border border-white/15 bg-[#050711] text-white shadow-2xl overflow-hidden">
         {/* Top Header Bar with Lifecycle Breadcrumb */}
-        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 bg-[#070a17] px-4 sm:px-5 py-3.5 shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/15 bg-white/[0.06]">
+        <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-white/10 bg-[#070a17] px-3.5 sm:px-5 py-3 shrink-0">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/15 bg-white/[0.06] shrink-0">
               <BrainLogo size={18} />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <h2 className="text-sm font-semibold tracking-tight text-white">
                   Capture Hub
                 </h2>
-                <span className="text-white/25">·</span>
-                <span className="mono text-[11px] text-[#9db4ff]">
+                <span className="text-white/25 hidden xs:inline">·</span>
+                <span className="mono text-[11px] text-[#9db4ff] truncate">
                   Source-Aware Memory Pipeline
                 </span>
               </div>
@@ -1085,7 +1426,9 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                             step === 'ORGANISE' ||
                             step === 'STORE')) ||
                         (activeTab === 'paste' &&
-                          (step === 'CAPTURE' || step === 'STORE')) ||
+                          (step === 'CAPTURE' ||
+                            step === 'REVIEW' ||
+                            step === 'STORE')) ||
                         (activeTab === 'export' && step === 'EXPORT')
                           ? 'text-white font-semibold'
                           : 'text-white/40'
@@ -1100,7 +1443,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           </div>
 
           {/* Right Header Controls: Default Brain Selector + Close */}
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2">
             {!isCreatingBrain ? (
               <div className="flex items-center gap-1.5">
                 <span className="mono text-[11px] text-white/45 hidden md:inline">
@@ -1108,11 +1451,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 </span>
                 <select
                   value={defaultBrain}
-                  onChange={(e) => {
-                    setDefaultBrain(e.target.value);
-                    setPasteBrain(e.target.value);
-                    setExportBrain(e.target.value);
-                  }}
+                  onChange={(e) => handleDefaultBrainChange(e.target.value)}
                   aria-label="Default destination brain"
                   className="mono rounded-lg border border-white/15 bg-black/50 px-2.5 py-1.5 text-xs text-white outline-none focus:border-white/35"
                 >
@@ -1172,20 +1511,20 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         </div>
 
         {/* 4-Workflow Navigation Bar */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 border-b border-white/10 bg-[#060914] px-2 sm:px-4 shrink-0">
+        <div className="grid grid-cols-2 sm:grid-cols-4 border-b border-white/10 bg-[#060914] px-1.5 sm:px-4 shrink-0">
           <button
             type="button"
             onClick={() => setActiveTab('companion')}
-            className={`flex items-center justify-center sm:justify-start gap-2.5 border-b-2 px-3 py-3 text-xs font-medium transition ${
+            className={`flex items-center justify-center sm:justify-start gap-2 border-b-2 px-2 sm:px-3 py-2.5 sm:py-3 text-xs font-medium transition ${
               activeTab === 'companion'
                 ? 'border-[#9db4ff] text-white bg-white/[0.03]'
                 : 'border-transparent text-white/55 hover:text-white hover:bg-white/[0.015]'
             }`}
           >
             <Puzzle className="h-4 w-4 shrink-0 text-[#9db4ff]" />
-            <div className="text-left">
-              <div className="leading-none">1. Browser Companion</div>
-              <div className="mono text-[10px] text-white/40 mt-1 hidden md:block">
+            <div className="text-left min-w-0">
+              <div className="leading-none truncate">1. Browser Companion</div>
+              <div className="mono text-[10px] text-white/40 mt-1 hidden md:block truncate">
                 Extension & device tokens
               </div>
             </div>
@@ -1194,23 +1533,23 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           <button
             type="button"
             onClick={() => setActiveTab('import')}
-            className={`flex items-center justify-center sm:justify-start gap-2.5 border-b-2 px-3 py-3 text-xs font-medium transition ${
+            className={`flex items-center justify-center sm:justify-start gap-2 border-b-2 px-2 sm:px-3 py-2.5 sm:py-3 text-xs font-medium transition ${
               activeTab === 'import'
                 ? 'border-[#9db4ff] text-white bg-white/[0.03]'
                 : 'border-transparent text-white/55 hover:text-white hover:bg-white/[0.015]'
             }`}
           >
             <Upload className="h-4 w-4 shrink-0 text-emerald-400" />
-            <div className="text-left">
+            <div className="text-left min-w-0">
               <div className="flex items-center gap-1.5 leading-none">
-                <span>2. Import & Review</span>
+                <span className="truncate">2. Import & Review</span>
                 {reviewQueue.length > 0 && (
                   <span className="mono tabular-nums rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">
                     {reviewQueue.length}
                   </span>
                 )}
               </div>
-              <div className="mono text-[10px] text-white/40 mt-1 hidden md:block">
+              <div className="mono text-[10px] text-white/40 mt-1 hidden md:block truncate">
                 Files, ZIPs & review queue
               </div>
             </div>
@@ -1219,16 +1558,16 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           <button
             type="button"
             onClick={() => setActiveTab('paste')}
-            className={`flex items-center justify-center sm:justify-start gap-2.5 border-b-2 px-3 py-3 text-xs font-medium transition ${
+            className={`flex items-center justify-center sm:justify-start gap-2 border-b-2 px-2 sm:px-3 py-2.5 sm:py-3 text-xs font-medium transition ${
               activeTab === 'paste'
                 ? 'border-[#9db4ff] text-white bg-white/[0.03]'
                 : 'border-transparent text-white/55 hover:text-white hover:bg-white/[0.015]'
             }`}
           >
             <ClipboardPaste className="h-4 w-4 shrink-0 text-amber-400" />
-            <div className="text-left">
-              <div className="leading-none">3. Paste Conversation</div>
-              <div className="mono text-[10px] text-white/40 mt-1 hidden md:block">
+            <div className="text-left min-w-0">
+              <div className="leading-none truncate">3. Paste Conversation</div>
+              <div className="mono text-[10px] text-white/40 mt-1 hidden md:block truncate">
                 Raw transcript or Markdown
               </div>
             </div>
@@ -1237,16 +1576,16 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           <button
             type="button"
             onClick={() => setActiveTab('export')}
-            className={`flex items-center justify-center sm:justify-start gap-2.5 border-b-2 px-3 py-3 text-xs font-medium transition ${
+            className={`flex items-center justify-center sm:justify-start gap-2 border-b-2 px-2 sm:px-3 py-2.5 sm:py-3 text-xs font-medium transition ${
               activeTab === 'export'
                 ? 'border-[#9db4ff] text-white bg-white/[0.03]'
                 : 'border-transparent text-white/55 hover:text-white hover:bg-white/[0.015]'
             }`}
           >
             <Download className="h-4 w-4 shrink-0 text-purple-400" />
-            <div className="text-left">
-              <div className="leading-none">4. Portable Export</div>
-              <div className="mono text-[10px] text-white/40 mt-1 hidden md:block">
+            <div className="text-left min-w-0">
+              <div className="leading-none truncate">4. Portable Export</div>
+              <div className="mono text-[10px] text-white/40 mt-1 hidden md:block truncate">
                 Markdown snapshot (.md)
               </div>
             </div>
@@ -1254,7 +1593,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         </div>
 
         {/* Main Scrollable Content Area */}
-        <div className="flex-1 overflow-y-auto p-3.5 sm:p-5 md:p-6 scrollbar-thin">
+        <div className="flex-1 overflow-y-auto overflow-x-hidden p-3 sm:p-5 md:p-6 scrollbar-thin">
           {/* ===============================================================
               WORKFLOW 1: BROWSER COMPANION
              =============================================================== */}
@@ -1357,7 +1696,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               </div>
 
               {/* Device Token Management */}
-              <div className="rounded-xl border border-white/10 bg-[#070a15] p-5 space-y-4">
+              <div className="rounded-xl border border-white/10 bg-[#070a15] p-4 sm:p-5 space-y-4">
                 <div>
                   <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                     <KeyRound className="h-4 w-4 text-[#9db4ff]" />
@@ -1378,7 +1717,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                     placeholder="Device label (e.g., MacBook Chrome, Work Edge)..."
                     value={newDeviceName}
                     onChange={(e) => setNewDeviceName(e.target.value)}
-                    className="min-w-[220px] flex-1 rounded-lg border border-white/15 bg-black/50 px-3 py-2 text-xs text-white placeholder-white/35 outline-none focus:border-white/35"
+                    className="min-w-[180px] flex-1 rounded-lg border border-white/15 bg-black/50 px-3 py-2 text-xs text-white placeholder-white/35 outline-none focus:border-white/35"
                   />
                   <select
                     value={newDeviceBrowser}
@@ -1426,8 +1765,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                       Paste this token into the "Device Token" field inside the
                       Browser Companion extension popup:
                     </p>
-                    <div className="flex items-center gap-2">
-                      <code className="mono flex-1 rounded-lg border border-emerald-500/30 bg-black/60 px-3 py-2 text-xs text-emerald-300 select-all">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <code className="mono flex-1 min-w-0 truncate rounded-lg border border-emerald-500/30 bg-black/60 px-3 py-2 text-xs text-emerald-300 select-all">
                         {newlyIssuedToken.token}
                       </code>
                       <button
@@ -1699,8 +2038,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                     </div>
                     <p className="mt-0.5 text-[11px] text-white/45">
                       Duplicate detection never modifies existing content
-                      automatically. Choose Merge, Replace, or Skip individually
-                      or in bulk below.
+                      automatically. Choose Create, Merge, Replace, or Skip
+                      individually or in bulk below.
                     </p>
                   </div>
 
@@ -1773,7 +2112,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               {/* Commit Status Notification Banner */}
               {commitBanner && (
                 <div
-                  className={`flex items-center justify-between rounded-xl border px-4 py-3 text-xs ${
+                  className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-4 py-3 text-xs ${
                     commitBanner.type === 'error'
                       ? 'border-rose-500/35 bg-rose-500/10 text-rose-200'
                       : commitBanner.type === 'warning'
@@ -1804,6 +2143,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 items={reviewQueue}
                 destinations={brains}
                 isBatchProcessing={isCommitting}
+                batchProgress={batchProgress}
                 concurrencyLimit={BULK_CONCURRENCY_LIMIT}
                 selectedIds={selectedQueueIds}
                 onSelectionChange={setSelectedQueueIds}
@@ -1811,6 +2151,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 onReplace={handleReplaceItem}
                 onSkip={handleSkipItem}
                 onRetry={handleRetryItem}
+                onRetryAllFailed={handleRetryAllFailed}
                 onImportNew={handleImportNewItem}
                 onBulkMerge={(items) => handleBulkAction(items, 'merge')}
                 onBulkReplace={(items) => handleBulkAction(items, 'replace')}
@@ -1827,32 +2168,53 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
           {/* ===============================================================
               WORKFLOW 3: PASTE CONVERSATION
+              (Paste -> Source -> Brain -> Duplicate Check -> Review/Decision -> Persistence -> Confirmation)
              =============================================================== */}
           {activeTab === 'paste' && (
             <div className="space-y-4">
               {pasteStatusBanner && (
                 <div
-                  className={`flex items-center justify-between rounded-xl border px-4 py-3 text-xs ${
+                  className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-4 py-3 text-xs ${
                     pasteStatusBanner.type === 'error'
                       ? 'border-rose-500/35 bg-rose-500/10 text-rose-200'
+                      : pasteStatusBanner.type === 'warning'
+                      ? 'border-amber-500/35 bg-amber-500/10 text-amber-200'
                       : 'border-emerald-500/35 bg-emerald-500/10 text-emerald-200'
                   }`}
                 >
                   <div className="flex items-center gap-2">
                     {pasteStatusBanner.type === 'error' ? (
-                      <AlertCircle className="h-4 w-4 text-rose-400" />
+                      <AlertCircle className="h-4 w-4 text-rose-400 shrink-0" />
                     ) : (
-                      <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+                      <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
                     )}
                     <span>{pasteStatusBanner.text}</span>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setPasteStatusBanner(null)}
-                    className="opacity-70 hover:opacity-100"
-                  >
-                    Dismiss
-                  </button>
+                  <div className="flex items-center gap-2">
+                    {pasteStatusBanner.type === 'error' &&
+                      pasteErrorRetryAction && (
+                        <button
+                          type="button"
+                          disabled={isStoringPaste}
+                          onClick={() =>
+                            handleExecutePasteResolution(pasteErrorRetryAction)
+                          }
+                          className="inline-flex items-center gap-1 rounded-md bg-rose-400 px-2.5 py-1 mono text-[11px] font-semibold text-black hover:bg-rose-300"
+                        >
+                          <RotateCcw className="h-3 w-3" />
+                          <span>
+                            Retry {pasteErrorRetryAction.toUpperCase()}
+                          </span>
+                        </button>
+                      )}
+                    <button
+                      type="button"
+                      onClick={() => setPasteStatusBanner(null)}
+                      className="opacity-70 hover:opacity-100"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -1907,39 +2269,32 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 </div>
               </div>
 
-              <div>
-                <label className="block mono text-[11px] text-white/50 mb-1">
-                  Tags (optional, comma-separated)
-                </label>
-                <input
-                  type="text"
-                  placeholder="architecture,database,sprint-planning"
-                  value={pasteTagsInput}
-                  onChange={(e) => setPasteTagsInput(e.target.value)}
-                  className="mono w-full rounded-lg border border-white/15 bg-black/50 px-3 py-1.5 text-xs text-white placeholder-white/30 outline-none focus:border-white/40"
-                />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block mono text-[11px] text-white/50 mb-1">
+                    Filename / Path (optional, used for duplicate check)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="e.g., auth_architecture_review.md"
+                    value={pasteFileNameInput}
+                    onChange={(e) => setPasteFileNameInput(e.target.value)}
+                    className="mono w-full rounded-lg border border-white/15 bg-black/50 px-3 py-1.5 text-xs text-white placeholder-white/30 outline-none focus:border-white/40"
+                  />
+                </div>
+                <div>
+                  <label className="block mono text-[11px] text-white/50 mb-1">
+                    Tags (optional, comma-separated)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="architecture,database,sprint-planning"
+                    value={pasteTagsInput}
+                    onChange={(e) => setPasteTagsInput(e.target.value)}
+                    className="mono w-full rounded-lg border border-white/15 bg-black/50 px-3 py-1.5 text-xs text-white placeholder-white/30 outline-none focus:border-white/40"
+                  />
+                </div>
               </div>
-
-              {/* Live Duplicate Detection Callout */}
-              {pasteDuplicateCheck?.exists &&
-                pasteDuplicateCheck.existingFact && (
-                  <div className="flex items-center justify-between rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-200">
-                    <div className="flex items-center gap-2">
-                      <AlertCircle className="h-4 w-4 text-amber-400 shrink-0" />
-                      <span>
-                        {pasteDuplicateCheck.isIdentical
-                          ? 'Exact duplicate'
-                          : 'Possible duplicate'}{' '}
-                        of Node{' '}
-                        <strong className="mono">
-                          #{pasteDuplicateCheck.existingFact.id}
-                        </strong>{' '}
-                        in "{pasteBrain}". Stage in Review Queue to choose
-                        Merge, Replace, or Skip.
-                      </span>
-                    </div>
-                  </div>
-                )}
 
               <div>
                 <div className="flex items-center justify-between mb-1">
@@ -1956,7 +2311,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                   </span>
                 </div>
                 <textarea
-                  rows={10}
+                  rows={8}
                   value={pasteContent}
                   onChange={(e) => setPasteContent(e.target.value)}
                   placeholder="Paste conversation turns (e.g., User: ... / Assistant: ...) or structured Markdown notes here..."
@@ -1964,30 +2319,162 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 />
               </div>
 
-              <div className="flex flex-wrap items-center justify-end gap-2.5 pt-1">
-                <button
-                  type="button"
-                  disabled={!pasteContent.trim() || isStoringPaste}
-                  onClick={handleQueuePastedConversation}
-                  className="flex items-center gap-1.5 rounded-xl border border-white/20 bg-white/[0.05] px-4 py-2 text-xs font-medium text-white hover:bg-white/[0.1] disabled:opacity-40 transition"
-                >
-                  <ArrowRight className="h-3.5 w-3.5" />
-                  <span>Stage in Review Queue</span>
-                </button>
+              {/* Live Duplicate Check & Explicit User Resolution Panel */}
+              <div className="rounded-xl border border-white/12 bg-[#070a15] p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="mono text-[11px] uppercase tracking-wider text-white/55">
+                      Duplicate Check & Resolution Decision
+                    </span>
+                    <span className="mono rounded border border-white/15 bg-white/[0.04] px-2 py-0.5 text-[11px] font-medium text-white">
+                      {pasteEvaluation.duplicateState === 'new'
+                        ? 'New'
+                        : pasteEvaluation.duplicateState === 'exact_duplicate'
+                        ? 'Exact duplicate'
+                        : pasteEvaluation.duplicateState ===
+                          'possible_duplicate'
+                        ? 'Possible duplicate'
+                        : pasteEvaluation.duplicateState === 'related_content'
+                        ? 'Related content'
+                        : 'Unable to determine'}
+                    </span>
+                  </div>
+                  {pasteEvaluation.nodeCheck?.existingFact && (
+                    <span className="mono text-[11px] text-amber-300">
+                      Matches Node #{pasteEvaluation.nodeCheck.existingFact.id}{' '}
+                      in "{pasteBrain}"
+                    </span>
+                  )}
+                </div>
 
-                <button
-                  type="button"
-                  disabled={!pasteContent.trim() || isStoringPaste}
-                  onClick={handleStorePasteDirectly}
-                  className="flex items-center gap-1.5 rounded-xl bg-white px-4 py-2 text-xs font-semibold text-black hover:bg-white/90 disabled:opacity-40 transition"
-                >
-                  <Check className="h-3.5 w-3.5" />
-                  <span>
-                    {isStoringPaste
-                      ? 'Persisting...'
-                      : `Store Directly in "${pasteBrain}"`}
-                  </span>
-                </button>
+                <p className="text-xs text-white/65">
+                  {pasteEvaluation.nodeCheck?.summary ||
+                    (pasteContent.trim()
+                      ? `No conflicting node found in "${pasteBrain}". Safe to create as a new node.`
+                      : 'Paste conversation content above to evaluate duplicate state against the destination Brain.')}
+                </p>
+
+                {/* Resolution Selector Buttons */}
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="mono text-[11px] text-white/45 mr-1">
+                      Resolution:
+                    </span>
+                    <button
+                      type="button"
+                      disabled={!pasteContent.trim() || isStoringPaste}
+                      onClick={() => setPasteResolution('create')}
+                      className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-medium transition disabled:opacity-35 ${
+                        pasteResolution === 'create'
+                          ? 'bg-emerald-400 text-black font-semibold'
+                          : 'border border-white/15 bg-white/[0.04] text-white/80 hover:text-white'
+                      }`}
+                    >
+                      <Check className="h-3 w-3" />
+                      <span>Create</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={
+                        !pasteContent.trim() ||
+                        isStoringPaste ||
+                        pasteEvaluation.duplicateState === 'unable_to_determine'
+                      }
+                      onClick={() => setPasteResolution('merge')}
+                      className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-medium transition disabled:opacity-35 disabled:cursor-not-allowed ${
+                        pasteResolution === 'merge'
+                          ? 'bg-[#9db4ff] text-black font-semibold'
+                          : 'border border-white/15 bg-white/[0.04] text-white/80 hover:text-white'
+                      }`}
+                      title={
+                        pasteEvaluation.duplicateState === 'unable_to_determine'
+                          ? 'Merge is blocked when duplicate status cannot be determined'
+                          : 'Merge pasted transcript with existing node in destination Brain'
+                      }
+                    >
+                      <GitMerge className="h-3 w-3" />
+                      <span>Merge</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={
+                        !pasteContent.trim() ||
+                        isStoringPaste ||
+                        pasteEvaluation.duplicateState === 'unable_to_determine'
+                      }
+                      onClick={() => setPasteResolution('replace')}
+                      className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-medium transition disabled:opacity-35 disabled:cursor-not-allowed ${
+                        pasteResolution === 'replace'
+                          ? 'bg-amber-400 text-black font-semibold'
+                          : 'border border-white/15 bg-white/[0.04] text-white/80 hover:text-white'
+                      }`}
+                      title={
+                        pasteEvaluation.duplicateState === 'unable_to_determine'
+                          ? 'Replace is blocked when duplicate status cannot be determined'
+                          : 'Replace matched node in destination Brain'
+                      }
+                    >
+                      <Replace className="h-3 w-3" />
+                      <span>Replace</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={!pasteContent.trim() || isStoringPaste}
+                      onClick={() => setPasteResolution('skip')}
+                      className={`inline-flex items-center gap-1 rounded-lg px-2.5 py-1 mono text-[11px] font-medium transition disabled:opacity-35 ${
+                        pasteResolution === 'skip'
+                          ? 'border border-white/30 bg-white/15 text-white font-semibold'
+                          : 'border border-white/12 bg-black/40 text-white/65 hover:text-white'
+                      }`}
+                    >
+                      <SkipForward className="h-3 w-3" />
+                      <span>Skip</span>
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={!pasteContent.trim() || isStoringPaste}
+                      onClick={handleQueuePastedConversation}
+                      className="flex items-center gap-1.5 rounded-xl border border-white/20 bg-white/[0.05] px-3.5 py-2 text-xs font-medium text-white hover:bg-white/[0.1] disabled:opacity-40 transition"
+                    >
+                      <ArrowRight className="h-3.5 w-3.5" />
+                      <span>Stage in Review Queue</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={
+                        !pasteContent.trim() ||
+                        isStoringPaste ||
+                        pasteResolution === 'undecided'
+                      }
+                      onClick={() => handleExecutePasteResolution()}
+                      className="flex items-center gap-1.5 rounded-xl bg-white px-4 py-2 text-xs font-semibold text-black hover:bg-white/90 disabled:opacity-40 transition"
+                    >
+                      <Check className="h-3.5 w-3.5" />
+                      <span>
+                        {isStoringPaste
+                          ? 'Persisting...'
+                          : pasteResolution === 'undecided'
+                          ? 'Choose Resolution Above'
+                          : `${
+                              pasteResolution === 'create'
+                                ? 'Create'
+                                : pasteResolution === 'merge'
+                                ? 'Merge'
+                                : pasteResolution === 'replace'
+                                ? 'Replace'
+                                : 'Skip'
+                            } in "${pasteBrain}"`}
+                      </span>
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -2063,7 +2550,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 </div>
 
                 <div className="flex flex-col justify-center items-end gap-2">
-                  <div className="flex items-center gap-2 w-full justify-end">
+                  <div className="flex flex-wrap items-center gap-2 w-full justify-end">
                     <button
                       type="button"
                       onClick={handleCopyExportMarkdown}
@@ -2095,7 +2582,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               </div>
 
               <div className="rounded-xl border border-white/10 bg-[#060914] overflow-hidden">
-                <div className="flex items-center justify-between border-b border-white/10 bg-white/[0.02] px-4 py-2.5 mono text-[11px] text-white/55">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 bg-white/[0.02] px-4 py-2.5 mono text-[11px] text-white/55">
                   <span>
                     Portable Markdown Preview ·{' '}
                     <strong className="text-white">
@@ -2117,7 +2604,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         </div>
 
         {/* Modal Footer */}
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/10 bg-[#070a17] px-4 sm:px-5 py-3.5 shrink-0">
+        <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-white/10 bg-[#070a17] px-3.5 sm:px-5 py-3 shrink-0">
           <div className="mono text-xs text-white/55">
             {activeTab === 'companion' && (
               <span>
@@ -2138,8 +2625,12 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
             )}
             {activeTab === 'import' && (
               <span className="tabular-nums">
-                {queueMetrics.total} queued · {selectedQueueIds.length} selected
-                · {queueMetrics.ready} actionable
+                {queueMetrics.imported} / {queueMetrics.total} imported ·{' '}
+                {selectedQueueIds.length} selected · {queueMetrics.ready}{' '}
+                actionable
+                {queueMetrics.failed > 0
+                  ? ` · ${queueMetrics.failed} failed`
+                  : ''}
               </span>
             )}
             {activeTab === 'paste' && (
@@ -2160,11 +2651,11 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
             )}
           </div>
 
-          <div className="flex items-center gap-2.5">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={onClose}
-              className="rounded-xl border border-white/15 px-4 py-2 text-xs font-medium text-white/70 hover:text-white transition"
+              className="rounded-xl border border-white/15 px-3.5 sm:px-4 py-2 text-xs font-medium text-white/70 hover:text-white transition"
             >
               Close
             </button>
@@ -2174,7 +2665,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 type="button"
                 disabled={isCommitting || queueMetrics.ready === 0}
                 onClick={handleCommitReviewQueue}
-                className="flex items-center gap-1.5 rounded-xl bg-white px-5 py-2 text-xs font-semibold text-black transition hover:bg-white/90 disabled:opacity-40"
+                className="flex items-center gap-1.5 rounded-xl bg-white px-4 sm:px-5 py-2 text-xs font-semibold text-black transition hover:bg-white/90 disabled:opacity-40"
               >
                 <Check className="h-3.5 w-3.5" />
                 <span>

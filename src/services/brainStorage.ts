@@ -690,9 +690,8 @@ class BrainStorageService {
   }
 
   /**
-   * Creates a local fact and waits for the backend to confirm its durable save.
-   * This is intentionally separate from remember(), which retains its offline-first
-   * fire-and-forget behavior for legacy UI flows.
+   * Creates a local fact and waits for the backend (or local fallback when running offline)
+   * to confirm its durable save.
    */
   private async rememberDurably(
     brain: string,
@@ -701,48 +700,124 @@ class BrainStorageService {
     fileName?: string,
     fileType?: FactFileType,
     tags?: string[],
-    filePath?: string
+    filePath?: string,
+    extraMeta?: {
+      isDocumentRoot?: boolean;
+      isUnifiedContextNode?: boolean;
+      documentTitle?: string;
+      semanticSectionCount?: number;
+      mergeHistory?: Fact['mergeHistory'];
+      parentId?: number;
+      headers?: Record<string, string>;
+      simulateFailure?: boolean;
+    }
   ): Promise<Fact> {
-    const response = await fetch(`${API_BASE}/api/remember`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        brain: brain.trim().toLowerCase(),
-        content: content.trim(),
+    if (extraMeta?.simulateFailure) {
+      throw new Error('Simulated persistence failure — destination Brain was not modified');
+    }
+
+    const resolvedBrain = brain.trim().toLowerCase();
+    const resolvedContent = content.trim();
+    const reqHeaders = extraMeta?.headers || { 'Content-Type': 'application/json' };
+
+    try {
+      const response = await fetch(`${API_BASE}/api/remember`, {
+        method: 'POST',
+        headers: reqHeaders,
+        body: JSON.stringify({
+          brain: resolvedBrain,
+          content: resolvedContent,
+          source,
+          fileName,
+          filePath,
+          fileType,
+          tags: tags || [],
+          isDocumentRoot: extraMeta?.isDocumentRoot,
+          isUnifiedContextNode: extraMeta?.isUnifiedContextNode,
+          documentTitle: extraMeta?.documentTitle,
+          semanticSectionCount: extraMeta?.semanticSectionCount,
+          mergeHistory: extraMeta?.mergeHistory,
+          parentId: extraMeta?.parentId,
+        }),
+      });
+
+      if (!response.ok) {
+        let errDetail = `HTTP ${response.status}`;
+        try {
+          const errJson = await response.json();
+          if (errJson?.error) errDetail = errJson.error;
+        } catch {}
+        throw new Error(`Backend save failed (${errDetail})`);
+      }
+
+      const saved = (await response.json()) as Fact;
+      if (!saved || typeof saved.id !== 'number') {
+        throw new Error('Backend did not return a saved fact ID');
+      }
+
+      const fact: Fact = {
+        ...saved,
+        brain: saved.brain || resolvedBrain,
+        content: saved.content || resolvedContent,
+        source: saved.source || source,
+        fileName: saved.fileName || fileName,
+        filePath: saved.filePath || filePath,
+        fileType: saved.fileType || fileType,
+        tags: saved.tags || tags || [],
+        isDocumentRoot: saved.isDocumentRoot ?? extraMeta?.isDocumentRoot,
+        isUnifiedContextNode: saved.isUnifiedContextNode ?? extraMeta?.isUnifiedContextNode,
+        documentTitle: saved.documentTitle || extraMeta?.documentTitle,
+        semanticSectionCount: saved.semanticSectionCount ?? extraMeta?.semanticSectionCount,
+        mergeHistory: saved.mergeHistory || extraMeta?.mergeHistory,
+        parentId: saved.parentId ?? extraMeta?.parentId,
+      };
+
+      this.facts = [fact, ...this.facts.filter((f) => f.id !== fact.id)];
+      this.createBrain(fact.brain);
+      this.saveLocalFacts();
+      this.recordActivity(fact, 'created');
+      this.notify();
+      return fact;
+    } catch (err: any) {
+      // If backend is unreachable and we are in pure local/offline cache mode, persist locally
+      const isNetworkOfflineError =
+        !this.backendReachable &&
+        this.backendChecked &&
+        err instanceof TypeError;
+
+      if (!isNetworkOfflineError) {
+        throw err;
+      }
+
+      const now = new Date().toISOString();
+      const nextId =
+        this.facts.length > 0 ? Math.max(...this.facts.map((f) => f.id)) + 1 : 1;
+      const offlineFact: Fact = {
+        id: nextId,
+        brain: resolvedBrain,
+        content: resolvedContent,
         source,
         fileName,
-        filePath,
+        filePath: filePath || fileName,
         fileType,
         tags: tags || [],
-      }),
-    });
+        isDocumentRoot: extraMeta?.isDocumentRoot,
+        isUnifiedContextNode: extraMeta?.isUnifiedContextNode,
+        documentTitle: extraMeta?.documentTitle,
+        semanticSectionCount: extraMeta?.semanticSectionCount,
+        mergeHistory: extraMeta?.mergeHistory,
+        parentId: extraMeta?.parentId,
+        created_at: now,
+        updated_at: now,
+      };
 
-    if (!response.ok) {
-      throw new Error(`Backend save failed (HTTP ${response.status})`);
+      this.facts = [offlineFact, ...this.facts];
+      this.createBrain(offlineFact.brain);
+      this.saveLocalFacts();
+      this.recordActivity(offlineFact, 'created');
+      this.notify();
+      return offlineFact;
     }
-
-    const saved = (await response.json()) as Fact;
-    if (!saved || typeof saved.id !== 'number') {
-      throw new Error('Backend did not return a saved fact ID');
-    }
-
-    const fact: Fact = {
-      ...saved,
-      brain: saved.brain || brain.trim().toLowerCase(),
-      content: saved.content || content.trim(),
-      source: saved.source || source,
-      fileName: saved.fileName || fileName,
-      filePath: saved.filePath || filePath,
-      fileType: saved.fileType || fileType,
-      tags: saved.tags || tags || [],
-    };
-
-    this.facts.unshift(fact);
-    this.createBrain(fact.brain);
-    this.saveLocalFacts();
-    this.recordActivity(fact, 'created');
-    this.notify();
-    return fact;
   }
 
   /**
@@ -764,7 +839,7 @@ class BrainStorageService {
 
     const resolvedBrain = brain.trim().toLowerCase();
     const effectivePath = filePath || fileName || 'document.md';
-    const effectiveFileName = fileName || effectivePath.split(/[\\\\/]/).pop() || 'document.md';
+    const effectiveFileName = fileName || effectivePath.split(/[\\/]/).pop() || 'document.md';
     const resolvedType = fileType || inferFileTypeFromExtension(effectiveFileName);
     const existingFact = this.findNodeByFilePath(resolvedBrain, effectivePath);
 
@@ -797,11 +872,39 @@ class BrainStorageService {
         const nextTags = tags?.length
           ? Array.from(new Set([...(existingFact.tags || []), ...tags]))
           : existingFact.tags || [];
+        const cleanTitle =
+          existingFact.documentTitle || effectiveFileName.replace(/\.[^/.]+$/, '');
+        const nextHistory = [
+          {
+            timestamp: now,
+            action: (mergeStrategy === 'replace' ? 'updated' : 'merged') as 'updated' | 'merged',
+            summary:
+              mergeStrategy === 'replace'
+                ? `Replaced content with updated file (${parsed.sections.length} semantic sections)`
+                : diff.summary,
+            previousContentLength: previousSnapshot.content.length,
+            newContentLength: nextContent.length,
+          },
+          ...(existingFact.mergeHistory || []),
+        ];
 
         const response = await fetch(`${API_BASE}/api/correct`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: existingFact.id, content: nextContent, tags: nextTags }),
+          body: JSON.stringify({
+            id: existingFact.id,
+            content: nextContent,
+            source,
+            tags: nextTags,
+            fileName: existingFact.fileName || effectiveFileName,
+            filePath: existingFact.filePath || effectivePath,
+            fileType: existingFact.fileType || resolvedType,
+            documentTitle: cleanTitle,
+            semanticSectionCount: parsed.sections.length,
+            mergeHistory: nextHistory,
+            isDocumentRoot: true,
+            isUnifiedContextNode: true,
+          }),
         });
         if (!response.ok) {
           throw new Error(`Backend update failed (HTTP ${response.status})`);
@@ -812,6 +915,7 @@ class BrainStorageService {
         }
 
         existingFact.content = nextContent;
+        existingFact.source = source;
         existingFact.updated_at = confirmation.updated_at || now;
         existingFact.tags = nextTags;
         existingFact.isUnifiedContextNode = true;
@@ -819,19 +923,8 @@ class BrainStorageService {
         existingFact.semanticSectionCount = parsed.sections.length;
         existingFact.fileName = existingFact.fileName || effectiveFileName;
         existingFact.filePath = existingFact.filePath || effectivePath;
-        existingFact.documentTitle = existingFact.documentTitle || effectiveFileName.replace(/\\.[^/.]+$/, '');
-        existingFact.mergeHistory = [
-          {
-            timestamp: now,
-            action: mergeStrategy === 'replace' ? 'updated' : 'merged',
-            summary: mergeStrategy === 'replace'
-              ? `Replaced content with updated file (${parsed.sections.length} semantic sections)`
-              : diff.summary,
-            previousContentLength: previousSnapshot.content.length,
-            newContentLength: nextContent.length,
-          },
-          ...(existingFact.mergeHistory || []),
-        ];
+        existingFact.documentTitle = cleanTitle;
+        existingFact.mergeHistory = nextHistory;
         this.saveLocalFacts();
         this.recordActivity(existingFact, 'modified');
         this.notify();
@@ -839,9 +932,10 @@ class BrainStorageService {
         return {
           fact: existingFact,
           action: mergeStrategy === 'replace' ? 'updated' : 'merged',
-          message: mergeStrategy === 'replace'
-            ? `Replaced content of node #${existingFact.id} with revised file context.`
-            : diff.summary,
+          message:
+            mergeStrategy === 'replace'
+              ? `Replaced content of node #${existingFact.id} with revised file context.`
+              : diff.summary,
           sectionsCount: parsed.sections.length,
           isExistingNode: true,
           previousId: existingFact.id,
@@ -850,7 +944,16 @@ class BrainStorageService {
     }
 
     const parsed = parseSemanticSections(text, resolvedType, effectiveFileName);
-    const cleanTitle = parsed.title || effectiveFileName.replace(/\\.[^/.]+$/, '');
+    const cleanTitle = parsed.title || effectiveFileName.replace(/\.[^/.]+$/, '');
+    const nowIso = new Date().toISOString();
+    const initialHistory = [
+      {
+        timestamp: nowIso,
+        action: 'created' as const,
+        summary: `Unified coherent context node initialized from ${effectiveFileName} (${parsed.sections.length} semantic sections)`,
+        newContentLength: text.length,
+      },
+    ];
     const savedFact = await this.rememberDurably(
       resolvedBrain,
       text,
@@ -858,22 +961,15 @@ class BrainStorageService {
       effectiveFileName,
       resolvedType,
       tags,
-      effectivePath
-    );
-    savedFact.isDocumentRoot = true;
-    savedFact.isUnifiedContextNode = true;
-    savedFact.documentTitle = cleanTitle;
-    savedFact.semanticSectionCount = parsed.sections.length;
-    savedFact.mergeHistory = [
+      effectivePath,
       {
-        timestamp: savedFact.created_at,
-        action: 'created',
-        summary: `Unified coherent context node initialized from ${effectiveFileName} (${parsed.sections.length} semantic sections)`,
-        newContentLength: text.length,
-      },
-    ];
-    this.saveLocalFacts();
-    this.notify();
+        isDocumentRoot: true,
+        isUnifiedContextNode: true,
+        documentTitle: cleanTitle,
+        semanticSectionCount: parsed.sections.length,
+        mergeHistory: initialHistory,
+      }
+    );
 
     return {
       fact: savedFact,
@@ -1146,9 +1242,10 @@ class BrainStorageService {
   }
 
   /**
-   * Backend-confirmed persistence for ImportReviewQueue actions ('create' | 'merge' | 'replace').
-   * Does NOT optimistically mark items as imported: awaits backend HTTP confirmation before
-   * mutating local state, and throws an Error if backend persistence fails.
+   * Backend-confirmed (or local-confirmed in offline cache mode) persistence for
+   * ImportReviewQueue actions ('create' | 'merge' | 'replace').
+   * Never optimistically marks items as imported: awaits durable confirmation before
+   * mutating local state, and throws an Error if persistence fails.
    */
   public async persistReviewedItem(params: {
     action: 'create' | 'merge' | 'replace';
@@ -1163,6 +1260,7 @@ class BrainStorageService {
     targetFactId?: number;
     strategy?: IngestStrategy;
     chunkSize?: number;
+    simulateFailure?: boolean;
     onProgress?: (progress: {
       mode: 'determinate' | 'indeterminate';
       current?: number;
@@ -1211,10 +1309,13 @@ class BrainStorageService {
         cleanTitle
       ).existingFact;
 
-    // Build headers including optional companion token if configured
+    // Build headers including optional companion token and simulated failure flag
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
     };
+    if (params.simulateFailure) {
+      headers['x-simulate-failure'] = 'true';
+    }
     try {
       const savedToken = localStorage.getItem('brain_active_device_token');
       if (savedToken) {
@@ -1222,26 +1323,46 @@ class BrainStorageService {
       }
     } catch {}
 
+    // If a specific targetFactId was requested for merge/replace and cannot be found locally,
+    // verify against backend /api/correct so missing node errors are properly surfaced.
+    const targetIdForUpdate = existingFact?.id ?? params.targetFactId;
+
     // CASE 1: MERGE into existing destination node
-    if (params.action === 'merge' && existingFact) {
+    if (params.action === 'merge' && (existingFact || targetIdForUpdate !== undefined)) {
       params.onProgress?.({
         mode: 'indeterminate',
-        label: 'Merging with destination node… [indeterminate]',
+        label: 'Merging with destination node…',
       });
 
-      const diff = detectIncrementalDiff(
-        existingFact.content,
-        formattedText,
-        resolvedType,
-        effectiveFileName
-      );
+      if (params.simulateFailure) {
+        throw new Error('Simulated persistence failure — destination node was not modified');
+      }
 
-      // Combine existing content with imported content even if sections overlapped
-      const mergedContent = diff.isIdentical
-        ? existingFact.content
-        : diff.hasNewContent
-        ? diff.mergedContent
-        : `${existingFact.content.trim()}\n\n${rawText}`;
+      const baseContent = existingFact ? existingFact.content : '';
+      const diff = existingFact
+        ? detectIncrementalDiff(
+            existingFact.content,
+            formattedText,
+            resolvedType,
+            effectiveFileName
+          )
+        : {
+            isIdentical: false,
+            hasNewContent: true,
+            newSections: [],
+            mergedContent: formattedText,
+            mergedSectionsCount: 1,
+            summary: `Merged imported content from ${effectiveFileName}`,
+            action: 'merged' as const,
+          };
+
+      const mergedContent = existingFact
+        ? diff.isIdentical
+          ? existingFact.content
+          : diff.hasNewContent
+          ? diff.mergedContent
+          : `${existingFact.content.trim()}\n\n${rawText}`
+        : formattedText;
 
       const parsed = parseSemanticSections(
         mergedContent,
@@ -1249,87 +1370,131 @@ class BrainStorageService {
         effectiveFileName
       );
       const mergedTags = Array.from(
-        new Set([...(existingFact.tags || []), ...(params.tags || [])])
+        new Set([...(existingFact?.tags || []), ...(params.tags || [])])
       );
       const mergeRecord = {
         timestamp: new Date().toISOString(),
         action: 'merged' as const,
         summary:
           diff.summary ||
-          `Merged imported content from ${effectiveFileName} into Node #${existingFact.id}`,
-        previousContentLength: existingFact.content.length,
+          `Merged imported content from ${effectiveFileName} into Node #${targetIdForUpdate}`,
+        previousContentLength: baseContent.length,
         newContentLength: mergedContent.length,
       };
       const nextMergeHistory = [
         mergeRecord,
-        ...(existingFact.mergeHistory || []),
+        ...(existingFact?.mergeHistory || []),
       ];
 
-      const res = await fetch(`${API_BASE}/api/correct`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          id: existingFact.id,
-          content: mergedContent,
-          tags: mergedTags,
-          fileName: existingFact.fileName || effectiveFileName,
-          filePath: existingFact.filePath || effectivePath,
-          fileType: existingFact.fileType || resolvedType,
-          documentTitle: existingFact.documentTitle || cleanTitle,
-          semanticSectionCount: parsed.sections.length,
-          mergeHistory: nextMergeHistory,
-          isDocumentRoot: true,
-          isUnifiedContextNode: true,
-        }),
-      });
+      try {
+        const res = await fetch(`${API_BASE}/api/correct`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            id: targetIdForUpdate,
+            content: mergedContent,
+            source: existingFact?.source || params.source,
+            tags: mergedTags,
+            fileName: existingFact?.fileName || effectiveFileName,
+            filePath: existingFact?.filePath || effectivePath,
+            fileType: existingFact?.fileType || resolvedType,
+            documentTitle: existingFact?.documentTitle || cleanTitle,
+            semanticSectionCount: parsed.sections.length,
+            mergeHistory: nextMergeHistory,
+            isDocumentRoot: true,
+            isUnifiedContextNode: true,
+          }),
+        });
 
-      if (!res.ok) {
-        let errDetail = `HTTP ${res.status}`;
-        try {
-          const errJson = await res.json();
-          if (errJson?.error) errDetail = errJson.error;
-        } catch {}
-        throw new Error(`Merge persistence failed (${errDetail})`);
+        if (!res.ok) {
+          let errDetail = `HTTP ${res.status}`;
+          try {
+            const errJson = await res.json();
+            if (errJson?.error) errDetail = errJson.error;
+          } catch {}
+          throw new Error(`Merge persistence failed (${errDetail})`);
+        }
+
+        const data = await res.json();
+        if (!data?.ok) {
+          throw new Error('Backend did not confirm merge update.');
+        }
+
+        const targetRef = existingFact || (data.fact as Fact);
+        if (existingFact) {
+          existingFact.content = mergedContent;
+          existingFact.updated_at = data.updated_at || new Date().toISOString();
+          existingFact.tags = mergedTags;
+          existingFact.fileName = existingFact.fileName || effectiveFileName;
+          existingFact.filePath = existingFact.filePath || effectivePath;
+          existingFact.fileType = existingFact.fileType || resolvedType;
+          existingFact.documentTitle = existingFact.documentTitle || cleanTitle;
+          existingFact.isDocumentRoot = true;
+          existingFact.isUnifiedContextNode = true;
+          existingFact.semanticSectionCount = parsed.sections.length;
+          existingFact.mergeHistory = nextMergeHistory;
+        }
+
+        this.saveLocalFacts();
+        if (targetRef) this.recordActivity(targetRef, 'modified');
+        this.notify();
+
+        return {
+          fact: targetRef,
+          action: 'merged',
+          message: `Merged into Node #${targetIdForUpdate} in "${resolvedBrain}"`,
+          sectionsCount: parsed.sections.length,
+          isExistingNode: true,
+          previousId: targetIdForUpdate,
+        };
+      } catch (err: any) {
+        const isNetworkOfflineError =
+          !this.backendReachable &&
+          this.backendChecked &&
+          err instanceof TypeError &&
+          Boolean(existingFact);
+
+        if (!isNetworkOfflineError || !existingFact) {
+          throw err;
+        }
+
+        existingFact.content = mergedContent;
+        existingFact.updated_at = new Date().toISOString();
+        existingFact.tags = mergedTags;
+        existingFact.fileName = existingFact.fileName || effectiveFileName;
+        existingFact.filePath = existingFact.filePath || effectivePath;
+        existingFact.fileType = existingFact.fileType || resolvedType;
+        existingFact.documentTitle = existingFact.documentTitle || cleanTitle;
+        existingFact.isDocumentRoot = true;
+        existingFact.isUnifiedContextNode = true;
+        existingFact.semanticSectionCount = parsed.sections.length;
+        existingFact.mergeHistory = nextMergeHistory;
+
+        this.saveLocalFacts();
+        this.recordActivity(existingFact, 'modified');
+        this.notify();
+
+        return {
+          fact: existingFact,
+          action: 'merged',
+          message: `Merged into Node #${existingFact.id} in "${resolvedBrain}"`,
+          sectionsCount: parsed.sections.length,
+          isExistingNode: true,
+          previousId: existingFact.id,
+        };
       }
-
-      const data = await res.json();
-      if (!data?.ok) {
-        throw new Error('Backend did not confirm merge update.');
-      }
-
-      // Update local state only after backend confirms
-      existingFact.content = mergedContent;
-      existingFact.updated_at = data.updated_at || new Date().toISOString();
-      existingFact.tags = mergedTags;
-      existingFact.fileName = existingFact.fileName || effectiveFileName;
-      existingFact.filePath = existingFact.filePath || effectivePath;
-      existingFact.fileType = existingFact.fileType || resolvedType;
-      existingFact.documentTitle = existingFact.documentTitle || cleanTitle;
-      existingFact.isDocumentRoot = true;
-      existingFact.isUnifiedContextNode = true;
-      existingFact.semanticSectionCount = parsed.sections.length;
-      existingFact.mergeHistory = nextMergeHistory;
-
-      this.saveLocalFacts();
-      this.recordActivity(existingFact, 'modified');
-      this.notify();
-
-      return {
-        fact: existingFact,
-        action: 'merged',
-        message: `Merged into Node #${existingFact.id} in "${resolvedBrain}"`,
-        sectionsCount: parsed.sections.length,
-        isExistingNode: true,
-        previousId: existingFact.id,
-      };
     }
 
     // CASE 2: REPLACE existing destination node content
-    if (params.action === 'replace' && existingFact) {
+    if (params.action === 'replace' && (existingFact || targetIdForUpdate !== undefined)) {
       params.onProgress?.({
         mode: 'indeterminate',
-        label: 'Replacing destination node… [indeterminate]',
+        label: 'Replacing destination node…',
       });
+
+      if (params.simulateFailure) {
+        throw new Error('Simulated persistence failure — destination node was not modified');
+      }
 
       const parsed = parseSemanticSections(
         formattedText,
@@ -1339,77 +1504,118 @@ class BrainStorageService {
       const nextTags =
         params.tags && params.tags.length > 0
           ? Array.from(new Set(params.tags))
-          : existingFact.tags || [];
+          : existingFact?.tags || [];
       const replaceRecord = {
         timestamp: new Date().toISOString(),
         action: 'updated' as const,
         summary: `Replaced content with ${effectiveFileName} (${parsed.sections.length} sections)`,
-        previousContentLength: existingFact.content.length,
+        previousContentLength: existingFact?.content.length ?? 0,
         newContentLength: formattedText.length,
       };
       const nextMergeHistory = [
         replaceRecord,
-        ...(existingFact.mergeHistory || []),
+        ...(existingFact?.mergeHistory || []),
       ];
 
-      const res = await fetch(`${API_BASE}/api/correct`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          id: existingFact.id,
-          content: formattedText,
-          tags: nextTags,
-          fileName: effectiveFileName,
-          filePath: effectivePath,
-          fileType: resolvedType,
-          documentTitle: cleanTitle,
-          semanticSectionCount: parsed.sections.length,
-          mergeHistory: nextMergeHistory,
-          isDocumentRoot: true,
-          isUnifiedContextNode: true,
-        }),
-      });
+      try {
+        const res = await fetch(`${API_BASE}/api/correct`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            id: targetIdForUpdate,
+            content: formattedText,
+            source: params.source,
+            tags: nextTags,
+            fileName: effectiveFileName,
+            filePath: effectivePath,
+            fileType: resolvedType,
+            documentTitle: cleanTitle,
+            semanticSectionCount: parsed.sections.length,
+            mergeHistory: nextMergeHistory,
+            isDocumentRoot: true,
+            isUnifiedContextNode: true,
+          }),
+        });
 
-      if (!res.ok) {
-        let errDetail = `HTTP ${res.status}`;
-        try {
-          const errJson = await res.json();
-          if (errJson?.error) errDetail = errJson.error;
-        } catch {}
-        throw new Error(`Replace persistence failed (${errDetail})`);
+        if (!res.ok) {
+          let errDetail = `HTTP ${res.status}`;
+          try {
+            const errJson = await res.json();
+            if (errJson?.error) errDetail = errJson.error;
+          } catch {}
+          throw new Error(`Replace persistence failed (${errDetail})`);
+        }
+
+        const data = await res.json();
+        if (!data?.ok) {
+          throw new Error('Backend did not confirm replacement.');
+        }
+
+        const targetRef = existingFact || (data.fact as Fact);
+        if (existingFact) {
+          existingFact.content = formattedText;
+          existingFact.source = params.source;
+          existingFact.updated_at = data.updated_at || new Date().toISOString();
+          existingFact.tags = nextTags;
+          existingFact.fileName = effectiveFileName;
+          existingFact.filePath = effectivePath;
+          existingFact.fileType = resolvedType;
+          existingFact.documentTitle = cleanTitle;
+          existingFact.isDocumentRoot = true;
+          existingFact.isUnifiedContextNode = true;
+          existingFact.semanticSectionCount = parsed.sections.length;
+          existingFact.mergeHistory = nextMergeHistory;
+        }
+
+        this.saveLocalFacts();
+        if (targetRef) this.recordActivity(targetRef, 'modified');
+        this.notify();
+
+        return {
+          fact: targetRef,
+          action: 'updated',
+          message: `Replaced Node #${targetIdForUpdate} in "${resolvedBrain}"`,
+          sectionsCount: parsed.sections.length,
+          isExistingNode: true,
+          previousId: targetIdForUpdate,
+        };
+      } catch (err: any) {
+        const isNetworkOfflineError =
+          !this.backendReachable &&
+          this.backendChecked &&
+          err instanceof TypeError &&
+          Boolean(existingFact);
+
+        if (!isNetworkOfflineError || !existingFact) {
+          throw err;
+        }
+
+        existingFact.content = formattedText;
+        existingFact.source = params.source;
+        existingFact.updated_at = new Date().toISOString();
+        existingFact.tags = nextTags;
+        existingFact.fileName = effectiveFileName;
+        existingFact.filePath = effectivePath;
+        existingFact.fileType = resolvedType;
+        existingFact.documentTitle = cleanTitle;
+        existingFact.isDocumentRoot = true;
+        existingFact.isUnifiedContextNode = true;
+        existingFact.semanticSectionCount = parsed.sections.length;
+        existingFact.mergeHistory = nextMergeHistory;
+
+        this.saveLocalFacts();
+        this.recordActivity(existingFact, 'modified');
+        this.notify();
+
+        return {
+          fact: existingFact,
+          action: 'updated',
+          message: `Replaced Node #${existingFact.id} in "${resolvedBrain}"`,
+          sectionsCount: parsed.sections.length,
+          isExistingNode: true,
+          previousId: existingFact.id,
+        };
       }
-
-      const data = await res.json();
-      if (!data?.ok) {
-        throw new Error('Backend did not confirm replacement.');
-      }
-
-      // Update local state only after backend confirms
-      existingFact.content = formattedText;
-      existingFact.source = params.source;
-      existingFact.updated_at = data.updated_at || new Date().toISOString();
-      existingFact.tags = nextTags;
-      existingFact.fileName = effectiveFileName;
-      existingFact.filePath = effectivePath;
-      existingFact.fileType = resolvedType;
-      existingFact.documentTitle = cleanTitle;
-      existingFact.isDocumentRoot = true;
-      existingFact.isUnifiedContextNode = true;
-      existingFact.semanticSectionCount = parsed.sections.length;
-      existingFact.mergeHistory = nextMergeHistory;
-
-      this.saveLocalFacts();
-      this.recordActivity(existingFact, 'modified');
-      this.notify();
-
-      return {
-        fact: existingFact,
-        action: 'updated',
-        message: `Replaced Node #${existingFact.id} in "${resolvedBrain}"`,
-        sectionsCount: parsed.sections.length,
-        isExistingNode: true,
-        previousId: existingFact.id,
-      };
     }
 
     // CASE 3: Multi-chunk or branching creation with measurable determinate chunk progress
@@ -1449,7 +1655,22 @@ class BrainStorageService {
             effectiveFileName,
             resolvedType,
             params.tags,
-            effectivePath
+            effectivePath,
+            {
+              documentTitle: `${cleanTitle} (Part ${i + 1}/${chunks.length})`,
+              semanticSectionCount: 1,
+              isDocumentRoot: i === 0,
+              headers,
+              simulateFailure: params.simulateFailure,
+              mergeHistory: [
+                {
+                  timestamp: new Date().toISOString(),
+                  action: 'created',
+                  summary: `Created chunk ${i + 1} of ${chunks.length} from ${effectiveFileName}`,
+                  newContentLength: chunks[i].length,
+                },
+              ],
+            }
           );
           if (!firstFact) firstFact = savedChunk;
           params.onProgress?.({
@@ -1496,12 +1717,24 @@ class BrainStorageService {
           effectiveFileName,
           resolvedType,
           [...(params.tags || []), 'document-hub'],
-          effectivePath
+          effectivePath,
+          {
+            isDocumentRoot: true,
+            isUnifiedContextNode: true,
+            documentTitle: cleanTitle,
+            semanticSectionCount: sections.length,
+            headers,
+            simulateFailure: params.simulateFailure,
+            mergeHistory: [
+              {
+                timestamp: new Date().toISOString(),
+                action: 'created',
+                summary: `Initialized branching document hub for ${effectiveFileName} (${sections.length} branch sections)`,
+                newContentLength: formattedText.length,
+              },
+            ],
+          }
         );
-        rootFact.isDocumentRoot = true;
-        rootFact.isUnifiedContextNode = true;
-        rootFact.documentTitle = cleanTitle;
-        rootFact.semanticSectionCount = sections.length;
 
         params.onProgress?.({
           mode: 'determinate',
@@ -1512,16 +1745,22 @@ class BrainStorageService {
         });
 
         for (let i = 0; i < sections.length; i++) {
-          const childFact = await this.rememberDurably(
+          await this.rememberDurably(
             resolvedBrain,
             sections[i].content.trim(),
             params.source,
             effectiveFileName,
             resolvedType,
             params.tags,
-            effectivePath
+            effectivePath,
+            {
+              parentId: rootFact.id,
+              documentTitle: sections[i].title || `${cleanTitle} · Section ${i + 1}`,
+              semanticSectionCount: 1,
+              headers,
+              simulateFailure: params.simulateFailure,
+            }
           );
-          childFact.parentId = rootFact.id;
           params.onProgress?.({
             mode: 'determinate',
             current: i + 2,
@@ -1546,7 +1785,7 @@ class BrainStorageService {
     // CASE 4: CREATE single unified node in destination Brain (indeterminate progress during single HTTP request)
     params.onProgress?.({
       mode: 'indeterminate',
-      label: 'Processing… [indeterminate]',
+      label: 'Persisting to Brain…',
     });
 
     const parsed = parseSemanticSections(
@@ -1564,63 +1803,24 @@ class BrainStorageService {
       },
     ];
 
-    const res = await fetch(`${API_BASE}/api/remember`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        brain: resolvedBrain,
-        content: formattedText,
-        source: params.source,
-        fileName: effectiveFileName,
-        filePath: effectivePath,
-        fileType: resolvedType,
-        tags: params.tags || [],
+    const confirmedFact = await this.rememberDurably(
+      resolvedBrain,
+      formattedText,
+      params.source,
+      effectiveFileName,
+      resolvedType,
+      params.tags || [],
+      effectivePath,
+      {
         isDocumentRoot: true,
         isUnifiedContextNode: true,
         documentTitle: cleanTitle,
         semanticSectionCount: parsed.sections.length,
         mergeHistory: initialHistory,
-      }),
-    });
-
-    if (!res.ok) {
-      let errDetail = `HTTP ${res.status}`;
-      try {
-        const errJson = await res.json();
-        if (errJson?.error) errDetail = errJson.error;
-      } catch {}
-      throw new Error(`Import persistence failed (${errDetail})`);
-    }
-
-    const savedFact: Fact = await res.json();
-    if (!savedFact || typeof savedFact.id !== 'number') {
-      throw new Error('Invalid confirmation payload from backend.');
-    }
-
-    const confirmedFact: Fact = {
-      ...savedFact,
-      brain: resolvedBrain,
-      content: formattedText,
-      source: params.source,
-      fileName: effectiveFileName,
-      filePath: effectivePath,
-      fileType: resolvedType,
-      tags: params.tags || [],
-      isDocumentRoot: true,
-      isUnifiedContextNode: true,
-      documentTitle: cleanTitle,
-      semanticSectionCount: parsed.sections.length,
-      mergeHistory: initialHistory,
-    };
-
-    this.createBrain(resolvedBrain);
-    this.facts = [
-      confirmedFact,
-      ...this.facts.filter((f) => f.id !== confirmedFact.id),
-    ];
-    this.saveLocalFacts();
-    this.recordActivity(confirmedFact, 'created');
-    this.notify();
+        headers,
+        simulateFailure: params.simulateFailure,
+      }
+    );
 
     return {
       fact: confirmedFact,

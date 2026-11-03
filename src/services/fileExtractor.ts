@@ -1,4 +1,5 @@
-import { AISource } from '../types/brain';
+import { AISource, FactFileType, inferFileTypeFromExtension } from '../types/brain';
+export { inferFileTypeFromExtension };
 
 export const SUPPORTED_FILE_EXTENSIONS = [
   '.zip',
@@ -21,6 +22,8 @@ export const SUPPORTED_FILE_EXTENSIONS = [
 export interface ExtractedFileResult {
   title: string;
   fileName: string;
+  filePath?: string;
+  fileType?: FactFileType;
   archiveParent?: string;
   extension: string;
   sizeBytes: number;
@@ -128,7 +131,14 @@ export async function extractItemsFromFile(
     return await extractZipArchive(file, onProgress);
   }
   const single = await extractTextFromFile(file, onProgress);
-  return [single];
+  const relativePath = (file as any).webkitRelativePath || file.name;
+  return [
+    {
+      ...single,
+      filePath: single.filePath || relativePath,
+      fileType: single.fileType || inferFileTypeFromExtension(single.fileName),
+    },
+  ];
 }
 
 /**
@@ -349,6 +359,8 @@ async function extractZipArchive(
         results.push({
           ...extracted,
           fileName: baseName,
+          filePath: relativePath,
+          fileType: extracted.fileType || inferFileTypeFromExtension(baseName),
           archiveParent: zipFile.name,
         });
       }

@@ -455,6 +455,12 @@ app.get('/api/recall', (req, res) => {
 // 5. Store / Remember Fact API
 app.post('/api/remember', (req, res) => {
   try {
+    if (req.headers['x-simulate-failure'] === 'true') {
+      return res.status(503).json({
+        error: 'Simulated persistence failure — destination Brain was not modified',
+      });
+    }
+
     const {
       brain,
       content,
@@ -520,9 +526,16 @@ app.post('/api/remember', (req, res) => {
 // 6. Correct / Update Fact API
 app.post('/api/correct', (req, res) => {
   try {
+    if (req.headers['x-simulate-failure'] === 'true') {
+      return res.status(503).json({
+        error: 'Simulated persistence failure — destination node was not modified',
+      });
+    }
+
     const {
       id,
       content,
+      source,
       tags,
       fileName,
       filePath,
@@ -544,6 +557,7 @@ app.post('/api/correct', (req, res) => {
 
     const now = new Date().toISOString();
     const nextContent = typeof content === 'string' ? content.trim() : existing.content;
+    const nextSource = typeof source === 'string' && source.trim() ? source.trim() : existing.source;
     const nextTagsJson = Array.isArray(tags) ? JSON.stringify(tags) : existing.tags_json;
     const nextFileName = fileName !== undefined ? fileName : existing.file_name;
     const nextFilePath = filePath !== undefined ? filePath : existing.file_path;
@@ -566,6 +580,7 @@ app.post('/api/correct', (req, res) => {
     db.prepare(`
       UPDATE facts
       SET content = ?,
+          source = ?,
           tags_json = ?,
           file_name = ?,
           file_path = ?,
@@ -579,6 +594,7 @@ app.post('/api/correct', (req, res) => {
       WHERE id = ?
     `).run(
       nextContent,
+      nextSource,
       nextTagsJson,
       nextFileName,
       nextFilePath,

@@ -214,6 +214,31 @@ export type DuplicateDetectionState =
   | 'related_content'
   | 'unable_to_determine';
 
+export type ReviewResolutionAction =
+  | 'create'
+  | 'merge'
+  | 'replace'
+  | 'skip'
+  | 'undecided';
+
+export type ReviewItemStatus =
+  | 'extracting'
+  | 'ready'
+  | 'importing'
+  | 'processing'
+  | 'imported'
+  | 'skipped'
+  | 'error';
+
+export interface ImportItemProgress {
+  mode: 'determinate' | 'indeterminate';
+  phase?: 'uploading' | 'extracting' | 'importing' | 'processing';
+  current?: number;
+  total?: number;
+  unit?: string;
+  label?: string;
+}
+
 export interface ExistingFileNodeCheck {
   exists: boolean;
   existingFact?: Fact;
@@ -224,6 +249,42 @@ export interface ExistingFileNodeCheck {
   summary?: string;
   recommendedAction: 'create' | 'merge' | 'skip' | 'replace' | 'ask_user';
   duplicateState?: DuplicateDetectionState;
+}
+
+export interface ImportReviewItem {
+  id: string;
+  title: string;
+  fileName: string;
+  filePath?: string;
+  fileType?: FactFileType;
+  archiveParent?: string;
+  extension: string;
+  sizeBytes: number;
+  text: string;
+  source: AISource;
+  destinationBrain: string;
+  itemCount: number;
+  itemUnitLabel: string;
+  status: ReviewItemStatus;
+  statusMessage?: string;
+  errorMessage?: string;
+  lastAttemptedAction?: 'create' | 'merge' | 'replace';
+  duplicateState: DuplicateDetectionState;
+  nodeCheck?: ExistingFileNodeCheck;
+  resolution: ReviewResolutionAction;
+  tags: string[];
+  progress?: ImportItemProgress;
+  simulateFailureOnce?: boolean;
+}
+
+export interface BatchExecutionProgress {
+  actionLabel: string;
+  completed: number;
+  total: number;
+  imported?: number;
+  skipped?: number;
+  failed?: number;
+  activeCount: number;
 }
 
 export interface IngestOperationResult {
