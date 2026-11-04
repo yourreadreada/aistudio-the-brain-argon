@@ -284,11 +284,6 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
                 <History className="h-4 w-4 shrink-0 text-sky-400" />
                 {!isCollapsed && <span>Activity Log</span>}
               </span>
-              {!isCollapsed && recentActivityCount > 0 && (
-                <span className="mono text-[11px] tabular-nums text-white/40">
-                  {recentActivityCount}
-                </span>
-              )}
             </button>
           </div>
         </div>

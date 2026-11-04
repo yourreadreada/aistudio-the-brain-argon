@@ -29,10 +29,156 @@ export interface IncrementalMergeResult {
 }
 
 /**
- * Normalizes text to standardize line endings and trailing whitespace.
+ * Normalizes line endings and trims outer whitespace while preserving original casing.
  */
 function normalize(text: string): string {
-  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  return (text || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+}
+
+/**
+ * Normalizes whitespace and casing for duplicate detection comparisons:
+ * - Standardizes CRLF/CR line breaks to LF
+ * - Collapses horizontal whitespace runs on each line
+ * - Normalizes multiple blank lines into a single blank line
+ * - Converts to lowercase
+ */
+export function normalizeWhitespaceAndCase(text: string): string {
+  return (text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Strips an automatically generated or leading top-level `# Title` heading
+ * when followed by document body content, returning both the full normalized text
+ * and the normalized body without the leading title heading.
+ */
+export function normalizeContentForDuplicateCheck(
+  rawText: string,
+  candidateTitles?: (string | undefined)[]
+): {
+  fullNormalized: string;
+  bodyNormalized: string;
+  fullNorm: string;
+  bodyNorm: string;
+  leadingHeadingNormalized: string | null;
+} {
+  const cleaned = normalize(rawText);
+  const fullNormalized = normalizeWhitespaceAndCase(cleaned);
+
+  if (!cleaned) {
+    return {
+      fullNormalized: '',
+      bodyNormalized: '',
+      fullNorm: '',
+      bodyNorm: '',
+      leadingHeadingNormalized: null,
+    };
+  }
+
+  // Match a leading single-# heading followed by body content
+  const leadingH1Match = cleaned.match(/^#\s+([^\n]+)\n+([\s\S]+)$/);
+  if (leadingH1Match) {
+    const rawHeading = leadingH1Match[1].trim();
+    const rawBody = leadingH1Match[2].trim();
+    const bodyNormalized = normalizeWhitespaceAndCase(rawBody);
+    const leadingHeadingNormalized = normalizeWhitespaceAndCase(rawHeading);
+
+    if (bodyNormalized.length > 0) {
+      return {
+        fullNormalized,
+        bodyNormalized,
+        fullNorm: fullNormalized,
+        bodyNorm: bodyNormalized,
+        leadingHeadingNormalized,
+      };
+    }
+  }
+
+  // Also check if candidateTitles were provided and the text starts with `# <candidateTitle>`
+  if (candidateTitles && candidateTitles.length > 0) {
+    for (const candidate of candidateTitles) {
+      if (!candidate || !candidate.trim()) continue;
+      const escaped = candidate
+        .trim()
+        .replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(`^#\\s+${escaped}\\s*\\n+([\\s\\S]+)$`, 'i');
+      const m = cleaned.match(regex);
+      if (m && m[1].trim()) {
+        const bodyNormalized = normalizeWhitespaceAndCase(m[1]);
+        return {
+          fullNormalized,
+          bodyNormalized,
+          fullNorm: fullNormalized,
+          bodyNorm: bodyNormalized,
+          leadingHeadingNormalized: normalizeWhitespaceAndCase(candidate),
+        };
+      }
+    }
+  }
+
+  return {
+    fullNormalized,
+    bodyNormalized: fullNormalized,
+    fullNorm: fullNormalized,
+    bodyNorm: fullNormalized,
+    leadingHeadingNormalized: null,
+  };
+}
+
+/**
+ * Determines whether two documents are exact duplicates after normalizing whitespace,
+ * casing, and accounting for automatically generated leading `# Document Title` headings.
+ * Partial matches or substrings are NEVER treated as exact duplicates.
+ */
+export function areDocumentsExactDuplicates(
+  contentA: string,
+  contentB: string,
+  candidateTitlesA?: (string | undefined)[],
+  candidateTitlesB?: (string | undefined)[]
+): boolean {
+  const normA = normalizeContentForDuplicateCheck(contentA, candidateTitlesA);
+  const normB = normalizeContentForDuplicateCheck(contentB, candidateTitlesB);
+
+  if (!normA.fullNormalized || !normB.fullNormalized) {
+    return false;
+  }
+
+  // 1. Direct normalized full-text equality
+  if (normA.fullNormalized === normB.fullNormalized) {
+    return true;
+  }
+
+  // 2. One document has a leading `# Title` header prepended while the other is the raw body
+  if (
+    normA.leadingHeadingNormalized !== null &&
+    normA.bodyNormalized.length > 0 &&
+    normA.bodyNormalized === normB.fullNormalized
+  ) {
+    return true;
+  }
+
+  if (
+    normB.leadingHeadingNormalized !== null &&
+    normB.bodyNormalized.length > 0 &&
+    normB.bodyNormalized === normA.fullNormalized
+  ) {
+    return true;
+  }
+
+  // 3. Both documents have leading `# Title` headers (e.g. generated from different filenames)
+  // and their normalized document bodies are 100% identical
+  if (
+    normA.leadingHeadingNormalized !== null &&
+    normB.leadingHeadingNormalized !== null &&
+    normA.bodyNormalized.length > 0 &&
+    normA.bodyNormalized === normB.bodyNormalized
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -383,8 +529,15 @@ export function detectIncrementalDiff(
   const normExisting = normalize(existingContent);
   const normIncoming = normalize(incomingContent);
 
-  // Exact match check
-  if (normExisting === normIncoming) {
+  // Exact match check (accounting for whitespace, casing, and leading document-title headings)
+  if (
+    areDocumentsExactDuplicates(
+      normExisting,
+      normIncoming,
+      [fileName],
+      [fileName]
+    )
+  ) {
     const parsed = parseSemanticSections(normExisting, fileType, fileName);
     return {
       isIdentical: true,
@@ -402,13 +555,18 @@ export function detectIncrementalDiff(
 
   // Map existing sections by normalized signature
   const existingSignatures = new Set(
-    existingParsed.sections.map((s) => s.content.trim().toLowerCase())
+    existingParsed.sections.map((s) => normalizeWhitespaceAndCase(s.content))
   );
 
-  // Find sections in incoming that don't exist yet
+  // Find sections in incoming that don't exist yet (ignoring a bare `# Title` header section if its body is empty)
   const newSections: SemanticSection[] = [];
   incomingParsed.sections.forEach((sec) => {
-    const sig = sec.content.trim().toLowerCase();
+    const sig = normalizeWhitespaceAndCase(sec.content);
+    if (!sig) return;
+    // Skip a standalone `# Title` header section if it has no body lines
+    if (/^#\s+[^\n]+$/.test(sec.content.trim())) {
+      return;
+    }
     if (!existingSignatures.has(sig)) {
       newSections.push(sec);
     }
@@ -444,7 +602,7 @@ export function detectIncrementalDiff(
     };
   }
 
-  // If no distinct new sections found but content differs (minor edit / formatting correction)
+  // If no distinct new sections found but content differs (e.g. partial subset or modified content)
   return {
     isIdentical: false,
     hasNewContent: true,

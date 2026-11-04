@@ -17,6 +17,8 @@ import {
   MinusSquare,
   ShieldAlert,
   FolderGit2,
+  Wand2,
+  Tag,
 } from 'lucide-react';
 import {
   AISource,
@@ -29,6 +31,10 @@ import {
   ImportReviewItem,
   BatchExecutionProgress,
 } from '../types/brain';
+import {
+  formatReadableTitle,
+  cleanTitleFromFileName,
+} from '../services/fileExtractor';
 
 export type {
   ReviewResolutionAction,
@@ -60,6 +66,8 @@ export interface ImportReviewQueueProps {
   onBulkMerge?: (items: ImportReviewItem[]) => Promise<void> | void;
   onBulkReplace?: (items: ImportReviewItem[]) => Promise<void> | void;
   onBulkSkip?: (items: ImportReviewItem[]) => Promise<void> | void;
+  onBulkFormatTitles?: (items: ImportReviewItem[]) => void;
+  onBulkAssignSource?: (items: ImportReviewItem[], source: AISource) => void;
   onUpdateItem?: (
     id: string,
     patch: Partial<
@@ -167,20 +175,109 @@ export function isItemEligibleForAction(
     };
   }
 
+  // Duplicate safety rule: Unable to determine must NEVER allow Merge or Replace
+  if (item.duplicateState === 'unable_to_determine') {
+    if (action === 'merge' || action === 'replace') {
+      return {
+        eligible: false,
+        reason:
+          'Duplicate status cannot be determined — Merge and Replace are blocked for safety. Choose Create or Skip, or update item fields to resolve duplicate status.',
+      };
+    }
+  }
+
   if (action === 'create') {
     return { eligible: true };
   }
 
-  // Duplicate safety rule: Unable to determine must NEVER allow Merge or Replace
-  if (item.duplicateState === 'unable_to_determine') {
-    return {
-      eligible: false,
-      reason:
-        'Duplicate status cannot be determined — Merge and Replace are blocked for safety. Choose Create or Skip, or update item fields to resolve duplicate status.',
-    };
-  }
-
   return { eligible: true };
+}
+
+/**
+ * Checks whether an item can be automatically/silently imported in a batch queue commit.
+ * Items with `duplicateState === 'unable_to_determine'` or `resolution === 'undecided'`
+ * must NEVER be silently imported without explicit user resolution.
+ */
+export function canSilentlyImportItem(item: ImportReviewItem): boolean {
+  if (item.status !== 'ready') return false;
+  if (item.duplicateState === 'unable_to_determine') return false;
+  if (item.resolution === 'undecided' || item.resolution === 'skip') return false;
+  if (!item.text || !item.text.trim()) return false;
+  return true;
+}
+
+/**
+ * Checks if a staged item is eligible for non-destructive bulk metadata updates
+ * (Bulk Title Formatting and Bulk Source Assignment).
+ */
+export function isItemEligibleForMetadataUpdate(item: ImportReviewItem): boolean {
+  return (
+    item.status !== 'extracting' &&
+    item.status !== 'importing' &&
+    item.status !== 'processing' &&
+    item.status !== 'imported'
+  );
+}
+
+/**
+ * Formats display titles of selected eligible items into readable Title Case
+ * while strictly preserving original `fileName` and `filePath`.
+ */
+export function applyBulkTitleFormatting(
+  items: ImportReviewItem[],
+  selectedIds: Iterable<string>
+): { updatedItems: ImportReviewItem[]; formattedCount: number } {
+  const selectedSet = new Set(selectedIds);
+  let formattedCount = 0;
+
+  const updatedItems = items.map((item) => {
+    if (!selectedSet.has(item.id) || !isItemEligibleForMetadataUpdate(item)) {
+      return item;
+    }
+    const rawSource = item.title?.trim() || item.fileName;
+    const formattedTitle = item.title?.trim()
+      ? formatReadableTitle(item.title)
+      : cleanTitleFromFileName(rawSource);
+    formattedCount++;
+    return {
+      ...item,
+      title: formattedTitle,
+      // Explicitly preserve original fileName and filePath unchanged
+      fileName: item.fileName,
+      filePath: item.filePath,
+    };
+  });
+
+  return { updatedItems, formattedCount };
+}
+
+/**
+ * Assigns a uniform AI source to selected eligible items while preserving
+ * original `fileName`, `filePath`, and `title`.
+ */
+export function applyBulkSourceAssignment(
+  items: ImportReviewItem[],
+  selectedIds: Iterable<string>,
+  source: AISource
+): { updatedItems: ImportReviewItem[]; updatedCount: number } {
+  const selectedSet = new Set(selectedIds);
+  let updatedCount = 0;
+
+  const updatedItems = items.map((item) => {
+    if (!selectedSet.has(item.id) || !isItemEligibleForMetadataUpdate(item)) {
+      return item;
+    }
+    updatedCount++;
+    return {
+      ...item,
+      source,
+      // Explicitly preserve original fileName and filePath unchanged
+      fileName: item.fileName,
+      filePath: item.filePath,
+    };
+  });
+
+  return { updatedItems, updatedCount };
 }
 
 const DUPLICATE_BADGE_META: Record<
@@ -248,6 +345,8 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
   onBulkMerge,
   onBulkReplace,
   onBulkSkip,
+  onBulkFormatTitles,
+  onBulkAssignSource,
   onUpdateItem,
   onRemoveItem,
   onClearQueue,
@@ -260,6 +359,9 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
     useState<BatchExecutionProgress | null>(null);
   const [bulkSafeguardNotice, setBulkSafeguardNotice] = useState<string | null>(
     null
+  );
+  const [bulkSourceValue, setBulkSourceValue] = useState<AISource>(
+    sources[0] || 'claude'
   );
 
   // Support both controlled and uncontrolled selection
@@ -303,6 +405,9 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
     const skipEligible = selectedItems.filter(
       (i) => isItemEligibleForAction(i, 'skip').eligible
     );
+    const metadataEligible = selectedItems.filter((i) =>
+      isItemEligibleForMetadataUpdate(i)
+    );
     const unknownDuplicateSelected = selectedItems.filter(
       (i) =>
         i.duplicateState === 'unable_to_determine' &&
@@ -313,6 +418,7 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
       mergeEligible,
       replaceEligible,
       skipEligible,
+      metadataEligible,
       unknownDuplicateSelected,
     };
   }, [selectedItems]);
@@ -372,6 +478,14 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
     }
   };
 
+  const eligibleIds = useMemo(
+    () =>
+      items
+        .filter((item) => isItemEligibleForMetadataUpdate(item))
+        .map((item) => item.id),
+    [items]
+  );
+
   const handleToggleSelectAll = () => {
     setBulkSafeguardNotice(null);
     if (allSelected) {
@@ -381,9 +495,56 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
     }
   };
 
+  const handleSelectAllEligible = () => {
+    setBulkSafeguardNotice(null);
+    updateSelection(eligibleIds);
+  };
+
   const handleClearSelection = () => {
     setBulkSafeguardNotice(null);
     updateSelection([]);
+  };
+
+  /**
+   * Bulk formats titles of selected eligible items into readable Title Case
+   * while preserving original filenames and paths.
+   */
+  const handleBulkFormatTitlesClick = () => {
+    if (selectionEligibility.metadataEligible.length === 0 || isAnyBatchRunning) {
+      return;
+    }
+    setBulkSafeguardNotice(null);
+    if (onBulkFormatTitles) {
+      onBulkFormatTitles(selectionEligibility.metadataEligible);
+      return;
+    }
+    if (onUpdateItem) {
+      for (const item of selectionEligibility.metadataEligible) {
+        const formatted = item.title?.trim()
+          ? formatReadableTitle(item.title)
+          : cleanTitleFromFileName(item.fileName);
+        onUpdateItem(item.id, { title: formatted });
+      }
+    }
+  };
+
+  /**
+   * Bulk assigns the selected AI source to all selected eligible items.
+   */
+  const handleBulkAssignSourceClick = () => {
+    if (selectionEligibility.metadataEligible.length === 0 || isAnyBatchRunning) {
+      return;
+    }
+    setBulkSafeguardNotice(null);
+    if (onBulkAssignSource) {
+      onBulkAssignSource(selectionEligibility.metadataEligible, bulkSourceValue);
+      return;
+    }
+    if (onUpdateItem) {
+      for (const item of selectionEligibility.metadataEligible) {
+        onUpdateItem(item.id, { source: bulkSourceValue });
+      }
+    }
   };
 
   /**
@@ -1118,6 +1279,18 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
               </span>
             </button>
 
+            {eligibleIds.length > 0 && eligibleIds.length < items.length && (
+              <button
+                type="button"
+                onClick={handleSelectAllEligible}
+                data-testid="select-all-eligible-btn"
+                className="inline-flex items-center gap-1 rounded-lg border border-[#9db4ff]/25 bg-[#9db4ff]/10 px-2.5 py-1 mono text-[11px] text-[#9db4ff] hover:bg-[#9db4ff]/20 transition"
+                title="Select all staged items that have not yet been imported"
+              >
+                <span>Select all eligible ({eligibleIds.length})</span>
+              </button>
+            )}
+
             <span className="mono text-[11px] tabular-nums text-white/75">
               <strong className="text-white">{selectedIds.length}</strong>{' '}
               selected
@@ -1134,8 +1307,68 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
             )}
           </div>
 
-          {/* Right: Bulk Merge / Bulk Replace / Bulk Skip */}
+          {/* Right: Bulk Title Formatting / Bulk Source Assignment / Bulk Merge / Bulk Replace / Bulk Skip */}
           <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
+            {/* Bulk Format Titles */}
+            <button
+              type="button"
+              disabled={
+                isAnyBatchRunning ||
+                selectionEligibility.metadataEligible.length === 0 ||
+                (!onBulkFormatTitles && !onUpdateItem)
+              }
+              onClick={handleBulkFormatTitlesClick}
+              data-testid="bulk-format-titles-btn"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.04] px-2.5 py-1.5 mono text-[11px] font-medium text-white/85 hover:border-white/30 hover:bg-white/[0.09] disabled:opacity-35 transition"
+              title="Convert selected item titles into readable Title Case while preserving original filenames and paths"
+            >
+              <Wand2 className="h-3.5 w-3.5 text-[#9db4ff] shrink-0" />
+              <span>Format Titles</span>
+              {selectedIds.length > 0 && (
+                <span className="tabular-nums rounded bg-black/40 px-1.5 py-0.2 text-[10px]">
+                  {selectionEligibility.metadataEligible.length}
+                </span>
+              )}
+            </button>
+
+            {/* Bulk Source Assignment */}
+            <div className="inline-flex items-center gap-1 rounded-lg border border-white/15 bg-black/40 p-0.5">
+              <Tag className="ml-1.5 h-3 w-3 text-white/45 shrink-0" />
+              <select
+                value={bulkSourceValue}
+                onChange={(e) =>
+                  setBulkSourceValue(e.target.value as AISource)
+                }
+                aria-label="Bulk source selector"
+                data-testid="bulk-source-select"
+                className="mono rounded bg-transparent px-1.5 py-1 text-[11px] text-white outline-none"
+              >
+                {sources.map((sKey) => (
+                  <option
+                    key={sKey}
+                    value={sKey}
+                    className="bg-[#050711]"
+                  >
+                    {SOURCE_PALETTE[sKey]?.name || sKey}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                disabled={
+                  isAnyBatchRunning ||
+                  selectionEligibility.metadataEligible.length === 0 ||
+                  (!onBulkAssignSource && !onUpdateItem)
+                }
+                onClick={handleBulkAssignSourceClick}
+                data-testid="bulk-assign-source-btn"
+                className="rounded-md bg-white/10 px-2 py-1 mono text-[10.5px] font-semibold text-white hover:bg-white/20 disabled:opacity-35 transition"
+                title="Assign selected AI source to all selected items"
+              >
+                Apply Source
+              </button>
+            </div>
+
             <button
               type="button"
               disabled={
@@ -1368,8 +1601,12 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
 
                           <div className="mt-1 flex flex-wrap items-center gap-1.5 pl-1 mono text-[10.5px] text-white/45">
                             <span
-                              className="truncate max-w-[170px]"
-                              title={item.filePath || item.fileName}
+                              className="truncate max-w-[190px] text-white/65"
+                              title={`Original file: ${item.fileName}${
+                                item.filePath && item.filePath !== item.fileName
+                                  ? ` (${item.filePath})`
+                                  : ''
+                              }`}
                             >
                               {item.filePath || item.fileName}
                             </span>

@@ -17,6 +17,8 @@ import {
 import {
   parseSemanticSections,
   detectIncrementalDiff,
+  areDocumentsExactDuplicates,
+  normalizeContentForDuplicateCheck,
 } from './semanticChunker';
 
 export interface CompanionDeviceRecord {
@@ -26,6 +28,34 @@ export interface CompanionDeviceRecord {
   browser: string;
   created_at: string;
   last_used_at: string | null;
+}
+
+export interface CompanionUnreachableResource {
+  name: string;
+  reason: string;
+  kind?: string;
+}
+
+export interface CompanionCaptureItem {
+  id: string;
+  brain: string;
+  source: AISource;
+  title: string;
+  fileName: string;
+  filePath: string;
+  fileType: FactFileType;
+  content: string;
+  tags: string[];
+  provenanceUrl?: string;
+  projectName?: string;
+  resourceKind?: 'conversation' | 'project_instructions' | 'artifact' | 'document' | 'code';
+  created_at: string;
+}
+
+export interface CompanionCaptureStageResult {
+  stagedCount: number;
+  items: CompanionCaptureItem[];
+  unreachableResources: CompanionUnreachableResource[];
 }
 
 export interface GatewayStatusInfo {
@@ -43,6 +73,7 @@ const STORAGE_KEY_FACTS = 'brain_local_facts_v1';
 const STORAGE_KEY_BRAINS = 'brain_local_brains_v1';
 const STORAGE_KEY_TAGS = 'brain_fact_tags_v1';
 const STORAGE_KEY_ACTIVITIES = 'brain_recent_activity_v1';
+const STORAGE_KEY_COMPANION_CAPTURES = 'brain_companion_captures_v1';
 
 // Seed initial memory facts based on user's real projects mentioned in conversation
 const SEED_FACTS: Fact[] = [
@@ -223,6 +254,7 @@ class BrainStorageService {
   private facts: Fact[] = [];
   private brains: string[] = [];
   private activities: RecentActivityItem[] = [];
+  private companionCaptures: CompanionCaptureItem[] = [];
   private tagsByFactId: Record<number, string[]> = {};
   private listeners: Listener[] = [];
   private backendReachable = false;
@@ -250,17 +282,53 @@ class BrainStorageService {
     return facts.map((f) => (this.tagsByFactId[f.id]?.length ? { ...f, tags: this.tagsByFactId[f.id] } : f));
   }
 
+  private normalizeLegacyFactRecord(raw: Fact): Fact {
+    const nowIso = new Date().toISOString();
+    const safeFileName = raw.fileName || (raw as any).file_name || undefined;
+    const safeFilePath = raw.filePath || (raw as any).file_path || safeFileName || undefined;
+    const safeTags = Array.isArray(raw.tags)
+      ? raw.tags.map((t) => String(t).trim()).filter(Boolean)
+      : [];
+    const normalized: Fact = {
+      ...raw,
+      id: typeof raw.id === 'number' ? raw.id : Date.now(),
+      brain: (raw.brain || 'coding').trim().toLowerCase(),
+      source: (raw.source || 'claude') as AISource,
+      content: typeof raw.content === 'string' ? raw.content : String(raw.content ?? ''),
+      tags: safeTags,
+      fileName: safeFileName,
+      filePath: safeFilePath,
+      created_at: raw.created_at || nowIso,
+      updated_at: raw.updated_at || raw.created_at || nowIso,
+    };
+    if (!normalized.fileType) {
+      normalized.fileType = getFactFileType(normalized);
+    }
+    return normalized;
+  }
+
   private loadLocalFallback() {
     try {
       const storedBrains = localStorage.getItem(STORAGE_KEY_BRAINS);
-      this.brains = storedBrains ? JSON.parse(storedBrains) : [...DEFAULT_BRAINS];
+      const parsedBrains = storedBrains ? JSON.parse(storedBrains) : null;
+      this.brains = Array.isArray(parsedBrains) && parsedBrains.length > 0
+        ? Array.from(new Set(parsedBrains.map((b: unknown) => String(b).trim().toLowerCase()).filter(Boolean)))
+        : [...DEFAULT_BRAINS];
 
       const storedFacts = localStorage.getItem(STORAGE_KEY_FACTS);
       if (storedFacts) {
         const parsed: Fact[] = JSON.parse(storedFacts);
-        const existingIds = new Set(parsed.map((f) => f.id));
-        const missingSeeds = SEED_FACTS.filter((sf) => !existingIds.has(sf.id));
-        this.facts = this.applyTags([...parsed, ...missingSeeds]);
+        if (Array.isArray(parsed)) {
+          const migrated = parsed
+            .filter((f) => f && typeof f === 'object')
+            .map((f) => this.normalizeLegacyFactRecord(f));
+          const existingIds = new Set(migrated.map((f) => f.id));
+          const missingSeeds = SEED_FACTS.filter((sf) => !existingIds.has(sf.id));
+          this.facts = this.applyTags([...migrated, ...missingSeeds]);
+        } else {
+          this.facts = [...SEED_FACTS];
+          this.saveLocalFacts();
+        }
       } else {
         this.facts = [...SEED_FACTS];
         this.saveLocalFacts();
@@ -1100,16 +1168,39 @@ class BrainStorageService {
 
     try {
       const resolvedBrain = brain.trim().toLowerCase();
-      const stripHeader = (raw: string) =>
-        raw
-          .trim()
-          .replace(/^#\s+[^\n]+\n+/, '')
-          .trim();
+      const incomingNorm = normalizeContentForDuplicateCheck(content, [
+        title,
+        fileName,
+        filePath,
+      ]);
 
-      const incomingTrimmed = content.trim();
-      const incomingBody = stripHeader(incomingTrimmed);
+      if (!incomingNorm.bodyNorm && !incomingNorm.fullNorm) {
+        return {
+          exists: false,
+          hasDiff: false,
+          isIdentical: false,
+          newSectionsDetected: 0,
+          recommendedAction: 'ask_user',
+          duplicateState: 'unable_to_determine',
+          summary:
+            'Unable to determine duplicate status — explicit user choice required',
+        };
+      }
 
-      // 1. Check by file path, file name, or document title (same logical file/document)
+      const bFacts = this.facts.filter((f) => f.brain === resolvedBrain);
+
+      // 1. Check if ANY node in the destination brain has exact duplicate normalized content
+      // (even when filenames, archive paths, whitespace, casing, or auto-generated leading title headings differ)
+      const exactContentMatch = bFacts.find((f) =>
+        areDocumentsExactDuplicates(
+          f.content,
+          content,
+          [f.documentTitle, f.fileName, f.filePath],
+          [title, fileName, filePath]
+        )
+      );
+
+      // 2. Check by file path, file name, or document title (same logical file/document identity)
       const pathOrTitleMatch = this.findNodeByFilePath(
         resolvedBrain,
         filePath || fileName,
@@ -1117,23 +1208,32 @@ class BrainStorageService {
       );
 
       if (pathOrTitleMatch) {
+        const isExact = areDocumentsExactDuplicates(
+          pathOrTitleMatch.content,
+          content,
+          [
+            pathOrTitleMatch.documentTitle,
+            pathOrTitleMatch.fileName,
+            pathOrTitleMatch.filePath,
+          ],
+          [title, fileName, filePath]
+        );
+
         const diff = detectIncrementalDiff(
           pathOrTitleMatch.content,
           content,
           pathOrTitleMatch.fileType,
           fileName
         );
-        const isExact =
-          diff.isIdentical ||
-          pathOrTitleMatch.content.trim() === incomingTrimmed ||
-          stripHeader(pathOrTitleMatch.content) === incomingBody;
 
         return {
           exists: true,
           existingFact: pathOrTitleMatch,
           hasDiff: !isExact && diff.hasNewContent,
           isIdentical: isExact,
-          newSectionsDetected: isExact ? 0 : Math.max(1, diff.newSections.length),
+          newSectionsDetected: isExact
+            ? 0
+            : Math.max(1, diff.newSections.length),
           existingSectionsCount: pathOrTitleMatch.semanticSectionCount || 1,
           summary: isExact
             ? `Exact duplicate of Node #${pathOrTitleMatch.id} (Skip by default)`
@@ -1144,18 +1244,6 @@ class BrainStorageService {
         };
       }
 
-      const bFacts = this.facts.filter((f) => f.brain === resolvedBrain);
-
-      // 2. Check if any fact in the destination brain has identical content (even under a different filename)
-      const exactContentMatch = bFacts.find((f) => {
-        const fTrimmed = f.content.trim();
-        const fBody = stripHeader(fTrimmed);
-        return (
-          fTrimmed === incomingTrimmed ||
-          (incomingBody.length > 0 && fBody === incomingBody)
-        );
-      });
-
       if (exactContentMatch) {
         return {
           exists: true,
@@ -1164,36 +1252,56 @@ class BrainStorageService {
           isIdentical: true,
           newSectionsDetected: 0,
           existingSectionsCount: exactContentMatch.semanticSectionCount || 1,
-          summary: `Exact duplicate of Node #${exactContentMatch.id} (Skip by default)`,
+          summary: `Exact duplicate of Node #${exactContentMatch.id} (identical document content — Skip by default)`,
           recommendedAction: 'skip',
           duplicateState: 'exact_duplicate',
         };
       }
 
       // 3. Check for Related Content: partial content overlap or shared semantic sections in destination brain
+      // (Never treat partial matches as exact duplicates)
       let relatedFact: Fact | undefined = undefined;
-      if (incomingBody.length >= 35) {
+      const incomingBodyNorm = incomingNorm.bodyNorm;
+
+      if (incomingBodyNorm.length >= 35) {
         relatedFact = bFacts.find((f) => {
-          const fBody = stripHeader(f.content);
-          if (fBody.length >= 35 && (fBody.includes(incomingBody) || incomingBody.includes(fBody))) {
+          const fNorm = normalizeContentForDuplicateCheck(f.content, [
+            f.documentTitle,
+            f.fileName,
+            f.filePath,
+          ]);
+          const fBodyNorm = fNorm.bodyNorm;
+
+          // Partial match: one document is a substantial proper substring of the other
+          if (
+            fBodyNorm.length >= 35 &&
+            fBodyNorm !== incomingBodyNorm &&
+            (fBodyNorm.includes(incomingBodyNorm) ||
+              incomingBodyNorm.includes(fBodyNorm))
+          ) {
             return true;
           }
-          // Check if semantic sections share identical turns/headings
-          const relDiff = detectIncrementalDiff(
-            f.content,
-            content,
-            f.fileType,
-            fileName
-          );
-          const totalIncomingSections =
-            relDiff.newSections.length + (relDiff.mergedSectionsCount > 0 ? 1 : 0);
-          return (
-            !relDiff.isIdentical &&
-            relDiff.newSections.length > 0 &&
-            relDiff.mergedSectionsCount > relDiff.newSections.length &&
-            totalIncomingSections > 1 &&
-            f.content.split('\n\n').some((block) => block.trim().length > 40 && incomingBody.includes(block.trim()))
-          );
+
+          // Shared substantial paragraph/section overlap without full document equality
+          const fBlocks = f.content
+            .replace(/^#\s+[^\n]+(?:\n+|$)/, '')
+            .split(/\n\s*\n/)
+            .map((b) =>
+              b
+                .trim()
+                .toLowerCase()
+                .replace(/\s+/g, ' ')
+            )
+            .filter((b) => b.length >= 45);
+
+          if (
+            fBlocks.length > 0 &&
+            fBlocks.some((block) => incomingBodyNorm.includes(block))
+          ) {
+            return true;
+          }
+
+          return false;
         });
       }
 
@@ -1217,7 +1325,7 @@ class BrainStorageService {
         };
       }
 
-      // 4. New content
+      // 4. Genuinely different / new content
       return {
         exists: false,
         hasDiff: false,
@@ -2381,6 +2489,211 @@ class BrainStorageService {
       const existing = await this.fetchCompanionDevices();
       const filtered = existing.filter((d) => d.id !== id);
       localStorage.setItem('brain_companion_devices_v1', JSON.stringify(filtered));
+    } catch {}
+    return true;
+  }
+
+  /**
+   * Fetches pending Browser Companion project/resource captures waiting to enter the Import Review Queue.
+   */
+  public async fetchCompanionCaptures(): Promise<CompanionCaptureItem[]> {
+    try {
+      const res = await fetch(`${API_BASE}/api/companion/captures`, {
+        signal: AbortSignal.timeout(2500),
+      });
+      if (!res.ok) throw new Error('Failed to fetch companion captures');
+      const rows: CompanionCaptureItem[] = await res.json();
+      if (Array.isArray(rows)) {
+        this.companionCaptures = rows;
+        try {
+          localStorage.setItem(STORAGE_KEY_COMPANION_CAPTURES, JSON.stringify(rows));
+        } catch {}
+        return [...this.companionCaptures];
+      }
+    } catch {}
+
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_COMPANION_CAPTURES);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          this.companionCaptures = parsed;
+        }
+      }
+    } catch {}
+
+    return [...this.companionCaptures];
+  }
+
+  /**
+   * Stages Browser Companion project/resource captures (conversations, project instructions,
+   * artifacts, documents, and code files) with provenance so they enter the Capture Hub Review Queue.
+   */
+  public async stageCompanionProjectCapture(payload: {
+    brain?: string;
+    source?: AISource;
+    projectName?: string;
+    provenanceUrl?: string;
+    items: Array<{
+      id?: string;
+      brain?: string;
+      source?: AISource;
+      title?: string;
+      fileName?: string;
+      filePath?: string;
+      fileType?: FactFileType;
+      content: string;
+      tags?: string[];
+      provenanceUrl?: string;
+      projectName?: string;
+      resourceKind?: 'conversation' | 'project_instructions' | 'artifact' | 'document' | 'code';
+    }>;
+    unreachableResources?: CompanionUnreachableResource[];
+  }): Promise<CompanionCaptureStageResult> {
+    const defaultBrain = (payload.brain || 'coding').trim().toLowerCase();
+    const defaultSource: AISource = payload.source || 'claude';
+    const rawItems = Array.isArray(payload.items) ? payload.items : [];
+    const unreachable = Array.isArray(payload.unreachableResources)
+      ? payload.unreachableResources
+      : [];
+
+    try {
+      const res = await fetch(`${API_BASE}/api/companion/captures`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          brain: defaultBrain,
+          source: defaultSource,
+          projectName: payload.projectName || '',
+          provenanceUrl: payload.provenanceUrl || '',
+          items: rawItems,
+          unreachableResources: unreachable,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const staged: CompanionCaptureItem[] = Array.isArray(data.items) ? data.items : [];
+        const mergedMap = new Map<string, CompanionCaptureItem>();
+        for (const item of [...staged, ...this.companionCaptures]) {
+          mergedMap.set(item.id, item);
+        }
+        this.companionCaptures = Array.from(mergedMap.values());
+        try {
+          localStorage.setItem(
+            STORAGE_KEY_COMPANION_CAPTURES,
+            JSON.stringify(this.companionCaptures)
+          );
+        } catch {}
+        this.notify();
+        return {
+          stagedCount: typeof data.stagedCount === 'number' ? data.stagedCount : staged.length,
+          items: staged,
+          unreachableResources: Array.isArray(data.unreachableResources)
+            ? data.unreachableResources
+            : unreachable,
+        };
+      }
+    } catch {}
+
+    // Local-first fallback when Express server is unreachable or in offline/test mode
+    const nowIso = new Date().toISOString();
+    const stagedLocal: CompanionCaptureItem[] = [];
+
+    for (let i = 0; i < rawItems.length; i++) {
+      const entry = rawItems[i];
+      const text = String(entry?.content ?? '').trim();
+      if (!text) continue;
+
+      const id =
+        entry.id ||
+        `cap_${Date.now().toString(36)}_${i}_${Math.random().toString(36).slice(2, 6)}`;
+      const itemBrain = (entry.brain || defaultBrain).trim().toLowerCase();
+      const itemSource: AISource = entry.source || defaultSource;
+      const projectName = (entry.projectName || payload.projectName || '').trim();
+      const provenanceUrl = (entry.provenanceUrl || payload.provenanceUrl || '').trim();
+      const resourceKind = entry.resourceKind || 'document';
+      const title = (entry.title || entry.fileName || `Captured Resource ${i + 1}`).trim();
+      const safeSlug =
+        title
+          .replace(/[^a-zA-Z0-9_-]+/g, '_')
+          .replace(/^_+|_+$/g, '')
+          .toLowerCase() || `captured_resource_${i + 1}`;
+      const fileName = (entry.fileName || `${safeSlug}.md`).trim();
+      const filePath = (
+        entry.filePath ||
+        (projectName ? `${itemSource}-project/${projectName}/${fileName}` : `${itemSource}-companion/${fileName}`)
+      ).trim();
+      const fileType: FactFileType = entry.fileType || inferFileTypeFromExtension(fileName);
+      const baseTags = Array.isArray(entry.tags) ? entry.tags : ['companion-capture', resourceKind];
+      const tags = Array.from(
+        new Set(
+          [
+            ...baseTags,
+            projectName
+              ? `project:${projectName.toLowerCase().replace(/[^a-z0-9_-]+/g, '-')}`
+              : '',
+          ].filter(Boolean)
+        )
+      );
+
+      stagedLocal.push({
+        id,
+        brain: itemBrain,
+        source: itemSource,
+        title,
+        fileName,
+        filePath,
+        fileType,
+        content: text,
+        tags,
+        provenanceUrl: provenanceUrl || undefined,
+        projectName: projectName || undefined,
+        resourceKind,
+        created_at: nowIso,
+      });
+    }
+
+    this.companionCaptures = [...stagedLocal, ...this.companionCaptures];
+    try {
+      localStorage.setItem(
+        STORAGE_KEY_COMPANION_CAPTURES,
+        JSON.stringify(this.companionCaptures)
+      );
+    } catch {}
+
+    this.notify();
+    return {
+      stagedCount: stagedLocal.length,
+      items: stagedLocal,
+      unreachableResources: unreachable,
+    };
+  }
+
+  public async consumeCompanionCapture(id: string): Promise<boolean> {
+    this.companionCaptures = this.companionCaptures.filter((item) => item.id !== id);
+    try {
+      await fetch(`${API_BASE}/api/companion/captures/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+    } catch {}
+    try {
+      localStorage.setItem(
+        STORAGE_KEY_COMPANION_CAPTURES,
+        JSON.stringify(this.companionCaptures)
+      );
+    } catch {}
+    return true;
+  }
+
+  public async clearCompanionCaptures(): Promise<boolean> {
+    this.companionCaptures = [];
+    try {
+      await fetch(`${API_BASE}/api/companion/captures/clear`, {
+        method: 'POST',
+      });
+    } catch {}
+    try {
+      localStorage.removeItem(STORAGE_KEY_COMPANION_CAPTURES);
     } catch {}
     return true;
   }

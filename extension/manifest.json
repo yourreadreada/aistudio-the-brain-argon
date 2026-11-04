@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Save to Brain",
-  "version": "0.2.0",
-  "description": "One-click capture and inject AI conversations into The Brain memory system.",
+  "version": "0.3.0",
+  "description": "Capture AI conversations, project documents, artifacts, and code into The Brain Review Queue and inject memory context.",
   "permissions": ["activeTab", "scripting", "storage"],
   "host_permissions": [
     "http://localhost:3000/*",
@@ -10,7 +10,8 @@
     "https://*.run.app/*",
     "https://claude.ai/*",
     "https://chatgpt.com/*",
-    "https://gemini.google.com/*"
+    "https://gemini.google.com/*",
+    "https://github.com/*"
   ],
   "action": {
     "default_popup": "popup.html",

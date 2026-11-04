@@ -50,6 +50,23 @@ db.exec(`
     created_at TEXT NOT NULL,
     last_used_at TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS companion_captures (
+    id TEXT PRIMARY KEY,
+    brain TEXT NOT NULL,
+    source TEXT NOT NULL,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_type TEXT,
+    project_name TEXT,
+    provenance_url TEXT,
+    resource_kind TEXT,
+    tags_json TEXT,
+    unreachable_json TEXT,
+    created_at TEXT NOT NULL
+  );
 `);
 
 // Ensure new columns exist on older DB files
@@ -402,6 +419,150 @@ app.delete('/api/companion/devices/:id', (req, res) => {
   const { id } = req.params;
   db.prepare('DELETE FROM companion_devices WHERE id = ?').run(id);
   res.json({ ok: true, id });
+});
+
+// 1c. Browser Companion Project & Resource Staging API (feeds into Import Review Queue)
+function serializeCompanionCaptureRow(row: any) {
+  if (!row) return null;
+  let tags: string[] = [];
+  let unreachableResources: { name: string; reason: string }[] = [];
+  try {
+    if (row.tags_json) tags = JSON.parse(row.tags_json);
+  } catch {}
+  try {
+    if (row.unreachable_json) unreachableResources = JSON.parse(row.unreachable_json);
+  } catch {}
+  return {
+    id: row.id,
+    brain: row.brain,
+    source: row.source,
+    title: row.title,
+    content: row.content,
+    fileName: row.file_name,
+    filePath: row.file_path,
+    fileType: row.file_type || 'md',
+    projectName: row.project_name || undefined,
+    provenanceUrl: row.provenance_url || undefined,
+    resourceKind: row.resource_kind || 'document',
+    tags,
+    unreachableResources,
+    created_at: row.created_at,
+  };
+}
+
+app.get('/api/companion/captures', (_req, res) => {
+  const rows = db
+    .prepare('SELECT * FROM companion_captures ORDER BY created_at DESC LIMIT 200')
+    .all();
+  res.json(rows.map(serializeCompanionCaptureRow));
+});
+
+app.post('/api/companion/captures', (req, res) => {
+  try {
+    const defaultBrain = (req.body?.brain || 'coding').trim().toLowerCase();
+    const defaultSource = (req.body?.source || 'claude').trim().toLowerCase();
+    const defaultProject = req.body?.projectName
+      ? String(req.body.projectName).trim()
+      : null;
+    const defaultProvenanceUrl = req.body?.provenanceUrl
+      ? String(req.body.provenanceUrl).trim()
+      : null;
+    const rawUnreachable = Array.isArray(req.body?.unreachableResources)
+      ? req.body.unreachableResources
+      : [];
+
+    const rawItems = Array.isArray(req.body?.items)
+      ? req.body.items
+      : req.body?.content
+      ? [req.body]
+      : [];
+
+    const now = new Date().toISOString();
+    const insertStmt = db.prepare(`
+      INSERT INTO companion_captures (
+        id, brain, source, title, content, file_name, file_path,
+        file_type, project_name, provenance_url, resource_kind,
+        tags_json, unreachable_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const stagedCaptures: any[] = [];
+    const skippedItems: { name: string; reason: string }[] = [...rawUnreachable];
+
+    for (let idx = 0; idx < rawItems.length; idx++) {
+      const item = rawItems[idx];
+      const content = String(item?.content || '').trim();
+      const title = String(item?.title || item?.fileName || `Project Resource ${idx + 1}`).trim();
+      if (!content) {
+        skippedItems.push({
+          name: title,
+          reason:
+            item?.reason ||
+            'Resource had no readable text content in active tab DOM.',
+        });
+        continue;
+      }
+
+      const id = `cap_${Date.now().toString(36)}_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+      const brain = String(item?.brain || defaultBrain).trim().toLowerCase();
+      const source = String(item?.source || defaultSource).trim().toLowerCase();
+      const safeSlug = title.replace(/[^a-zA-Z0-9_-]+/g, '_').toLowerCase() || `resource_${idx + 1}`;
+      const fileName = String(item?.fileName || item?.file_name || `${safeSlug}.md`).trim();
+      const filePath = String(
+        item?.filePath ||
+          item?.file_path ||
+          (defaultProject
+            ? `${source}-project/${defaultProject.replace(/[^a-zA-Z0-9_-]+/g, '_').toLowerCase()}/${fileName}`
+            : `${source}-companion/${fileName}`)
+      ).trim();
+      const fileType = String(item?.fileType || item?.file_type || 'md').trim();
+      const resourceKind = String(item?.resourceKind || 'document').trim();
+      const tags = Array.isArray(item?.tags)
+        ? item.tags
+        : ['companion-capture', ...(defaultProject ? ['project-resource'] : [])];
+
+      insertStmt.run(
+        id,
+        brain,
+        source,
+        title,
+        content,
+        fileName,
+        filePath,
+        fileType,
+        item?.projectName || defaultProject,
+        item?.provenanceUrl || defaultProvenanceUrl,
+        resourceKind,
+        JSON.stringify(tags),
+        JSON.stringify(idx === 0 ? skippedItems : []),
+        now
+      );
+
+      const savedRow = db.prepare('SELECT * FROM companion_captures WHERE id = ?').get(id);
+      stagedCaptures.push(serializeCompanionCaptureRow(savedRow));
+    }
+
+    res.json({
+      ok: true,
+      stagedCount: stagedCaptures.length,
+      skippedUnreachableCount: skippedItems.length,
+      captures: stagedCaptures,
+      unreachableResources: skippedItems,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to stage companion project capture' });
+  }
+});
+
+app.delete('/api/companion/captures/:id', (req, res) => {
+  const { id } = req.params;
+  db.prepare('DELETE FROM companion_captures WHERE id = ?').run(id);
+  res.json({ ok: true, id });
+});
+
+app.post('/api/companion/captures/clear', (_req, res) => {
+  db.prepare('DELETE FROM companion_captures').run();
+  res.json({ ok: true });
 });
 
 // 2. List Brains API

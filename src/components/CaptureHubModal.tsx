@@ -36,6 +36,8 @@ import {
 import {
   brainStore,
   CompanionDeviceRecord,
+  CompanionCaptureItem,
+  CompanionUnreachableResource,
   GatewayStatusInfo,
 } from '../services/brainStorage';
 import { BrainLogo } from './BrainLogo';
@@ -44,12 +46,18 @@ import {
   ExtractedFileResult,
   SUPPORTED_FILE_EXTENSIONS,
   inferFileTypeFromExtension,
+  cleanTitleFromFileName,
+  formatReadableTitle,
 } from '../services/fileExtractor';
+import { areDocumentsExactDuplicates } from '../services/semanticChunker';
 import {
   ImportReviewQueue,
   runWithControlledConcurrency,
   isItemEligibleForAction,
   getDefaultResolutionForDuplicateState,
+  canSilentlyImportItem,
+  applyBulkTitleFormatting,
+  applyBulkSourceAssignment,
 } from './ImportReviewQueue';
 
 export type CaptureHubTab = 'companion' | 'import' | 'paste' | 'export';
@@ -95,6 +103,73 @@ const WORKFLOW_STEPS = [
 
 const BULK_CONCURRENCY_LIMIT = 3;
 
+/**
+ * Reconciles intra-queue exact duplicates so that when multiple identical files
+ * with different filenames or archive paths (e.g. unpacked from a .ZIP archive)
+ * are staged together in the Review Queue for the same destination Brain,
+ * subsequent identical items are flagged as `exact_duplicate` (default `skip`)
+ * while preserving original `fileName` and `filePath`.
+ */
+export function reconcileIntraQueueDuplicates(
+  items: ImportReviewItem[]
+): ImportReviewItem[] {
+  const result: ImportReviewItem[] = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const current = items[i];
+    if (
+      current.status !== 'ready' ||
+      !current.text ||
+      !current.text.trim() ||
+      current.duplicateState === 'exact_duplicate'
+    ) {
+      result.push(current);
+      continue;
+    }
+
+    const earlierDuplicate = result.find(
+      (prev) =>
+        prev.id !== current.id &&
+        prev.destinationBrain === current.destinationBrain &&
+        prev.status !== 'error' &&
+        prev.status !== 'skipped' &&
+        prev.text &&
+        prev.text.trim() &&
+        areDocumentsExactDuplicates(
+          prev.text,
+          current.text,
+          [prev.title, prev.fileName, prev.filePath],
+          [current.title, current.fileName, current.filePath]
+        )
+    );
+
+    if (earlierDuplicate) {
+      result.push({
+        ...current,
+        duplicateState: 'exact_duplicate',
+        resolution:
+          current.resolution === 'create' || current.resolution === 'undecided'
+            ? 'skip'
+            : current.resolution,
+        statusMessage: `Exact duplicate of staged item "${earlierDuplicate.fileName}" (Skip by default)`,
+        nodeCheck: {
+          exists: true,
+          hasDiff: false,
+          isIdentical: true,
+          newSectionsDetected: 0,
+          recommendedAction: 'skip',
+          duplicateState: 'exact_duplicate',
+          summary: `Exact duplicate of staged item "${earlierDuplicate.fileName}" (Skip by default)`,
+        },
+      });
+    } else {
+      result.push(current);
+    }
+  }
+
+  return result;
+}
+
 export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   isOpen,
   onClose,
@@ -131,6 +206,15 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     token: string;
   } | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [companionCaptures, setCompanionCaptures] = useState<
+    CompanionCaptureItem[]
+  >([]);
+  const [companionUnreachable, setCompanionUnreachable] = useState<
+    CompanionUnreachableResource[]
+  >([]);
+  const [companionStageBanner, setCompanionStageBanner] = useState<
+    string | null
+  >(null);
 
   // --- Workflow 2: Import Files & Review Queue State ---
   const [reviewQueue, setReviewQueue] = useState<ImportReviewItem[]>([]);
@@ -208,9 +292,9 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
     const nodeCheck = brainStore.checkExistingFileNode(
       targetBrain,
-      effectivePath,
-      text,
       effectiveFileName,
+      text,
+      effectivePath,
       title
     );
 
@@ -311,15 +395,82 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     }
   }, [isOpen, currentBrain, initialTab]);
 
+  const stageCompanionItemsIntoReviewQueue = (
+    capturedItems: CompanionCaptureItem[]
+  ) => {
+    if (!capturedItems || capturedItems.length === 0) return;
+
+    setReviewQueue((prev) => {
+      const existingIds = new Set(prev.map((q) => q.id));
+      const newQueueItems: ImportReviewItem[] = [];
+
+      for (const cap of capturedItems) {
+        if (existingIds.has(cap.id) || !cap.content?.trim()) continue;
+        const targetBrain = cap.brain || defaultBrain;
+        const formattedTitle = cap.title
+          ? formatReadableTitle(cap.title)
+          : cleanTitleFromFileName(cap.fileName);
+        const evalRes = computeDuplicateEvaluation(
+          cap.content,
+          cap.fileName,
+          targetBrain,
+          formattedTitle,
+          false,
+          cap.filePath || cap.fileName
+        );
+        const ext =
+          '.' + (cap.fileName.split('.').pop()?.toLowerCase() || 'md');
+
+        newQueueItems.push({
+          id: cap.id,
+          title: formattedTitle,
+          fileName: cap.fileName,
+          filePath: cap.filePath || cap.fileName,
+          fileType: cap.fileType || inferFileTypeFromExtension(ext),
+          archiveParent: cap.projectName
+            ? `Project: ${cap.projectName}`
+            : cap.provenanceUrl
+            ? 'Browser Companion'
+            : undefined,
+          extension: ext,
+          sizeBytes: new Blob([cap.content]).size,
+          text: cap.content,
+          source: cap.source || 'claude',
+          destinationBrain: targetBrain,
+          itemCount: 1,
+          itemUnitLabel: cap.resourceKind || 'resource',
+          status: evalRes.status,
+          statusMessage:
+            evalRes.nodeCheck?.summary ||
+            (cap.projectName
+              ? `Captured from project "${cap.projectName}"`
+              : 'Staged from Browser Companion'),
+          duplicateState: evalRes.duplicateState,
+          nodeCheck: evalRes.nodeCheck,
+          resolution: evalRes.resolution,
+          tags: Array.isArray(cap.tags) ? cap.tags : ['companion-capture'],
+        });
+      }
+
+      if (newQueueItems.length === 0) return prev;
+      return reconcileIntraQueueDuplicates([...newQueueItems, ...prev]);
+    });
+  };
+
   const refreshCompanionState = async () => {
     setIsLoadingCompanion(true);
     try {
-      const [status, devList] = await Promise.all([
+      const [status, devList, stagedCaptures] = await Promise.all([
         brainStore.checkGatewayStatus(),
         brainStore.fetchCompanionDevices(),
+        brainStore.fetchCompanionCaptures(),
       ]);
       setGatewayStatus(status);
       setDevices(devList);
+      setCompanionCaptures(stagedCaptures);
+      if (stagedCaptures.length > 0) {
+        stageCompanionItemsIntoReviewQueue(stagedCaptures);
+      }
     } finally {
       setIsLoadingCompanion(false);
     }
@@ -388,10 +539,17 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     const skipped = reviewQueue.filter((q) => q.status === 'skipped').length;
     const failed = reviewQueue.filter((q) => q.status === 'error').length;
     const ready = reviewQueue.filter(
-      (q) => q.status === 'ready' && q.resolution !== 'undecided'
+      (q) =>
+        q.status === 'ready' &&
+        q.resolution !== 'undecided' &&
+        (q.resolution === 'skip' || canSilentlyImportItem(q))
     ).length;
     const needsDecision = reviewQueue.filter(
-      (q) => q.status === 'ready' && q.resolution === 'undecided'
+      (q) =>
+        q.status === 'ready' &&
+        (q.resolution === 'undecided' ||
+          (q.duplicateState === 'unable_to_determine' &&
+            q.resolution !== 'skip'))
     ).length;
     const duplicates = reviewQueue.filter(
       (q) =>
@@ -478,6 +636,54 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     }
   };
 
+  const handleStageSampleProjectCapture = async () => {
+    setCompanionStageBanner(null);
+    const stageRes = await brainStore.stageCompanionProjectCapture({
+      brain: defaultBrain,
+      source: 'claude',
+      projectName: 'The Brain Argon Architecture',
+      provenanceUrl: 'https://claude.ai/project/argon-memory-workspace',
+      items: [
+        {
+          title: 'argon_project_system_instructions_v2',
+          fileName: 'argon_project_system_instructions_v2.md',
+          filePath:
+            'claude-project/The_Brain_Argon_Architecture/argon_project_system_instructions_v2.md',
+          fileType: 'md',
+          resourceKind: 'project_instructions',
+          content: `# Argon Project System Instructions\n\n> Provenance: https://claude.ai/project/argon-memory-workspace\n\nAlways preserve Argon's local-first persistence model (localStorage + local SQLite gateway) and route multi-file captures through ImportReviewQueue.`,
+          tags: ['companion-capture', 'project-instructions', 'claude'],
+        },
+        {
+          title: 'capture_hub_deduplication_spec_artifact',
+          fileName: 'capture_hub_deduplication_spec_artifact.md',
+          filePath:
+            'claude-project/The_Brain_Argon_Architecture/capture_hub_deduplication_spec_artifact.md',
+          fileType: 'md',
+          resourceKind: 'artifact',
+          content: `# Capture Hub Deduplication Spec\n\n> Provenance: https://claude.ai/project/argon-memory-workspace\n\nCompare normalized document bodies after stripping leading auto-generated title headings so renamed copies are detected as exact duplicates.`,
+          tags: ['companion-capture', 'artifact', 'claude'],
+        },
+      ],
+      unreachableResources: [
+        {
+          name: 'architecture_whitepaper_scan.pdf',
+          kind: 'pdf',
+          reason:
+            'Binary attachment card is not expanded in page DOM — download and drop into Import & Review',
+        },
+      ],
+    });
+
+    setCompanionUnreachable(stageRes.unreachableResources || []);
+    stageCompanionItemsIntoReviewQueue(stageRes.items);
+    const refreshed = await brainStore.fetchCompanionCaptures();
+    setCompanionCaptures(refreshed);
+    setCompanionStageBanner(
+      `Staged ${stageRes.stagedCount} project resource(s) from "The Brain Argon Architecture" into the Import Review Queue with full provenance.`
+    );
+  };
+
   // --- Workflow 2: File Selection & Review Queue Action Handlers ---
   const handleFilesSelected = async (files: FileList | File[]) => {
     setCommitBanner(null);
@@ -494,7 +700,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
       const placeholderItem: ImportReviewItem = {
         id: placeholderId,
-        title: file.name.replace(/\.[^/.]+$/, ''),
+        title: cleanTitleFromFileName(file.name),
         fileName: file.name,
         filePath: relativePath,
         fileType: inferFileTypeFromExtension(ext),
@@ -544,7 +750,9 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           (extItem, idx) => {
             const hasErr = extItem.status === 'error' || !extItem.text.trim();
             const itemTitle =
-              extItem.title || extItem.fileName.replace(/\.[^/.]+$/, '');
+              extItem.title
+                ? formatReadableTitle(extItem.title)
+                : cleanTitleFromFileName(extItem.fileName);
             const effectiveFilePath = extItem.filePath || extItem.fileName;
             const evalRes = computeDuplicateEvaluation(
               extItem.text,
@@ -586,8 +794,10 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         );
 
         setReviewQueue((prev) =>
-          prev.flatMap((item) =>
-            item.id === placeholderId ? mappedItems : [item]
+          reconcileIntraQueueDuplicates(
+            prev.flatMap((item) =>
+              item.id === placeholderId ? mappedItems : [item]
+            )
           )
         );
       } catch (err: any) {
@@ -648,6 +858,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   const handleRemoveQueueItem = (id: string) => {
     setReviewQueue((prev) => prev.filter((item) => item.id !== id));
     setSelectedQueueIds((prev) => prev.filter((selId) => selId !== id));
+    brainStore.consumeCompanionCapture(id).catch(() => {});
   };
 
   /**
@@ -795,6 +1006,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
             : q
         )
       );
+      brainStore.consumeCompanionCapture(item.id).catch(() => {});
       return true;
     } catch (err: any) {
       const message =
@@ -876,6 +1088,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           : q
       )
     );
+    brainStore.consumeCompanionCapture(item.id).catch(() => {});
   };
 
   const handleRetryItem = async (item: ImportReviewItem): Promise<boolean> => {
@@ -1078,6 +1291,41 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     });
   };
 
+  const handleBulkFormatTitles = (itemsToFormat: ImportReviewItem[]) => {
+    if (itemsToFormat.length === 0) return;
+    const ids = itemsToFormat.map((i) => i.id);
+    setReviewQueue((prev) => {
+      const { updatedItems } = applyBulkTitleFormatting(prev, ids);
+      return updatedItems;
+    });
+    setCommitBanner({
+      type: 'success',
+      text: `Formatted ${itemsToFormat.length} ${
+        itemsToFormat.length === 1 ? 'title' : 'titles'
+      } into Title Case (original filenames and paths preserved).`,
+    });
+  };
+
+  const handleBulkAssignSource = (
+    itemsToUpdate: ImportReviewItem[],
+    source: AISource
+  ) => {
+    if (itemsToUpdate.length === 0) return;
+    const ids = itemsToUpdate.map((i) => i.id);
+    setReviewQueue((prev) => {
+      const { updatedItems } = applyBulkSourceAssignment(prev, ids, source);
+      return updatedItems;
+    });
+    setCommitBanner({
+      type: 'success',
+      text: `Assigned source "${
+        SOURCE_PALETTE[source]?.name || source
+      }" to ${itemsToUpdate.length} selected ${
+        itemsToUpdate.length === 1 ? 'item' : 'items'
+      }.`,
+    });
+  };
+
   const handleCommitReviewQueue = async () => {
     const actionable = reviewQueue.filter(
       (item) => item.status === 'ready' && item.resolution !== 'undecided'
@@ -1103,9 +1351,10 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         continue;
       }
 
+      // Never allow an unknown duplicate state ('unable_to_determine') to be silently imported
       if (
-        item.duplicateState === 'unable_to_determine' &&
-        (item.resolution === 'merge' || item.resolution === 'replace')
+        item.duplicateState === 'unable_to_determine' ||
+        !canSilentlyImportItem(item)
       ) {
         continue;
       }
@@ -1946,6 +2195,82 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                   </ul>
                 </div>
               </div>
+
+              {/* Project & Resource Capture Staging into Review Queue */}
+              <div className="rounded-xl border border-white/10 bg-[#070a15] p-4 sm:p-5 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h4 className="text-xs font-semibold uppercase tracking-wider text-white">
+                      Browser Companion — Project & Resource Capture
+                    </h4>
+                    <p className="mt-0.5 text-xs text-white/55">
+                      Captures project instructions, Claude Artifacts / ChatGPT
+                      Canvas blocks, open project documents, code snippets, and
+                      conversation turns with provenance, and stages them into
+                      the <strong>Import Review Queue</strong>.
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={handleStageSampleProjectCapture}
+                      data-testid="stage-companion-project-btn"
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-[#9db4ff]/35 bg-[#9db4ff]/15 px-3 py-1.5 mono text-[11px] font-semibold text-[#9db4ff] hover:bg-[#9db4ff]/25 transition"
+                    >
+                      <Puzzle className="h-3.5 w-3.5" />
+                      <span>Stage Project Resources to Review Queue</span>
+                    </button>
+                    {companionCaptures.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('import')}
+                        className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-400 px-3 py-1.5 mono text-[11px] font-semibold text-black hover:bg-emerald-300 transition"
+                      >
+                        <span>
+                          Open Review Queue ({companionCaptures.length} staged)
+                        </span>
+                        <ArrowRight className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {companionStageBanner && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-3.5 py-2 text-xs text-emerald-200">
+                    <div className="flex items-center gap-2">
+                      <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                      <span>{companionStageBanner}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('import')}
+                      className="mono text-[11px] font-semibold text-emerald-300 underline hover:text-white"
+                    >
+                      Review in Queue →
+                    </button>
+                  </div>
+                )}
+
+                {companionUnreachable.length > 0 && (
+                  <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-3.5 py-2.5 text-xs text-amber-200 space-y-1">
+                    <div className="font-semibold flex items-center gap-1.5">
+                      <AlertCircle className="h-3.5 w-3.5 text-amber-400 shrink-0" />
+                      <span>
+                        Browser Permission / DOM Boundary Notice (
+                        {companionUnreachable.length} binary attachment card)
+                      </span>
+                    </div>
+                    <ul className="list-disc list-inside text-[11px] text-amber-200/85">
+                      {companionUnreachable.map((u, idx) => (
+                        <li key={idx}>
+                          <strong className="mono">{u.name}</strong> —{' '}
+                          {u.reason}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
@@ -2156,6 +2481,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 onBulkMerge={(items) => handleBulkAction(items, 'merge')}
                 onBulkReplace={(items) => handleBulkAction(items, 'replace')}
                 onBulkSkip={(items) => handleBulkAction(items, 'skip')}
+                onBulkFormatTitles={handleBulkFormatTitles}
+                onBulkAssignSource={handleBulkAssignSource}
                 onUpdateItem={handleUpdateQueueItem}
                 onRemoveItem={handleRemoveQueueItem}
                 onClearQueue={() => {

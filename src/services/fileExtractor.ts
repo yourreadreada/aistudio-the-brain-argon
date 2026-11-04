@@ -19,6 +19,14 @@ export const SUPPORTED_FILE_EXTENSIONS = [
   '.webp',
 ];
 
+export const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB general limit
+export const MAX_PDF_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB PDF limit
+export const MAX_XLSX_FILE_SIZE_BYTES = 15 * 1024 * 1024; // 15 MB spreadsheet limit
+export const MAX_XLSX_SHEETS = 20;
+export const MAX_XLSX_ROWS_PER_SHEET = 500;
+export const MAX_XLSX_TOTAL_ROWS = 2000;
+export const MAX_XLSX_COLUMNS_PER_ROW = 50;
+
 export interface ExtractedFileResult {
   title: string;
   fileName: string;
@@ -33,6 +41,210 @@ export interface ExtractedFileResult {
   detectedSource: AISource;
   status: 'success' | 'warning' | 'error';
   statusMessage?: string;
+}
+
+const KNOWN_ACRONYMS: Record<string, string> = {
+  ai: 'AI',
+  api: 'API',
+  ui: 'UI',
+  ux: 'UX',
+  db: 'DB',
+  sql: 'SQL',
+  pdf: 'PDF',
+  docx: 'DOCX',
+  xlsx: 'XLSX',
+  pptx: 'PPTX',
+  json: 'JSON',
+  csv: 'CSV',
+  md: 'MD',
+  txt: 'TXT',
+  html: 'HTML',
+  css: 'CSS',
+  js: 'JS',
+  ts: 'TS',
+  jsx: 'JSX',
+  tsx: 'TSX',
+  mcp: 'MCP',
+  llm: 'LLM',
+  llms: 'LLMs',
+  gpt: 'GPT',
+  chatgpt: 'ChatGPT',
+  rag: 'RAG',
+  ocr: 'OCR',
+  url: 'URL',
+  uri: 'URI',
+  id: 'ID',
+  pr: 'PR',
+  prs: 'PRs',
+  sih: 'SIH',
+  github: 'GitHub',
+  gitlab: 'GitLab',
+  fastapi: 'FastAPI',
+  pytorch: 'PyTorch',
+  graphql: 'GraphQL',
+  javascript: 'JavaScript',
+  typescript: 'TypeScript',
+  powerpoint: 'PowerPoint',
+  readme: 'README',
+  sqlite: 'SQLite',
+  mfcc: 'MFCC',
+  redis: 'Redis',
+  rfc: 'RFC',
+  adr: 'ADR',
+  dsp: 'DSP',
+  cn: 'CN',
+};
+
+const MINOR_TITLE_WORDS = new Set([
+  'a',
+  'an',
+  'the',
+  'and',
+  'or',
+  'but',
+  'nor',
+  'for',
+  'so',
+  'yet',
+  'in',
+  'on',
+  'at',
+  'to',
+  'of',
+  'by',
+  'with',
+  'from',
+  'into',
+  'onto',
+  'per',
+  'via',
+]);
+
+const KNOWN_STRIPPABLE_EXTENSIONS = new Set([
+  'zip',
+  'md',
+  'markdown',
+  'txt',
+  'json',
+  'csv',
+  'pdf',
+  'docx',
+  'doc',
+  'rtf',
+  'xlsx',
+  'xls',
+  'pptx',
+  'ppt',
+  'png',
+  'jpg',
+  'jpeg',
+  'webp',
+  'svg',
+  'gif',
+  'ts',
+  'tsx',
+  'js',
+  'jsx',
+  'py',
+  'rs',
+  'go',
+  'java',
+  'cpp',
+  'c',
+  'sql',
+  'yaml',
+  'yml',
+  'sh',
+  'html',
+  'css',
+]);
+
+/**
+ * Formats a raw filename or title into readable Title Case without mutating
+ * the underlying filename or path identity.
+ * - Strips file extensions when present
+ * - Replaces underscores and hyphens with spaces
+ * - Converts lowercase words to Title Case while preserving acronyms and intentional camelCase
+ */
+export function formatReadableTitle(rawInput: string): string {
+  const trimmed = (rawInput || '').trim();
+  if (!trimmed) return 'Untitled Document';
+
+  // Extract base segment if path separators exist
+  const baseSegment = trimmed.split(/[\\/]/).pop() || trimmed;
+
+  // Strip trailing file extension if it matches a known extension
+  const extMatch = baseSegment.match(/^(.+)\.([a-zA-Z0-9]{1,8})$/);
+  const withoutExt =
+    extMatch && KNOWN_STRIPPABLE_EXTENSIONS.has(extMatch[2].toLowerCase())
+      ? extMatch[1]
+      : baseSegment;
+
+  // Replace underscores and hyphens with spaces and collapse repeated whitespace
+  const normalizedWords = withoutExt
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!normalizedWords) return baseSegment;
+
+  const tokens = normalizedWords.split(' ');
+  const total = tokens.length;
+
+  return tokens
+    .map((word, idx) => {
+      if (!word) return '';
+
+      // Preserve parenthetical wrappers like "(3" or "chats)"
+      const leadPunctMatch = word.match(/^([([{"']+)(.*)$/);
+      const leadPunct = leadPunctMatch ? leadPunctMatch[1] : '';
+      const restAfterLead = leadPunctMatch ? leadPunctMatch[2] : word;
+
+      const trailPunctMatch = restAfterLead.match(/^(.*?)([)\]}"',.:;!?]+)$/);
+      const core = trailPunctMatch ? trailPunctMatch[1] : restAfterLead;
+      const trailPunct = trailPunctMatch ? trailPunctMatch[2] : '';
+
+      if (!core) return word;
+
+      const lower = core.toLowerCase();
+
+      // 1. Check known acronyms / brand casing
+      if (KNOWN_ACRONYMS[lower]) {
+        return `${leadPunct}${KNOWN_ACRONYMS[lower]}${trailPunct}`;
+      }
+
+      // 2. Format version tokens such as v1, v2, v2.1 -> V1, V2, V2.1
+      if (/^v\d+(\.\d+)*$/i.test(core)) {
+        return `${leadPunct}V${core.slice(1)}${trailPunct}`;
+      }
+
+      // 3. Preserve words that already have intentional internal mixed/upper casing (e.g. "OpenAI", "macOS")
+      if (/[a-z]/.test(core) && /[A-Z]/.test(core.slice(1))) {
+        return `${leadPunct}${core}${trailPunct}`;
+      }
+
+      // 4. Preserve short all-uppercase acronyms (2-4 letters) if the input wasn't entirely uppercase
+      const isEntireInputUpper =
+        normalizedWords === normalizedWords.toUpperCase() &&
+        /[A-Z]/.test(normalizedWords);
+      if (!isEntireInputUpper && /^[A-Z0-9]{2,4}$/.test(core)) {
+        return `${leadPunct}${core}${trailPunct}`;
+      }
+
+      // 5. Keep minor conjunctions/prepositions lowercase unless first or last word
+      if (idx > 0 && idx < total - 1 && MINOR_TITLE_WORDS.has(lower)) {
+        return `${leadPunct}${lower}${trailPunct}`;
+      }
+
+      // 6. Standard Title Case
+      const titled = lower.charAt(0).toUpperCase() + lower.slice(1);
+      return `${leadPunct}${titled}${trailPunct}`;
+    })
+    .join(' ');
+}
+
+export function cleanTitleFromFileName(fileName: string): string {
+  return formatReadableTitle(fileName);
 }
 
 export function detectSourceFromFileName(filename: string, textSample: string = ''): AISource {
@@ -90,11 +302,6 @@ export function detectSourceFromFileName(filename: string, textSample: string = 
   return 'claude';
 }
 
-function cleanTitleFromFileName(fileName: string): string {
-  const base = fileName.split(/[\\/]/).pop() || fileName;
-  return base.replace(/\.[^/.]+$/, '').replace(/[_-]+/g, ' ').trim() || base;
-}
-
 function countMarkdownSectionsOrTurns(text: string): { count: number; label: string } {
   if (text.includes('#### User') || text.includes('#### Assistant') || text.includes('**USER**:')) {
     const turns = text.split(/(?=#### (?:User|Assistant)|\*\*(?:USER|ASSISTANT)\*\*:)/g).filter(Boolean);
@@ -120,6 +327,64 @@ export interface ExtractionProgressInfo {
 export type ExtractionProgressCallback = (info: ExtractionProgressInfo) => void;
 
 /**
+ * Polyfills ES2025 `Promise.try` and `Uint8Array.prototype.toHex` / `Uint8Array.fromHex`
+ * if missing in the current JS runtime (e.g. Node 22 or older browsers),
+ * which are required by `pdfjs-dist` 6.x during PDF parsing and worker initialization.
+ */
+function ensurePdfJsRuntimePolyfills(): void {
+  if (typeof (Promise as any).try !== 'function') {
+    (Promise as any).try = function <T>(
+      callback: (...args: any[]) => T | PromiseLike<T>,
+      ...args: any[]
+    ): Promise<T> {
+      return new Promise<T>((resolve) => resolve(callback(...args)));
+    };
+  }
+
+  if (typeof (Uint8Array.prototype as any).toHex !== 'function') {
+    (Uint8Array.prototype as any).toHex = function (this: Uint8Array): string {
+      let out = '';
+      for (let i = 0; i < this.length; i++) {
+        out += this[i].toString(16).padStart(2, '0');
+      }
+      return out;
+    };
+  }
+
+  if (typeof (Uint8Array as any).fromHex !== 'function') {
+    (Uint8Array as any).fromHex = function (hex: string): Uint8Array {
+      const clean = String(hex || '').replace(/\s+/g, '');
+      const bytes = new Uint8Array(Math.floor(clean.length / 2));
+      for (let i = 0; i < bytes.length; i++) {
+        bytes[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+      }
+      return bytes;
+    };
+  }
+}
+
+ensurePdfJsRuntimePolyfills();
+
+/**
+ * Configures PDF.js to use the local package worker matching the installed pdfjs-dist version
+ * instead of a hard-coded external CDN version.
+ */
+export function configurePdfWorker(pdfjsLib: any): string {
+  ensurePdfJsRuntimePolyfills();
+
+  const localWorkerUrl = new URL(
+    '../../node_modules/pdfjs-dist/build/pdf.worker.min.mjs',
+    import.meta.url
+  ).toString();
+
+  if (pdfjsLib?.GlobalWorkerOptions) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = localWorkerUrl;
+  }
+
+  return localWorkerUrl;
+}
+
+/**
  * Unpacks a file or a .zip archive into one or more ExtractedFileResult items for the Review Queue.
  */
 export async function extractItemsFromFile(
@@ -135,6 +400,7 @@ export async function extractItemsFromFile(
   return [
     {
       ...single,
+      fileName: file.name,
       filePath: single.filePath || relativePath,
       fileType: single.fileType || inferFileTypeFromExtension(single.fileName),
     },
@@ -156,6 +422,26 @@ export async function extractTextFromFile(
   const sizeBytes = file.size;
 
   try {
+    // Rejectlegacy .xls before general size checks so the user always gets the specific .xlsx conversion instructions
+    if (extension === '.xls') {
+      return await extractXlsx(file, initialSource, onProgress);
+    }
+
+    if (sizeBytes > MAX_FILE_SIZE_BYTES && extension !== '.pdf' && extension !== '.xlsx') {
+      const mb = (sizeBytes / (1024 * 1024)).toFixed(1);
+      const maxMb = (MAX_FILE_SIZE_BYTES / (1024 * 1024)).toFixed(1);
+      return {
+        title,
+        fileName,
+        extension,
+        sizeBytes,
+        text: '',
+        detectedSource: initialSource,
+        status: 'error',
+        statusMessage: `File exceeds maximum supported size (${mb} MB > ${maxMb} MB limit). Please split or compress the file before importing.`,
+      };
+    }
+
     // 0. If a .zip file is passed to single-file extractor, combine or return first summary
     if (extension === '.zip') {
       const items = await extractZipArchive(file, onProgress);
@@ -221,7 +507,7 @@ export async function extractTextFromFile(
         const parsed = JSON.parse(rawText);
         const extracted = extractChatFromJson(parsed, fileName, onProgress);
         return {
-          title: extracted.title || title,
+          title: extracted.title ? formatReadableTitle(extracted.title) : title,
           fileName,
           extension,
           sizeBytes,
@@ -303,6 +589,7 @@ export async function extractTextFromFile(
 
 /**
  * Unpacks a .zip archive using JSZip and extracts all supported inner files or conversation exports.
+ * Preserves both the base fileName and the full archive relative filePath independently of the Title Case display title.
  */
 async function extractZipArchive(
   zipFile: File,
@@ -355,7 +642,7 @@ async function extractZipArchive(
       const blob = await zipEntry.async('blob');
       const innerFile = new File([blob], baseName, { type: blob.type });
       const extracted = await extractTextFromFile(innerFile);
-      if (extracted.text.trim()) {
+      if (extracted.text.trim() || extracted.status === 'error') {
         results.push({
           ...extracted,
           fileName: baseName,
@@ -372,28 +659,128 @@ async function extractZipArchive(
   return results;
 }
 
-// PDF Extraction (Lazy-loaded)
+/**
+ * PDF Extraction using local/package pdfjs-dist worker.
+ * Surfaces clear error messages for malformed/corrupted PDFs and scanned PDFs without a text layer.
+ */
 async function extractPdf(
   file: File,
   detectedSource: AISource,
   onProgress?: ExtractionProgressCallback
 ): Promise<ExtractedFileResult> {
+  const title = cleanTitleFromFileName(file.name);
+  if (file.size > MAX_PDF_FILE_SIZE_BYTES) {
+    const mb = (file.size / (1024 * 1024)).toFixed(1);
+    const maxMb = (MAX_PDF_FILE_SIZE_BYTES / (1024 * 1024)).toFixed(1);
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'pdf',
+      extension: '.pdf',
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: 0,
+      itemUnitLabel: 'pages',
+      detectedSource,
+      status: 'error',
+      statusMessage: `Oversized PDF file (${mb} MB exceeds ${maxMb} MB limit). Split the PDF into smaller documents before importing.`,
+    };
+  }
+
   onProgress?.({
     mode: 'indeterminate',
     phase: 'extracting',
     label: 'Loading PDF document…',
   });
-  const pdfjsLib = await import('pdfjs-dist');
-  try {
-    pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs`;
-  } catch {}
 
   const arrayBuffer = await file.arrayBuffer();
-  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) });
-  const pdf = await loadingTask.promise;
-  const numPages = pdf.numPages;
+  const bytes = new Uint8Array(arrayBuffer);
+
+  // Quick structural header check before invoking PDF.js
+  if (bytes.byteLength < 5) {
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'pdf',
+      extension: '.pdf',
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: 0,
+      itemUnitLabel: 'pages',
+      detectedSource,
+      status: 'error',
+      statusMessage:
+        'Malformed or corrupted PDF file: file is too small to contain a valid PDF header.',
+    };
+  }
+
+  const headerAscii = String.fromCharCode(
+    ...bytes.slice(0, Math.min(bytes.byteLength, 1024))
+  );
+  if (!headerAscii.includes('%PDF-')) {
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'pdf',
+      extension: '.pdf',
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: 0,
+      itemUnitLabel: 'pages',
+      detectedSource,
+      status: 'error',
+      statusMessage:
+        'Malformed or corrupted PDF file: missing %PDF- document header.',
+    };
+  }
+
+  const pdfjsLib = await import('pdfjs-dist');
+  configurePdfWorker(pdfjsLib);
+
+  let pdf: any;
+  try {
+    const loadingTask = pdfjsLib.getDocument({
+      data: bytes,
+      useSystemFonts: true,
+      disableFontFace: true,
+    });
+    pdf = await loadingTask.promise;
+  } catch (err: any) {
+    const rawMsg = err?.message || 'Unable to parse PDF structure';
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'pdf',
+      extension: '.pdf',
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: 0,
+      itemUnitLabel: 'pages',
+      detectedSource,
+      status: 'error',
+      statusMessage: `Malformed or corrupted PDF file: ${rawMsg}`,
+    };
+  }
+
+  const numPages = pdf?.numPages || 0;
+  if (numPages === 0) {
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'pdf',
+      extension: '.pdf',
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: 0,
+      itemUnitLabel: 'pages',
+      detectedSource,
+      status: 'error',
+      statusMessage: 'Malformed PDF file: document contains 0 pages.',
+    };
+  }
 
   const pageTexts: string[] = [];
+  let pageReadErrors = 0;
 
   for (let i = 1; i <= numPages; i++) {
     onProgress?.({
@@ -416,25 +803,46 @@ async function extractPdf(
         pageTexts.push(`## Page ${i}\n\n${combinedText}`);
       }
     } catch {
-      // Continue next page on partial error
+      pageReadErrors++;
     }
   }
 
+  try {
+    await pdf.destroy?.();
+  } catch {}
+
   const fullText = pageTexts.join('\n\n').trim();
 
+  if (!fullText) {
+    const isCorruptedPages = pageReadErrors === numPages;
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'pdf',
+      extension: '.pdf',
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: numPages,
+      itemUnitLabel: numPages === 1 ? 'page' : 'pages',
+      detectedSource,
+      status: 'error',
+      statusMessage: isCorruptedPages
+        ? 'Malformed PDF file: failed to read page streams.'
+        : 'Scanned or image-only PDF: no extractable text layer found. Run OCR before importing.',
+    };
+  }
+
   return {
-    title: cleanTitleFromFileName(file.name),
+    title,
     fileName: file.name,
+    fileType: 'pdf',
     extension: '.pdf',
     sizeBytes: file.size,
     text: fullText,
     pageOrItemCount: numPages,
     itemUnitLabel: numPages === 1 ? 'page' : 'pages',
     detectedSource: detectSourceFromFileName(file.name, fullText) || detectedSource,
-    status: fullText ? 'success' : 'warning',
-    statusMessage: fullText
-      ? undefined
-      : 'No text layer found (scanned image PDF).',
+    status: 'success',
   };
 }
 
@@ -470,67 +878,258 @@ async function extractDocx(
   };
 }
 
-// Excel (.xlsx, .xls) Extraction (Lazy-loaded)
+// Excel (.xlsx, .xls) Extraction using safe `read-excel-file`
 async function extractXlsx(
   file: File,
   detectedSource: AISource,
   onProgress?: ExtractionProgressCallback
 ): Promise<ExtractedFileResult> {
+  const title = cleanTitleFromFileName(file.name);
+  const extension = '.' + (file.name.split('.').pop() || 'xlsx').toLowerCase();
+
+  // 1. Reject unsupported legacy binary .xls files with clear conversion instructions
+  if (extension === '.xls') {
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'xlsx',
+      extension: '.xls',
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: 0,
+      itemUnitLabel: 'sheets',
+      detectedSource,
+      status: 'error',
+      statusMessage:
+        'Unsupported legacy .xls binary spreadsheet format. Please open this file in Microsoft Excel, Apple Numbers, or Google Sheets and save/export it as .xlsx before importing.',
+    };
+  }
+
+  // 2. Guard against oversized spreadsheets
+  if (file.size > MAX_XLSX_FILE_SIZE_BYTES) {
+    const mb = (file.size / (1024 * 1024)).toFixed(1);
+    const maxMb = (MAX_XLSX_FILE_SIZE_BYTES / (1024 * 1024)).toFixed(1);
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'xlsx',
+      extension: '.xlsx',
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: 0,
+      itemUnitLabel: 'sheets',
+      detectedSource,
+      status: 'error',
+      statusMessage: `Oversized spreadsheet (${mb} MB exceeds ${maxMb} MB limit). Export individual sheets or reduce file size before importing.`,
+    };
+  }
+
   onProgress?.({
     mode: 'indeterminate',
     phase: 'extracting',
-    label: 'Reading workbook…',
+    label: 'Reading .xlsx workbook…',
   });
-  const XLSX = await import('xlsx');
+
   const arrayBuffer = await file.arrayBuffer();
-  const workbook = XLSX.read(arrayBuffer, { type: 'array' });
-  const sheetNames = workbook.SheetNames || [];
+  const headerBytes = new Uint8Array(arrayBuffer.slice(0, 8));
+
+  // Detect OLE2 Compound Document header (0xD0 0xCF 0x11 0xE0) renamed as .xlsx
+  if (
+    headerBytes.length >= 4 &&
+    headerBytes[0] === 0xd0 &&
+    headerBytes[1] === 0xcf &&
+    headerBytes[2] === 0x11 &&
+    headerBytes[3] === 0xe0
+  ) {
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'xlsx',
+      extension,
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: 0,
+      itemUnitLabel: 'sheets',
+      detectedSource,
+      status: 'error',
+      statusMessage:
+        'Unsupported legacy .xls binary spreadsheet detected (file uses OLE2 format). Please open it in Excel or Google Sheets and save it as .xlsx before importing.',
+    };
+  }
+
+  // Verify ZIP/OOXML magic header (PK\x03\x04)
+  if (
+    headerBytes.length < 4 ||
+    headerBytes[0] !== 0x50 ||
+    headerBytes[1] !== 0x4b
+  ) {
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'xlsx',
+      extension,
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: 0,
+      itemUnitLabel: 'sheets',
+      detectedSource,
+      status: 'error',
+      statusMessage:
+        'Malformed or corrupted .xlsx file: file is not a valid OpenXML workbook archive.',
+    };
+  }
+
+  let sheets: { sheet: string; data: any[][] }[] = [];
+  try {
+    const readXlsxModule = await import('read-excel-file/universal');
+    const readXlsxFile =
+      (readXlsxModule as any).default || readXlsxModule;
+    sheets = await readXlsxFile(arrayBuffer);
+  } catch (err: any) {
+    const detail = err?.message || 'Unable to parse workbook XML structure';
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'xlsx',
+      extension,
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: 0,
+      itemUnitLabel: 'sheets',
+      detectedSource,
+      status: 'error',
+      statusMessage: `Malformed or corrupted .xlsx file: ${detail}`,
+    };
+  }
+
+  const totalSheetCount = Array.isArray(sheets) ? sheets.length : 0;
+  if (totalSheetCount === 0) {
+    return {
+      title,
+      fileName: file.name,
+      fileType: 'xlsx',
+      extension,
+      sizeBytes: file.size,
+      text: '',
+      pageOrItemCount: 0,
+      itemUnitLabel: 'sheets',
+      detectedSource,
+      status: 'warning',
+      statusMessage: 'Spreadsheet is empty (no sheets found).',
+    };
+  }
+
+  const boundedSheets = sheets.slice(0, MAX_XLSX_SHEETS);
+  const truncationNotices: string[] = [];
+
+  if (totalSheetCount > MAX_XLSX_SHEETS) {
+    truncationNotices.push(
+      `omitted ${totalSheetCount - MAX_XLSX_SHEETS} additional sheet(s) beyond ${MAX_XLSX_SHEETS}-sheet limit`
+    );
+  }
+
   const parts: string[] = [];
+  let totalIncludedRows = 0;
+  let stoppedByTotalRowLimit = false;
 
-  sheetNames.forEach((sheetName, idx) => {
-    if (sheetNames.length > 0) {
-      onProgress?.({
-        mode: 'determinate',
-        phase: 'extracting',
-        current: idx + 1,
-        total: sheetNames.length,
-        unit: sheetNames.length === 1 ? 'sheet' : 'sheets',
-        label: 'Extracting sheets',
-      });
+  for (let idx = 0; idx < boundedSheets.length; idx++) {
+    const sheetObj = boundedSheets[idx];
+    const sheetName = sheetObj.sheet || `Sheet ${idx + 1}`;
+    const rawRows = Array.isArray(sheetObj.data) ? sheetObj.data : [];
+
+    onProgress?.({
+      mode: 'determinate',
+      phase: 'extracting',
+      current: idx + 1,
+      total: boundedSheets.length,
+      unit: boundedSheets.length === 1 ? 'sheet' : 'sheets',
+      label: 'Extracting sheets',
+    });
+
+    const nonEmptyRows: string[] = [];
+    let sheetOmittedRows = 0;
+    let sheetOmittedCols = false;
+
+    for (const row of rawRows) {
+      if (!Array.isArray(row)) continue;
+      const formattedCells = row
+        .slice(0, MAX_XLSX_COLUMNS_PER_ROW)
+        .map((cell) => {
+          if (cell === null || cell === undefined) return '';
+          if (cell instanceof Date) return cell.toISOString().slice(0, 10);
+          return String(cell).replace(/\s+/g, ' ').trim();
+        });
+
+      if (row.length > MAX_XLSX_COLUMNS_PER_ROW) {
+        sheetOmittedCols = true;
+      }
+
+      if (!formattedCells.some((c) => c.length > 0)) {
+        continue;
+      }
+
+      if (nonEmptyRows.length >= MAX_XLSX_ROWS_PER_SHEET) {
+        sheetOmittedRows++;
+        continue;
+      }
+
+      if (totalIncludedRows >= MAX_XLSX_TOTAL_ROWS) {
+        sheetOmittedRows++;
+        stoppedByTotalRowLimit = true;
+        continue;
+      }
+
+      nonEmptyRows.push(formattedCells.join(' | ').replace(/(?:\s*\|\s*)+$/, ''));
+      totalIncludedRows++;
     }
-    const worksheet = workbook.Sheets[sheetName];
-    if (!worksheet) return;
 
-    const csv = XLSX.utils.sheet_to_csv(worksheet);
-    const rows = csv
-      .split('\n')
-      .map((r) => r.trim())
-      .filter((r) => r.replace(/,/g, '').trim());
-
-    if (rows.length > 0) {
-      const formattedRows = rows.map((row) =>
-        row
-          .split(',')
-          .map((c) => c.trim())
-          .join(' | ')
+    if (sheetOmittedCols) {
+      truncationNotices.push(
+        `capped "${sheetName}" at ${MAX_XLSX_COLUMNS_PER_ROW} columns per row`
       );
-      parts.push(`## Sheet: ${sheetName}\n\n${formattedRows.join('\n')}`);
     }
-  });
+
+    if (sheetOmittedRows > 0) {
+      truncationNotices.push(
+        `truncated ${sheetOmittedRows} row(s) in "${sheetName}"`
+      );
+    }
+
+    if (nonEmptyRows.length > 0) {
+      const sheetFooter =
+        sheetOmittedRows > 0
+          ? `\n\n[Truncated: ${sheetOmittedRows} additional row(s) omitted in "${sheetName}"]`
+          : '';
+      parts.push(
+        `## Sheet: ${sheetName}\n\n${nonEmptyRows.join('\n')}${sheetFooter}`
+      );
+    }
+
+    if (stoppedByTotalRowLimit) {
+      break;
+    }
+  }
 
   const fullText = parts.join('\n\n').trim();
+  const wasTruncated = truncationNotices.length > 0;
 
   return {
-    title: cleanTitleFromFileName(file.name),
+    title,
     fileName: file.name,
-    extension: '.' + (file.name.split('.').pop() || 'xlsx').toLowerCase(),
+    fileType: 'xlsx',
+    extension,
     sizeBytes: file.size,
     text: fullText,
-    pageOrItemCount: sheetNames.length,
-    itemUnitLabel: sheetNames.length === 1 ? 'sheet' : 'sheets',
-    detectedSource,
-    status: fullText ? 'success' : 'warning',
-    statusMessage: fullText ? undefined : 'Spreadsheet is empty',
+    pageOrItemCount: boundedSheets.length,
+    itemUnitLabel: boundedSheets.length === 1 ? 'sheet' : 'sheets',
+    detectedSource:
+      detectSourceFromFileName(file.name, fullText) || detectedSource,
+    status: !fullText ? 'warning' : wasTruncated ? 'warning' : 'success',
+    statusMessage: !fullText
+      ? 'Spreadsheet is empty'
+      : wasTruncated
+      ? `Spreadsheet truncated for safety: ${truncationNotices.join('; ')}.`
+      : undefined,
   };
 }
 
@@ -728,4 +1327,3 @@ function extractChatFromJson(
     conversationCount: 1,
   };
 }
-
