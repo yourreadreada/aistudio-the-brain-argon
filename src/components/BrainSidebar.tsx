@@ -23,6 +23,7 @@ import {
   LogOut,
   Check,
   X,
+  Database,
 } from 'lucide-react';
 import {
   AISource,
@@ -34,7 +35,8 @@ import { BrainLogo } from './BrainLogo';
 import { GuidedService } from './GuidedConnectionModal';
 import { CaptureHubTab } from './CaptureHubModal';
 
-export type WorkspaceViewMode = 'graph' | 'list' | 'simulator';
+export type WorkspaceViewMode = 'graph' | 'list' | 'simulator' | 'settings';
+
 
 interface BrainSidebarProps {
   isCollapsed: boolean;
@@ -285,8 +287,30 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
                 {!isCollapsed && <span>Activity Log</span>}
               </span>
             </button>
+
+            <button
+              type="button"
+              onClick={() => onSelectViewMode('settings')}
+              title="Database & Backup Settings"
+              className={`flex w-full items-center rounded-lg text-xs font-medium transition-colors ${
+                isCollapsed ? 'justify-center py-2.5' : 'justify-between px-2.5 py-2'
+              } ${
+                viewMode === 'settings'
+                  ? 'bg-white/[0.1] text-white'
+                  : 'text-white/60 hover:bg-white/[0.04] hover:text-white'
+              }`}
+            >
+              <span className="flex items-center gap-2.5 whitespace-nowrap">
+                <Database className="h-4 w-4 shrink-0 text-emerald-400" />
+                {!isCollapsed && <span>Settings</span>}
+              </span>
+              {!isCollapsed && (
+                <span className="mono text-[10px] text-white/40">DB</span>
+              )}
+            </button>
           </div>
         </div>
+
 
         {/* SECTION 2: Brains (Workspaces) */}
         <div className="border-t border-white/10 pt-4">

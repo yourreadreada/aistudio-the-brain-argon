@@ -1,5 +1,5 @@
 import React from 'react';
-import { Menu, Plus, Upload, Puzzle } from 'lucide-react';
+import { Menu, Plus, Upload, Puzzle, Database } from 'lucide-react';
 import { AISource, Fact, FactFileType, SOURCE_PALETTE, FILE_TYPE_CONFIG } from '../types/brain';
 import { GlobalSearchBar } from './GlobalSearchBar';
 import { GuidedService } from './GuidedConnectionModal';
@@ -22,6 +22,8 @@ interface BrainAppHeaderProps {
   onOpenAddFact: () => void;
   onOpenIngest: (initialTab?: CaptureHubTab) => void;
   onOpenMcp: () => void;
+  onOpenSettings?: () => void;
+  isSettingsActive?: boolean;
   onOpenGuidedConfig?: (service?: GuidedService) => void;
   connectionStatus?: { chatgpt: boolean; claude: boolean; gemini: boolean; backend: boolean };
   onSwitchToLogin: () => void;
@@ -43,6 +45,8 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
   onSelectFileTypeFilter,
   onOpenAddFact,
   onOpenIngest,
+  onOpenSettings,
+  isSettingsActive = false,
   onToggleMobileSidebar,
   totalFactsCount = 0,
 }) => {
@@ -114,6 +118,22 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
 
       {/* Zone 3: Primary Workspace Actions */}
       <div className="flex items-center gap-2 shrink-0">
+        {onOpenSettings && (
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className={`hidden md:flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition whitespace-nowrap shrink-0 ${
+              isSettingsActive
+                ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
+                : 'border-white/12 bg-white/[0.02] text-white/75 hover:border-white/25 hover:bg-white/[0.06] hover:text-white'
+            }`}
+            title="Database & Backup Settings"
+          >
+            <Database className="h-3.5 w-3.5 text-emerald-400" />
+            <span>Settings</span>
+          </button>
+        )}
+
         <button
           type="button"
           onClick={() => onOpenIngest('companion')}
@@ -145,3 +165,4 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
     </header>
   );
 };
+

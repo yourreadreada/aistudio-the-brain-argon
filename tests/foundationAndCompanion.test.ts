@@ -358,7 +358,7 @@ describe('Phase 1 & Phase 2: Argon Foundation + Browser Companion Completion', (
       }
     });
 
-    it('restricts CORS to local development and extension origins and defaults bind host to 127.0.0.1', () => {
+    it('restricts CORS to local development and extension origins and enforces local-only 127.0.0.1 bind host (LAN deferred)', () => {
       assert.equal(isAllowedCorsOrigin(undefined), true);
       assert.equal(isAllowedCorsOrigin('http://localhost:3000'), true);
       assert.equal(isAllowedCorsOrigin('http://127.0.0.1:3000'), true);
@@ -367,8 +367,8 @@ describe('Phase 1 & Phase 2: Argon Foundation + Browser Companion Completion', (
       assert.equal(isAllowedCorsOrigin('https://malicious-site.example.com'), false);
 
       assert.equal(resolveBindHost({}), '127.0.0.1');
-      assert.equal(resolveBindHost({ BRAIN_ALLOW_LAN: 'true' }), '0.0.0.0');
-      assert.equal(resolveBindHost({ BRAIN_HOST: '192.168.1.50' }), '192.168.1.50');
+      assert.equal(resolveBindHost({ BRAIN_ALLOW_LAN: 'true' }), '127.0.0.1');
+      assert.equal(resolveBindHost({ BRAIN_HOST: '0.0.0.0' }), '127.0.0.1');
     });
   });
 

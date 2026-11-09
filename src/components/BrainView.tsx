@@ -31,6 +31,8 @@ import { GuidedConnectionModal, GuidedService } from './GuidedConnectionModal';
 import { DeleteBrainModal } from './DeleteBrainModal';
 import { BrainManagerModal } from './BrainManagerModal';
 import { RecentActivityPanel } from './RecentActivityPanel';
+import { DatabaseSettingsView } from './DatabaseSettingsView';
+
 
 interface BrainViewProps {
   userEmail: string;
@@ -530,6 +532,10 @@ export const BrainView: React.FC<BrainViewProps> = ({
           onOpenAddFact={() => setIsAddFactOpen(true)}
           onOpenIngest={(tab) => handleOpenCaptureHub(tab || 'import')}
           onOpenMcp={() => handleOpenGuidedConfig('chatgpt')}
+          onOpenSettings={() =>
+            setViewMode((prev) => (prev === 'settings' ? 'graph' : 'settings'))
+          }
+          isSettingsActive={viewMode === 'settings'}
           onOpenGuidedConfig={handleOpenGuidedConfig}
           connectionStatus={connectionStatus}
           onSwitchToLogin={onSwitchToLogin}
@@ -1068,6 +1074,19 @@ export const BrainView: React.FC<BrainViewProps> = ({
                   </div>
                 </div>
               </div>
+            </div>
+          )}
+
+          {/* VIEW 4: DATABASE & BACKUP SETTINGS */}
+          {viewMode === 'settings' && (
+            <div className="relative z-10 h-full overflow-hidden">
+              <DatabaseSettingsView
+                onBackToWorkspace={() => setViewMode('graph')}
+                onAfterRestore={() => {
+                  refreshData();
+                  refreshActivities();
+                }}
+              />
             </div>
           )}
 

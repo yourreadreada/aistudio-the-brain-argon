@@ -2972,6 +2972,122 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
   public resetToDefaults() {
     this.loadFromBackend();
   }
+
+  // --- Database & Backup Settings API Client ---
+
+  public async fetchDatabaseStatus(): Promise<DatabaseStatusPayload> {
+    const res = await fetch(`${API_BASE}/api/database/status`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Failed to load database status (HTTP ${res.status})`);
+    }
+    return data as DatabaseStatusPayload;
+  }
+
+  public async createDatabaseBackup(): Promise<{
+    success: boolean;
+    backup: DatabaseBackupItem;
+    backups: DatabaseBackupItem[];
+  }> {
+    const res = await fetch(`${API_BASE}/api/database/backups`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Failed to create database backup (HTTP ${res.status})`);
+    }
+    return data;
+  }
+
+  public async restoreDatabaseBackup(fileName: string): Promise<{
+    success: boolean;
+    message: string;
+    restoredFrom: DatabaseBackupItem;
+    safetyBackup: DatabaseBackupItem;
+    status: DatabaseStatusPayload;
+  }> {
+    const res = await fetch(`${API_BASE}/api/database/restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fileName, confirm: true }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Database restore failed (HTTP ${res.status})`);
+    }
+    // Reload facts and brains from the restored SQLite database
+    await this.loadFromBackend();
+    return data;
+  }
+
+  public async updateBackupRetention(maxBackups: number): Promise<{
+    success: boolean;
+    maxBackups: number;
+    retentionResult: {
+      maxBackups: number;
+      keptCount: number;
+      deletedCount: number;
+      deletedFiles: string[];
+      lastKnownGoodBackup: string | null;
+    };
+    backups: DatabaseBackupItem[];
+  }> {
+    const res = await fetch(`${API_BASE}/api/database/retention`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ maxBackups }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Failed to update backup retention (HTTP ${res.status})`);
+    }
+    return data;
+  }
+
+  public getBackupDownloadUrl(fileName: string): string {
+    return `${API_BASE}/api/database/backups/${encodeURIComponent(fileName)}/download`;
+  }
+}
+
+export interface DatabaseBackupItem {
+  fileName: string;
+  backupPath: string;
+  createdAt: string;
+  sizeBytes: number;
+  verified: boolean;
+  integrityStatus: string;
+  schemaVersion: number;
+  factsCount: number;
+  kind: 'manual' | 'pre-migration' | 'pre-restore-safety';
+}
+
+export interface DatabaseStatusPayload {
+  status: 'healthy' | 'degraded' | 'error';
+  engine: string;
+  journalMode: string;
+  integrityStatus: string;
+  schemaVersion: number;
+  appliedMigrations: Array<{ version: number; name: string; applied_at: string }>;
+  dbLocation: string;
+  backupLocation: string;
+  dbSizeBytes: number;
+  factsCount: number;
+  brainsCount: number;
+  brains: string[];
+  devicesCount: number;
+  capturesCount: number;
+  retention: {
+    maxBackups: number;
+  };
+  backupsSummary: {
+    totalBackups: number;
+    verifiedBackups: number;
+    latestBackupAt: string | null;
+    latestBackupFileName: string | null;
+  };
+  backups: DatabaseBackupItem[];
 }
 
 export const brainStore = new BrainStorageService();
+

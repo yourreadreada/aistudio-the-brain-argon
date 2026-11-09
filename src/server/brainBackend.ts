@@ -326,45 +326,936 @@ export function verifyCompanionToken(
   return null;
 }
 
-/**
- * Creates a safe timestamped backup of an existing SQLite database file on disk.
- */
-export function backupDatabaseFile(
-  dbPath: string,
-  backupDir?: string
-): string | null {
-  if (!dbPath || dbPath === ':memory:' || !fs.existsSync(dbPath)) {
-    return null;
-  }
-  const stat = fs.statSync(dbPath);
-  if (stat.size === 0) return null;
+export type BackupKind = 'manual' | 'pre-migration' | 'pre-restore-safety';
 
-  const targetDir = backupDir || path.join(path.dirname(dbPath), 'backups');
+export interface DatabaseIntegrityResult {
+  valid: boolean;
+  integrityStatus: string;
+  schemaVersion: number;
+  factsCount: number;
+  sizeBytes: number;
+  tables: string[];
+  error?: string;
+}
+
+export interface BackupMetadata {
+  fileName: string;
+  backupPath: string;
+  createdAt: string;
+  sizeBytes: number;
+  verified: boolean;
+  integrityStatus: string;
+  schemaVersion: number;
+  factsCount: number;
+  kind: BackupKind;
+}
+
+export interface CreateConsistentBackupOptions {
+  backupDir?: string;
+  kind?: BackupKind;
+  maxBackups?: number;
+  /**
+   * Test hook to simulate an interrupted or corrupted staging snapshot before promotion.
+   */
+  simulateInterruptedBackup?: boolean;
+  simulateCorruptStaging?: boolean;
+}
+
+export interface BackupRetentionResult {
+  maxBackups: number;
+  keptCount: number;
+  deletedCount: number;
+  deletedFiles: string[];
+  lastKnownGoodBackup: string | null;
+}
+
+export interface RestoreDatabaseOptions {
+  db?: DatabaseSync;
+  dbPath: string;
+  backupPath: string;
+  backupDir?: string;
+  /**
+   * Test hooks to simulate failure during staging or during live restore commit
+   * to verify automatic rollback to the pre-restore safety backup.
+   */
+  simulateStageFailure?: boolean;
+  simulateApplyFailure?: boolean;
+}
+
+export interface RestoreDatabaseResult {
+  success: boolean;
+  restoredFrom: BackupMetadata;
+  safetyBackup: BackupMetadata;
+  factsCountAfterRestore: number;
+  schemaVersionAfterRestore: number;
+  integrityStatus: string;
+}
+
+const SQLITE_MAGIC_HEADER = 'SQLite format 3\0';
+const REQUIRED_CORE_TABLES = [
+  'app_metadata',
+  'schema_migrations',
+  'facts',
+  'companion_devices',
+  'companion_captures',
+] as const;
+
+/**
+ * Checks whether a file on disk has a valid 16-byte SQLite3 file header.
+ * Empty (0-byte) files are treated as uninitialized rather than corrupted.
+ */
+export function hasValidSqliteHeader(filePath: string): {
+  valid: boolean;
+  empty: boolean;
+  error?: string;
+} {
+  if (!filePath || filePath === ':memory:' || !fs.existsSync(filePath)) {
+    return { valid: true, empty: true };
+  }
+  const stat = fs.statSync(filePath);
+  if (stat.size === 0) {
+    return { valid: true, empty: true };
+  }
+  if (stat.size < 16) {
+    return {
+      valid: false,
+      empty: false,
+      error: `File is truncated (${stat.size} bytes < 16-byte SQLite header)`,
+    };
+  }
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(16);
+    fs.readSync(fd, buf, 0, 16, 0);
+    const headerStr = buf.toString('utf8');
+    if (headerStr !== SQLITE_MAGIC_HEADER) {
+      return {
+        valid: false,
+        empty: false,
+        error: 'Invalid SQLite file header (not a valid SQLite 3 database)',
+      };
+    }
+    return { valid: true, empty: false };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Verifies a SQLite database file on disk using SQLite header inspection,
+ * `PRAGMA integrity_check`, `PRAGMA foreign_key_check`, and core table presence.
+ */
+export function verifyDatabaseFileIntegrity(
+  filePath: string,
+  options?: { requireCoreTables?: boolean }
+): DatabaseIntegrityResult {
+  const requireCoreTables = options?.requireCoreTables !== false;
+
+  if (!filePath || filePath === ':memory:' || !fs.existsSync(filePath)) {
+    return {
+      valid: false,
+      integrityStatus: 'missing',
+      schemaVersion: 0,
+      factsCount: 0,
+      sizeBytes: 0,
+      tables: [],
+      error: 'Database file does not exist',
+    };
+  }
+
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(filePath);
+  } catch (err: any) {
+    return {
+      valid: false,
+      integrityStatus: 'unreadable',
+      schemaVersion: 0,
+      factsCount: 0,
+      sizeBytes: 0,
+      tables: [],
+      error: err?.message || 'Unable to stat database file',
+    };
+  }
+
+  if (stat.size === 0) {
+    return {
+      valid: false,
+      integrityStatus: 'empty',
+      schemaVersion: 0,
+      factsCount: 0,
+      sizeBytes: 0,
+      tables: [],
+      error: 'Database file is empty (0 bytes)',
+    };
+  }
+
+  const headerCheck = hasValidSqliteHeader(filePath);
+  if (!headerCheck.valid) {
+    return {
+      valid: false,
+      integrityStatus: 'corrupted_header',
+      schemaVersion: 0,
+      factsCount: 0,
+      sizeBytes: stat.size,
+      tables: [],
+      error: headerCheck.error || 'Malformed SQLite header',
+    };
+  }
+
+  let checkDb: DatabaseSync | null = null;
+  try {
+    checkDb = new DatabaseSync(filePath);
+    const integrityRows = checkDb.prepare('PRAGMA integrity_check').all() as Array<{
+      integrity_check?: string;
+    }>;
+    const integrityMessages = integrityRows
+      .map((r) => String(r.integrity_check || '').trim())
+      .filter(Boolean);
+    const isIntegrityOk =
+      integrityMessages.length === 1 &&
+      integrityMessages[0].toLowerCase() === 'ok';
+
+    if (!isIntegrityOk) {
+      return {
+        valid: false,
+        integrityStatus: integrityMessages.join('; ') || 'integrity_check_failed',
+        schemaVersion: 0,
+        factsCount: 0,
+        sizeBytes: stat.size,
+        tables: [],
+        error: `SQLite integrity_check failed: ${integrityMessages.join('; ')}`,
+      };
+    }
+
+    const fkRows = checkDb.prepare('PRAGMA foreign_key_check').all();
+    if (fkRows.length > 0) {
+      return {
+        valid: false,
+        integrityStatus: 'foreign_key_violation',
+        schemaVersion: 0,
+        factsCount: 0,
+        sizeBytes: stat.size,
+        tables: [],
+        error: `SQLite foreign_key_check reported ${fkRows.length} violation(s)`,
+      };
+    }
+
+    const tableRows = checkDb
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
+      .all() as Array<{ name: string }>;
+    const tables = tableRows.map((r) => r.name);
+
+    if (requireCoreTables) {
+      const missingTables = REQUIRED_CORE_TABLES.filter(
+        (reqTable) => !tables.includes(reqTable)
+      );
+      if (missingTables.length > 0) {
+        return {
+          valid: false,
+          integrityStatus: `missing_tables:${missingTables.join(',')}`,
+          schemaVersion: 0,
+          factsCount: 0,
+          sizeBytes: stat.size,
+          tables,
+          error: `Database is missing required Argon tables: ${missingTables.join(', ')}`,
+        };
+      }
+    }
+
+    let schemaVersion = 0;
+    if (tables.includes('schema_migrations')) {
+      const versionRow = checkDb
+        .prepare('SELECT MAX(version) as maxVer FROM schema_migrations')
+        .get() as { maxVer: number | null } | undefined;
+      schemaVersion = Number(versionRow?.maxVer || 0);
+    }
+
+    let factsCount = 0;
+    if (tables.includes('facts')) {
+      const countRow = checkDb
+        .prepare('SELECT count(*) as count FROM facts')
+        .get() as { count: number } | undefined;
+      factsCount = Number(countRow?.count || 0);
+    }
+
+    return {
+      valid: true,
+      integrityStatus: 'ok',
+      schemaVersion,
+      factsCount,
+      sizeBytes: stat.size,
+      tables,
+    };
+  } catch (err: any) {
+    return {
+      valid: false,
+      integrityStatus: 'corrupted',
+      schemaVersion: 0,
+      factsCount: 0,
+      sizeBytes: stat.size,
+      tables: [],
+      error: err?.message || 'SQLite database verification failed',
+    };
+  } finally {
+    if (checkDb) {
+      try {
+        checkDb.close();
+      } catch {}
+    }
+  }
+}
+
+/**
+ * Removes incomplete `.tmp` staging files from the backup directory so interrupted
+ * backups never linger or appear as valid backups.
+ */
+export function cleanupIncompleteBackups(backupDir: string): string[] {
+  if (!backupDir || !fs.existsSync(backupDir)) return [];
+  const removed: string[] = [];
+  for (const entry of fs.readdirSync(backupDir)) {
+    if (
+      entry.endsWith('.tmp') ||
+      entry.endsWith('.tmp-wal') ||
+      entry.endsWith('.tmp-shm') ||
+      entry.startsWith('.staging_') ||
+      entry.startsWith('.restore_stage_')
+    ) {
+      const fullPath = path.join(backupDir, entry);
+      try {
+        if (fs.statSync(fullPath).isFile()) {
+          fs.unlinkSync(fullPath);
+          removed.push(entry);
+        }
+      } catch {}
+    }
+  }
+  return removed;
+}
+
+/**
+ * Generates a unique, non-colliding timestamped backup filename in `targetDir`
+ * so an existing valid backup is NEVER overwritten.
+ */
+function allocateUniqueBackupFilePath(targetDir: string): {
+  fileName: string;
+  backupPath: string;
+} {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  let attempt = 0;
+  while (true) {
+    const randSuffix = crypto.randomBytes(3).toString('hex');
+    const suffix = attempt === 0 ? randSuffix : `${randSuffix}_${attempt}`;
+    const fileName = `brain_backup_${stamp}_${suffix}.db`;
+    const backupPath = path.join(targetDir, fileName);
+    if (!fs.existsSync(backupPath)) {
+      return { fileName, backupPath };
+    }
+    attempt++;
+  }
+}
+
+/**
+ * Creates a transactionally consistent, verified SQLite snapshot using `VACUUM INTO`
+ * to a temporary staging file first, verifies its integrity with `PRAGMA integrity_check`,
+ * atomically renames it to a unique timestamped `.db` file, and writes a `.meta.json` sidecar.
+ */
+export function createConsistentBackup(
+  dbOrPath: DatabaseSync | string,
+  dbPathOrOptions?: string | CreateConsistentBackupOptions,
+  maybeOptions: CreateConsistentBackupOptions = {}
+): BackupMetadata {
+  let activeDb: DatabaseSync | null = null;
+  let ownsDb = false;
+  let dbPath = '';
+  let options: CreateConsistentBackupOptions = maybeOptions;
+
+  if (typeof dbOrPath === 'string') {
+    dbPath = dbOrPath;
+    if (typeof dbPathOrOptions === 'object' && dbPathOrOptions !== null) {
+      options = dbPathOrOptions;
+    } else if (typeof dbPathOrOptions === 'string') {
+      options = { ...maybeOptions, backupDir: dbPathOrOptions };
+    }
+  } else {
+    activeDb = dbOrPath;
+    if (typeof dbPathOrOptions === 'string') {
+      dbPath = dbPathOrOptions;
+    } else if (typeof dbPathOrOptions === 'object' && dbPathOrOptions !== null) {
+      options = dbPathOrOptions;
+      dbPath = (activeDb as any).__brainDbPath || '';
+    } else {
+      dbPath = (activeDb as any).__brainDbPath || '';
+    }
+  }
+
+  if (!activeDb) {
+    if (!dbPath || dbPath === ':memory:' || !fs.existsSync(dbPath)) {
+      throw new Error(`Cannot create backup: database file not found at "${dbPath}"`);
+    }
+    const stat = fs.statSync(dbPath);
+    if (stat.size === 0) {
+      throw new Error(`Cannot create backup: database file at "${dbPath}" is empty`);
+    }
+    const headerCheck = hasValidSqliteHeader(dbPath);
+    if (!headerCheck.valid) {
+      throw new Error(
+        `Cannot create backup: source database is malformed (${headerCheck.error})`
+      );
+    }
+    activeDb = new DatabaseSync(dbPath);
+    ownsDb = true;
+  }
+
+  const targetDir =
+    options.backupDir ||
+    (activeDb as any).__brainBackupDir ||
+    (dbPath && dbPath !== ':memory:'
+      ? path.join(path.dirname(dbPath), 'backups')
+      : path.join(process.cwd(), 'data', 'backups'));
+
   if (!fs.existsSync(targetDir)) {
     fs.mkdirSync(targetDir, { recursive: true });
   }
 
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const backupPath = path.join(targetDir, `brain_backup_${stamp}.db`);
-  fs.copyFileSync(dbPath, backupPath);
+  cleanupIncompleteBackups(targetDir);
 
-  for (const suffix of ['-wal', '-shm']) {
-    const journalPath = `${dbPath}${suffix}`;
-    if (fs.existsSync(journalPath)) {
-      fs.copyFileSync(journalPath, `${backupPath}${suffix}`);
+  const stagingId = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const stagingPath = path.join(targetDir, `.staging_brain_backup_${stagingId}.db.tmp`);
+
+  try {
+    const escapedStagingPath = stagingPath.replace(/'/g, "''");
+    // VACUUM INTO creates a self-contained, transactionally consistent SQLite snapshot
+    // safely even while the live database is open and in WAL mode.
+    activeDb.exec(`VACUUM INTO '${escapedStagingPath}'`);
+
+    if (options.simulateInterruptedBackup) {
+      throw new Error('Simulated backup interruption during staging');
+    }
+
+    if (options.simulateCorruptStaging) {
+      fs.writeFileSync(stagingPath, 'CORRUPTED_SQLITE_SNAPSHOT_BYTES', 'utf8');
+    }
+
+    // Verify the staged snapshot before promoting it to a final backup file.
+    // Allow pre-migration backups of older schema versions that may not yet have all v4 tables.
+    const kind: BackupKind = options.kind || 'manual';
+    const verification = verifyDatabaseFileIntegrity(stagingPath, {
+      requireCoreTables: kind !== 'pre-migration',
+    });
+
+    if (!verification.valid) {
+      throw new Error(
+        `Backup verification failed on staged snapshot: ${
+          verification.error || verification.integrityStatus
+        }`
+      );
+    }
+
+    const { fileName, backupPath } = allocateUniqueBackupFilePath(targetDir);
+    const createdAt = new Date().toISOString();
+
+    // Atomically promote verified staging file to final backup path
+    fs.renameSync(stagingPath, backupPath);
+
+    const metadata: BackupMetadata = {
+      fileName,
+      backupPath,
+      createdAt,
+      sizeBytes: verification.sizeBytes,
+      verified: true,
+      integrityStatus: verification.integrityStatus,
+      schemaVersion: verification.schemaVersion,
+      factsCount: verification.factsCount,
+      kind,
+    };
+
+    const metaPath = `${backupPath}.meta.json`;
+    fs.writeFileSync(
+      metaPath,
+      JSON.stringify(
+        {
+          fileName: metadata.fileName,
+          createdAt: metadata.createdAt,
+          sizeBytes: metadata.sizeBytes,
+          verified: metadata.verified,
+          integrityStatus: metadata.integrityStatus,
+          schemaVersion: metadata.schemaVersion,
+          factsCount: metadata.factsCount,
+          kind: metadata.kind,
+        },
+        null,
+        2
+      ),
+      'utf8'
+    );
+
+    if (typeof options.maxBackups === 'number' && options.maxBackups >= 1) {
+      applyBackupRetention(targetDir, options.maxBackups);
+    }
+
+    return metadata;
+  } finally {
+    // Always clean up incomplete staging files on failure or interruption
+    for (const suffix of ['', '-wal', '-shm']) {
+      const p = `${stagingPath}${suffix}`;
+      if (fs.existsSync(p)) {
+        try {
+          fs.unlinkSync(p);
+        } catch {}
+      }
+    }
+    if (ownsDb && activeDb) {
+      try {
+        activeDb.close();
+      } catch {}
     }
   }
-
-  return backupPath;
 }
 
-interface MigrationDefinition {
+/**
+ * Creates a safe, SQLite-consistent timestamped backup of an existing SQLite database.
+ * Returns the final verified backup file path, or `null` if the source database does not exist yet.
+ */
+export function backupDatabaseFile(
+  dbPath: string,
+  backupDir?: string,
+  existingDb?: DatabaseSync,
+  kind: BackupKind = 'manual'
+): string | null {
+  if (!dbPath || dbPath === ':memory:') {
+    return null;
+  }
+  if (!existingDb) {
+    if (!fs.existsSync(dbPath)) return null;
+    const stat = fs.statSync(dbPath);
+    if (stat.size === 0) return null;
+  }
+  const meta = existingDb
+    ? createConsistentBackup(existingDb, dbPath, { backupDir, kind })
+    : createConsistentBackup(dbPath, { backupDir, kind });
+  return meta.backupPath;
+}
+
+/**
+ * Lists all backup `.db` files in `backupDir` (ignoring incomplete `.tmp` staging files),
+ * verifying each backup's SQLite integrity and reading its sidecar metadata.
+ * Sorted newest-first.
+ */
+export function listBackups(backupDir: string): BackupMetadata[] {
+  if (!backupDir || !fs.existsSync(backupDir)) {
+    return [];
+  }
+
+  const entries = fs.readdirSync(backupDir);
+  const backups: BackupMetadata[] = [];
+
+  for (const entry of entries) {
+    // Never list temporary/staging files or hidden files as backups
+    if (
+      !entry.endsWith('.db') ||
+      entry.endsWith('.tmp') ||
+      entry.startsWith('.')
+    ) {
+      continue;
+    }
+
+    const fullPath = path.join(backupDir, entry);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(fullPath);
+      if (!stat.isFile()) continue;
+    } catch {
+      continue;
+    }
+
+    const metaPath = `${fullPath}.meta.json`;
+    let sidecar: Partial<BackupMetadata> = {};
+    if (fs.existsSync(metaPath)) {
+      try {
+        sidecar = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      } catch {}
+    }
+
+    const kind: BackupKind =
+      sidecar.kind === 'pre-migration' ||
+      sidecar.kind === 'pre-restore-safety' ||
+      sidecar.kind === 'manual'
+        ? sidecar.kind
+        : 'manual';
+
+    const verification = verifyDatabaseFileIntegrity(fullPath, {
+      requireCoreTables: kind !== 'pre-migration',
+    });
+
+    backups.push({
+      fileName: entry,
+      backupPath: fullPath,
+      createdAt: sidecar.createdAt || stat.mtime.toISOString(),
+      sizeBytes: stat.size,
+      verified: verification.valid,
+      integrityStatus: verification.valid
+        ? 'ok'
+        : verification.error || verification.integrityStatus,
+      schemaVersion: verification.valid
+        ? verification.schemaVersion
+        : Number(sidecar.schemaVersion || 0),
+      factsCount: verification.valid
+        ? verification.factsCount
+        : Number(sidecar.factsCount || 0),
+      kind,
+    });
+  }
+
+  backups.sort((a, b) => {
+    const timeDiff =
+      new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+    if (timeDiff !== 0) return timeDiff;
+    return b.fileName.localeCompare(a.fileName);
+  });
+
+  return backups;
+}
+
+/**
+ * Applies backup retention cleanup in `backupDir`, keeping up to `maxBackups` verified backups.
+ * SAFETY INVARIANT: Never deletes the last known-good (`verified: true`) backup.
+ */
+export function applyBackupRetention(
+  backupDir: string,
+  maxBackups: number = 10
+): BackupRetentionResult {
+  const effectiveMax = Math.max(1, Math.floor(Number(maxBackups) || 10));
+  if (!backupDir || !fs.existsSync(backupDir)) {
+    return {
+      maxBackups: effectiveMax,
+      keptCount: 0,
+      deletedCount: 0,
+      deletedFiles: [],
+      lastKnownGoodBackup: null,
+    };
+  }
+
+  cleanupIncompleteBackups(backupDir);
+
+  const allBackups = listBackups(backupDir);
+  const verifiedBackups = allBackups.filter((b) => b.verified);
+  const lastKnownGood = verifiedBackups.length > 0 ? verifiedBackups[0] : null;
+
+  if (verifiedBackups.length <= effectiveMax) {
+    return {
+      maxBackups: effectiveMax,
+      keptCount: allBackups.length,
+      deletedCount: 0,
+      deletedFiles: [],
+      lastKnownGoodBackup: lastKnownGood ? lastKnownGood.fileName : null,
+    };
+  }
+
+  const toDelete = verifiedBackups.slice(effectiveMax);
+  const deletedFiles: string[] = [];
+
+  for (const candidate of toDelete) {
+    // Never delete the last known-good backup under any circumstance
+    if (lastKnownGood && candidate.fileName === lastKnownGood.fileName) {
+      continue;
+    }
+    try {
+      if (fs.existsSync(candidate.backupPath)) {
+        fs.unlinkSync(candidate.backupPath);
+      }
+      for (const suffix of ['.meta.json', '-wal', '-shm']) {
+        const sidePath = `${candidate.backupPath}${suffix}`;
+        if (fs.existsSync(sidePath)) {
+          fs.unlinkSync(sidePath);
+        }
+      }
+      deletedFiles.push(candidate.fileName);
+    } catch {}
+  }
+
+  const remaining = listBackups(backupDir);
+  return {
+    maxBackups: effectiveMax,
+    keptCount: remaining.length,
+    deletedCount: deletedFiles.length,
+    deletedFiles,
+    lastKnownGoodBackup: lastKnownGood ? lastKnownGood.fileName : null,
+  };
+}
+
+/**
+ * Copies all Argon schema tables and auto-increment sequences from an attached source
+ * database schema (`sourceSchema`) into `main` inside a single atomic transaction.
+ */
+function copyDatabaseStateFromAttached(
+  targetDb: DatabaseSync,
+  attachedFilePath: string,
+  simulateApplyFailure?: boolean
+): void {
+  const escapedPath = attachedFilePath.replace(/'/g, "''");
+  targetDb.exec(`ATTACH DATABASE '${escapedPath}' AS restore_source`);
+  try {
+    targetDb.exec('BEGIN IMMEDIATE');
+    try {
+      for (const table of REQUIRED_CORE_TABLES) {
+        targetDb.exec(`DELETE FROM main.${table}`);
+        const cols = (
+          targetDb.prepare(`PRAGMA main.table_info(${table})`).all() as Array<{
+            name: string;
+          }>
+        ).map((c) => c.name);
+        const srcCols = (
+          targetDb
+            .prepare(`PRAGMA restore_source.table_info(${table})`)
+            .all() as Array<{ name: string }>
+        ).map((c) => c.name);
+        const sharedCols = cols.filter((c) => srcCols.includes(c));
+        if (sharedCols.length > 0) {
+          const colList = sharedCols.join(', ');
+          targetDb.exec(
+            `INSERT INTO main.${table} (${colList}) SELECT ${colList} FROM restore_source.${table}`
+          );
+        }
+      }
+
+      if (simulateApplyFailure) {
+        throw new Error(
+          'Simulated failure while applying staged restore to live database'
+        );
+      }
+
+      targetDb.exec('COMMIT');
+    } catch (err) {
+      try {
+        targetDb.exec('ROLLBACK');
+      } catch {}
+      throw err;
+    }
+  } finally {
+    try {
+      targetDb.exec('DETACH DATABASE restore_source');
+    } catch {}
+  }
+
+  try {
+    targetDb.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  } catch {}
+}
+
+/**
+ * Safely restores the database from a validated backup:
+ * 1. Validates the candidate backup file (`PRAGMA integrity_check`, header, tables).
+ * 2. Automatically creates a verified `pre-restore-safety` backup of the current live database.
+ * 3. Stages the candidate backup into a temporary file, runs any pending migrations on the staged copy,
+ *    and verifies the staged database (`PRAGMA integrity_check`) before touching the live database.
+ * 4. Applies the verified staged database transactionally (and checkpoints WAL).
+ * 5. Verifies the restored live database (`PRAGMA integrity_check`).
+ * 6. If any stage fails, preserves or automatically rolls back to the `pre-restore-safety` backup.
+ */
+export function restoreDatabaseFromBackup(
+  options: RestoreDatabaseOptions
+): RestoreDatabaseResult {
+  const { dbPath, backupPath } = options;
+  if (!backupPath || !fs.existsSync(backupPath)) {
+    throw new Error('Selected backup file does not exist');
+  }
+
+  // Step 1: Validate the candidate backup before doing anything else
+  const candidateVerification = verifyDatabaseFileIntegrity(backupPath, {
+    requireCoreTables: false,
+  });
+  if (!candidateVerification.valid) {
+    throw new Error(
+      `Cannot restore from invalid or corrupted backup: ${
+        candidateVerification.error || candidateVerification.integrityStatus
+      }`
+    );
+  }
+  if (!candidateVerification.tables.includes('facts')) {
+    throw new Error(
+      'Cannot restore: backup file does not contain a valid Argon facts table'
+    );
+  }
+
+  const targetBackupDir =
+    options.backupDir ||
+    (options.db && (options.db as any).__brainBackupDir) ||
+    (dbPath && dbPath !== ':memory:'
+      ? path.join(path.dirname(dbPath), 'backups')
+      : path.join(process.cwd(), 'data', 'backups'));
+
+  if (!fs.existsSync(targetBackupDir)) {
+    fs.mkdirSync(targetBackupDir, { recursive: true });
+  }
+
+  let liveDb: DatabaseSync | null = options.db || null;
+  let ownsLiveDb = false;
+  if (!liveDb) {
+    if (!dbPath || dbPath === ':memory:') {
+      throw new Error('A valid database path or open DatabaseSync instance is required');
+    }
+    const initialized = initializeDatabase(dbPath, {
+      seedOnBrandNewDb: false,
+      backupDir: targetBackupDir,
+    });
+    liveDb = initialized.db;
+    ownsLiveDb = true;
+  }
+
+  const stagingId = `${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const stagedRestorePath = path.join(
+    targetBackupDir,
+    `.restore_stage_${stagingId}.db.tmp`
+  );
+
+  try {
+    // Step 2: Create a verified safety backup of the current live database BEFORE restoring
+    const safetyBackup = createConsistentBackup(liveDb, dbPath, {
+      backupDir: targetBackupDir,
+      kind: 'pre-restore-safety',
+    });
+
+    if (!safetyBackup.verified) {
+      throw new Error(
+        'Aborted restore: failed to verify pre-restore safety backup of current database'
+      );
+    }
+
+    // Step 3: Stage the backup into a temporary file, migrate if older schema, and verify integrity
+    let candidateDb: DatabaseSync | null = null;
+    try {
+      candidateDb = new DatabaseSync(backupPath);
+      const escapedStage = stagedRestorePath.replace(/'/g, "''");
+      candidateDb.exec(`VACUUM INTO '${escapedStage}'`);
+    } finally {
+      if (candidateDb) {
+        try {
+          candidateDb.close();
+        } catch {}
+      }
+    }
+
+    if (options.simulateStageFailure) {
+      throw new Error('Simulated failure during restore staging verification');
+    }
+
+    // Ensure the staged database has all current migrations applied
+    let stageDb: DatabaseSync | null = null;
+    try {
+      stageDb = new DatabaseSync(stagedRestorePath);
+      runSchemaMigrations(stageDb);
+    } finally {
+      if (stageDb) {
+        try {
+          stageDb.close();
+        } catch {}
+      }
+    }
+
+    const stageVerification = verifyDatabaseFileIntegrity(stagedRestorePath, {
+      requireCoreTables: true,
+    });
+    if (!stageVerification.valid) {
+      throw new Error(
+        `Staged restore verification failed: ${
+          stageVerification.error || stageVerification.integrityStatus
+        }`
+      );
+    }
+
+    // Step 4: Apply the verified staged database to the live database, with automatic rollback on failure
+    try {
+      copyDatabaseStateFromAttached(
+        liveDb,
+        stagedRestorePath,
+        options.simulateApplyFailure
+      );
+
+      // Step 5: Verify the live database integrity after restore
+      const liveIntegrityRow = liveDb
+        .prepare('PRAGMA integrity_check')
+        .get() as { integrity_check?: string } | undefined;
+      if (
+        !liveIntegrityRow ||
+        String(liveIntegrityRow.integrity_check || '').toLowerCase() !== 'ok'
+      ) {
+        throw new Error(
+          `Post-restore integrity check failed: ${
+            liveIntegrityRow?.integrity_check || 'unknown'
+          }`
+        );
+      }
+    } catch (applyErr: any) {
+      // Step 6: Automatic rollback from the verified pre-restore safety backup
+      try {
+        copyDatabaseStateFromAttached(liveDb, safetyBackup.backupPath, false);
+      } catch {}
+      const rollbackErr = new Error(
+        `Restore failed and was safely rolled back to safety backup (${safetyBackup.fileName}): ${
+          applyErr?.message || 'Unknown error'
+        }`
+      );
+      (rollbackErr as any).rolledBack = true;
+      (rollbackErr as any).safetyBackup = safetyBackup;
+      throw rollbackErr;
+    }
+
+    const factsCountAfterRestore = (
+      liveDb.prepare('SELECT count(*) as count FROM facts').get() as {
+        count: number;
+      }
+    ).count;
+    const schemaVersionRow = liveDb
+      .prepare('SELECT MAX(version) as maxVer FROM schema_migrations')
+      .get() as { maxVer: number | null } | undefined;
+    const schemaVersionAfterRestore = Number(schemaVersionRow?.maxVer || 0);
+
+    const backupStat = fs.statSync(backupPath);
+    const restoredFrom: BackupMetadata = {
+      fileName: path.basename(backupPath),
+      backupPath,
+      createdAt: backupStat.mtime.toISOString(),
+      sizeBytes: backupStat.size,
+      verified: true,
+      integrityStatus: 'ok',
+      schemaVersion: candidateVerification.schemaVersion,
+      factsCount: candidateVerification.factsCount,
+      kind: 'manual',
+    };
+
+    return {
+      success: true,
+      restoredFrom,
+      safetyBackup,
+      factsCountAfterRestore,
+      schemaVersionAfterRestore,
+      integrityStatus: 'ok',
+    };
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) {
+      const p = `${stagedRestorePath}${suffix}`;
+      if (fs.existsSync(p)) {
+        try {
+          fs.unlinkSync(p);
+        } catch {}
+      }
+    }
+    if (ownsLiveDb && liveDb) {
+      try {
+        liveDb.close();
+      } catch {}
+    }
+  }
+}
+
+export interface MigrationDefinition {
   version: number;
   name: string;
   up: (db: DatabaseSync) => void;
 }
 
-const SCHEMA_MIGRATIONS: MigrationDefinition[] = [
+export const SCHEMA_MIGRATIONS: MigrationDefinition[] = [
   {
     version: 1,
     name: '001_initial_schema',
@@ -519,13 +1410,15 @@ const SCHEMA_MIGRATIONS: MigrationDefinition[] = [
 ];
 
 /**
- * Runs repeatable schema migrations and backs up the database file prior to migrating
- * if an existing database has user data and pending migrations.
+ * Runs repeatable, versioned, ordered schema migrations and creates a verified
+ * SQLite-consistent backup prior to migrating if an existing database has user data
+ * and pending migrations. Each migration executes in an atomic transaction.
  */
 export function runSchemaMigrations(
   db: DatabaseSync,
   dbPath?: string,
-  backupDir?: string
+  backupDir?: string,
+  customMigrations?: MigrationDefinition[]
 ): { appliedMigrations: string[]; backupPath: string | null } {
   db.exec(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -540,7 +1433,10 @@ export function runSchemaMigrations(
     .all() as { version: number; name: string }[];
   const appliedVersions = new Set(appliedRows.map((r) => r.version));
 
-  const pending = SCHEMA_MIGRATIONS.filter((m) => !appliedVersions.has(m.version));
+  const allMigrations = [...(customMigrations || SCHEMA_MIGRATIONS)].sort(
+    (a, b) => a.version - b.version
+  );
+  const pending = allMigrations.filter((m) => !appliedVersions.has(m.version));
   if (pending.length === 0) {
     return { appliedMigrations: [], backupPath: null };
   }
@@ -560,7 +1456,7 @@ export function runSchemaMigrations(
 
   let backupPath: string | null = null;
   if (hasExistingData && dbPath && dbPath !== ':memory:') {
-    backupPath = backupDatabaseFile(dbPath, backupDir);
+    backupPath = backupDatabaseFile(dbPath, backupDir, db, 'pre-migration');
   }
 
   const appliedMigrations: string[] = [];
@@ -580,7 +1476,9 @@ export function runSchemaMigrations(
       db.exec('COMMIT');
       appliedMigrations.push(migration.name);
     } catch (err) {
-      db.exec('ROLLBACK');
+      try {
+        db.exec('ROLLBACK');
+      } catch {}
       throw err;
     }
   }
@@ -660,6 +1558,10 @@ export interface InitializeDatabaseOptions {
    */
   forceSeedDemo?: boolean;
   forceDemoSeed?: boolean;
+  /**
+   * Optional custom migration list (used in automated tests to verify migration ordering and rollback).
+   */
+  customMigrations?: MigrationDefinition[];
 }
 
 export function initializeDatabase(
@@ -683,6 +1585,15 @@ export function initializeDatabase(
   const fileExistedBefore =
     dbPath !== ':memory:' && fs.existsSync(dbPath) && fs.statSync(dbPath).size > 0;
 
+  if (fileExistedBefore) {
+    const headerCheck = hasValidSqliteHeader(dbPath);
+    if (!headerCheck.valid) {
+      throw new Error(
+        `Malformed or corrupted SQLite database file at "${dbPath}": ${headerCheck.error}`
+      );
+    }
+  }
+
   if (dbPath !== ':memory:') {
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) {
@@ -690,85 +1601,118 @@ export function initializeDatabase(
     }
   }
 
+  const resolvedBackupDir =
+    options.backupDir ||
+    (dbPath !== ':memory:'
+      ? path.join(path.dirname(dbPath), 'backups')
+      : path.join(process.cwd(), 'data', 'backups'));
+
   const db = new DatabaseSync(dbPath);
+  (db as any).__brainDbPath = dbPath;
+  (db as any).__brainBackupDir = resolvedBackupDir;
 
-  // Check if facts table existed prior to running migrations
-  const hadFactsTable = Boolean(
-    db
-      .prepare(
-        `SELECT name FROM sqlite_master WHERE type='table' AND name='facts'`
-      )
-      .get()
-  );
-
-  const { appliedMigrations, backupPath } = runSchemaMigrations(
-    db,
-    dbPath,
-    options.backupDir
-  );
-
-  const initMeta = db
-    .prepare(`SELECT value FROM app_metadata WHERE key = 'db_initialized'`)
-    .get() as { value: string } | undefined;
-
-  const factsCount = (
-    db.prepare('SELECT count(*) as count FROM facts').get() as { count: number }
-  ).count;
-  const devicesCount = (
-    db.prepare('SELECT count(*) as count FROM companion_devices').get() as {
-      count: number;
+  try {
+    if (dbPath !== ':memory:') {
+      db.exec('PRAGMA journal_mode = WAL');
+      db.exec('PRAGMA synchronous = NORMAL');
     }
-  ).count;
-  const capturesCount = (
-    db.prepare('SELECT count(*) as count FROM companion_captures').get() as {
-      count: number;
+    db.exec('PRAGMA foreign_keys = ON');
+
+    // Verify SQLite structural integrity before migrating or serving
+    const integrityCheck = db
+      .prepare('PRAGMA integrity_check')
+      .get() as { integrity_check?: string } | undefined;
+    if (
+      !integrityCheck ||
+      String(integrityCheck.integrity_check || '').toLowerCase() !== 'ok'
+    ) {
+      throw new Error(
+        `Database integrity check failed on startup: ${
+          integrityCheck?.integrity_check || 'corrupted database'
+        }`
+      );
     }
-  ).count;
 
-  const isBrandNewDb =
-    !fileExistedBefore &&
-    !hadFactsTable &&
-    !initMeta &&
-    factsCount === 0 &&
-    devicesCount === 0 &&
-    capturesCount === 0;
+    // Check if facts table existed prior to running migrations
+    const hadFactsTable = Boolean(
+      db
+        .prepare(
+          `SELECT name FROM sqlite_master WHERE type='table' AND name='facts'`
+        )
+        .get()
+    );
 
-  let seededCount = 0;
-  if (options.forceSeedDemo || options.forceDemoSeed) {
-    seededCount = seedDemoFactsNonDestructive(db);
-  } else if (isBrandNewDb && options.seedOnBrandNewDb) {
-    seededCount = seedDemoFactsNonDestructive(db);
+    const { appliedMigrations, backupPath } = runSchemaMigrations(
+      db,
+      dbPath,
+      resolvedBackupDir,
+      options.customMigrations
+    );
+
+    const initMeta = db
+      .prepare(`SELECT value FROM app_metadata WHERE key = 'db_initialized'`)
+      .get() as { value: string } | undefined;
+
+    const factsCount = (
+      db.prepare('SELECT count(*) as count FROM facts').get() as {
+        count: number;
+      }
+    ).count;
+    const devicesCount = (
+      db.prepare('SELECT count(*) as count FROM companion_devices').get() as {
+        count: number;
+      }
+    ).count;
+    const capturesCount = (
+      db.prepare('SELECT count(*) as count FROM companion_captures').get() as {
+        count: number;
+      }
+    ).count;
+
+    const isBrandNewDb =
+      !fileExistedBefore &&
+      !hadFactsTable &&
+      !initMeta &&
+      factsCount === 0 &&
+      devicesCount === 0 &&
+      capturesCount === 0;
+
+    let seededCount = 0;
+    if (options.forceSeedDemo || options.forceDemoSeed) {
+      seededCount = seedDemoFactsNonDestructive(db);
+    } else if (isBrandNewDb && options.seedOnBrandNewDb) {
+      seededCount = seedDemoFactsNonDestructive(db);
+    }
+
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO app_metadata (key, value, updated_at)
+       VALUES ('db_initialized', '1', ?)
+       ON CONFLICT(key) DO UPDATE SET updated_at = excluded.updated_at`
+    ).run(now);
+
+    return {
+      db,
+      dbPath,
+      isBrandNew: isBrandNewDb,
+      isBrandNewDb,
+      appliedMigrations,
+      backupPath,
+      seededCount,
+    };
+  } catch (err) {
+    try {
+      db.close();
+    } catch {}
+    throw err;
   }
-
-  const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO app_metadata (key, value, updated_at)
-     VALUES ('db_initialized', '1', ?)
-     ON CONFLICT(key) DO UPDATE SET updated_at = excluded.updated_at`
-  ).run(now);
-
-  return {
-    db,
-    dbPath,
-    isBrandNew: isBrandNewDb,
-    isBrandNewDb,
-    appliedMigrations,
-    backupPath,
-    seededCount,
-  };
 }
 
 /**
- * Resolves the server bind host: defaults to 127.0.0.1 unless BRAIN_ALLOW_LAN=true
- * or BRAIN_HOST is explicitly configured.
+ * Resolves the server bind host.
+ * LAN and remote access are explicitly deferred in this phase; Argon binds strictly to 127.0.0.1.
  */
-export function resolveBindHost(env: NodeJS.ProcessEnv = process.env): string {
-  if (env.BRAIN_ALLOW_LAN === 'true') {
-    return '0.0.0.0';
-  }
-  if (env.BRAIN_HOST && env.BRAIN_HOST.trim()) {
-    return env.BRAIN_HOST.trim();
-  }
+export function resolveBindHost(_env: NodeJS.ProcessEnv = process.env): string {
   return '127.0.0.1';
 }
 
@@ -979,11 +1923,38 @@ export function serializeCompanionCaptureRow(row: any) {
   };
 }
 
+export interface CreateBrainAppOptions {
+  dbPath?: string;
+  backupDir?: string;
+}
+
+function formatSafeDisplayPath(targetPath: string): string {
+  if (!targetPath || targetPath === ':memory:') return ':memory:';
+  const rel = path.relative(process.cwd(), targetPath).replace(/\\/g, '/');
+  if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+    return rel;
+  }
+  return path.basename(targetPath);
+}
+
 /**
  * Creates the Express application wired to the provided SQLite DatabaseSync instance.
  */
-export function createBrainApp(db: DatabaseSync) {
+export function createBrainApp(
+  db: DatabaseSync,
+  options: CreateBrainAppOptions = {}
+) {
   const app = express();
+  const resolvedDbPath: string =
+    options.dbPath ||
+    (db as any).__brainDbPath ||
+    path.join(process.cwd(), 'data', 'brain.db');
+  const resolvedBackupDir: string =
+    options.backupDir ||
+    (db as any).__brainBackupDir ||
+    (resolvedDbPath !== ':memory:'
+      ? path.join(path.dirname(resolvedDbPath), 'backups')
+      : path.join(process.cwd(), 'data', 'backups'));
 
   app.use(express.json({ limit: '20mb' }));
   app.use(express.urlencoded({ extended: true, limit: '20mb' }));
@@ -1103,6 +2074,122 @@ export function createBrainApp(db: DatabaseSync) {
     return Array.from(new Set([...defaults, ...found]));
   }
 
+  function getConfiguredRetentionCount(): number {
+    try {
+      const row = db
+        .prepare(
+          `SELECT value FROM app_metadata WHERE key = 'backup_retention_count'`
+        )
+        .get() as { value: string } | undefined;
+      if (row && row.value) {
+        const parsed = Number.parseInt(row.value, 10);
+        if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 100) {
+          return parsed;
+        }
+      }
+    } catch {}
+    return 10;
+  }
+
+  function setConfiguredRetentionCount(maxBackups: number): number {
+    const clamped = Math.max(1, Math.min(100, Math.floor(maxBackups)));
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO app_metadata (key, value, updated_at)
+       VALUES ('backup_retention_count', ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    ).run(String(clamped), now);
+    return clamped;
+  }
+
+  function buildDatabaseStatusPayload() {
+    const factsCount = (
+      db.prepare('SELECT count(*) as count FROM facts').get() as { count: number }
+    ).count;
+    const activeDevicesCount = (
+      db
+        .prepare(
+          'SELECT count(*) as count FROM companion_devices WHERE revoked_at IS NULL'
+        )
+        .get() as { count: number }
+    ).count;
+    const capturesCount = (
+      db.prepare('SELECT count(*) as count FROM companion_captures').get() as {
+        count: number;
+      }
+    ).count;
+    const migrations = db
+      .prepare(
+        'SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC'
+      )
+      .all() as Array<{ version: number; name: string; applied_at: string }>;
+    const schemaVersion =
+      migrations.length > 0 ? migrations[migrations.length - 1].version : 0;
+
+    let journalMode = 'memory';
+    try {
+      const jmRow = db.prepare('PRAGMA journal_mode').get() as
+        | { journal_mode?: string }
+        | undefined;
+      if (jmRow?.journal_mode) {
+        journalMode = String(jmRow.journal_mode).toLowerCase();
+      }
+    } catch {}
+
+    let integrityStatus = 'ok';
+    try {
+      const icRow = db.prepare('PRAGMA quick_check').get() as
+        | { quick_check?: string }
+        | undefined;
+      if (icRow?.quick_check) {
+        integrityStatus = String(icRow.quick_check).toLowerCase();
+      }
+    } catch {
+      integrityStatus = 'error';
+    }
+
+    let dbSizeBytes = 0;
+    if (resolvedDbPath !== ':memory:' && fs.existsSync(resolvedDbPath)) {
+      try {
+        dbSizeBytes = fs.statSync(resolvedDbPath).size;
+      } catch {}
+    }
+
+    const maxBackups = getConfiguredRetentionCount();
+    const backups = listBackups(resolvedBackupDir).map((b) => ({
+      ...b,
+      backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${b.fileName}`,
+    }));
+    const verifiedBackups = backups.filter((b) => b.verified);
+
+    return {
+      status: integrityStatus === 'ok' ? 'healthy' : 'degraded',
+      engine: 'SQLite (node:sqlite)',
+      journalMode,
+      integrityStatus,
+      schemaVersion,
+      appliedMigrations: migrations,
+      dbLocation: formatSafeDisplayPath(resolvedDbPath),
+      backupLocation: `${formatSafeDisplayPath(resolvedBackupDir)}/`,
+      dbSizeBytes,
+      factsCount,
+      brainsCount: getBrainList().length,
+      brains: getBrainList(),
+      devicesCount: activeDevicesCount,
+      capturesCount,
+      retention: {
+        maxBackups,
+      },
+      backupsSummary: {
+        totalBackups: backups.length,
+        verifiedBackups: verifiedBackups.length,
+        latestBackupAt: verifiedBackups[0]?.createdAt || null,
+        latestBackupFileName: verifiedBackups[0]?.fileName || null,
+      },
+      backups,
+    };
+  }
+
   // 1. Status API
   app.get('/api/status', (_req: Request, res: Response) => {
     const count = (
@@ -1125,6 +2212,236 @@ export function createBrainApp(db: DatabaseSync) {
       geminiLiveTest: Boolean(process.env.GEMINI_API_KEY),
     });
   });
+
+  // 1a. Database & Backup Settings APIs
+  app.get('/api/database/status', (_req: Request, res: Response) => {
+    try {
+      res.json(buildDatabaseStatusPayload());
+    } catch (err: any) {
+      res.status(500).json({
+        error: err?.message || 'Failed to read database status',
+        code: 'DATABASE_STATUS_FAILED',
+      });
+    }
+  });
+
+  app.get('/api/database/backups', (_req: Request, res: Response) => {
+    try {
+      const maxBackups = getConfiguredRetentionCount();
+      const backups = listBackups(resolvedBackupDir).map((b) => ({
+        ...b,
+        backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${b.fileName}`,
+      }));
+      res.json({
+        backups,
+        backupLocation: `${formatSafeDisplayPath(resolvedBackupDir)}/`,
+        retention: { maxBackups },
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        error: err?.message || 'Failed to list database backups',
+        code: 'BACKUP_LIST_FAILED',
+      });
+    }
+  });
+
+  app.post('/api/database/backups', (req: Request, res: Response) => {
+    try {
+      if (req.headers['x-simulate-failure'] === 'true') {
+        return res.status(500).json({
+          error: 'Simulated backup creation failure',
+          code: 'BACKUP_FAILED',
+        });
+      }
+      const maxBackups = getConfiguredRetentionCount();
+      const created = createConsistentBackup(db, resolvedDbPath, {
+        backupDir: resolvedBackupDir,
+        kind: 'manual',
+      });
+      const retentionResult = applyBackupRetention(
+        resolvedBackupDir,
+        maxBackups
+      );
+      const backups = listBackups(resolvedBackupDir).map((b) => ({
+        ...b,
+        backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${b.fileName}`,
+      }));
+      res.status(201).json({
+        success: true,
+        backup: {
+          ...created,
+          backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${created.fileName}`,
+        },
+        retentionResult,
+        backups,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        error: err?.message || 'Failed to create consistent SQLite backup',
+        code: 'BACKUP_FAILED',
+      });
+    }
+  });
+
+  app.get(
+    '/api/database/backups/:fileName/download',
+    (req: Request, res: Response) => {
+      const rawName = String(req.params.fileName || '').trim();
+      if (
+        !rawName ||
+        !/^[a-zA-Z0-9_.-]+\.db$/.test(rawName) ||
+        rawName.includes('..') ||
+        rawName.endsWith('.tmp')
+      ) {
+        return res.status(400).json({
+          error: 'Invalid backup file name',
+          code: 'INVALID_BACKUP_FILENAME',
+        });
+      }
+
+      const targetPath = path.join(resolvedBackupDir, rawName);
+      if (!fs.existsSync(targetPath)) {
+        return res.status(404).json({
+          error: 'Backup file not found',
+          code: 'BACKUP_NOT_FOUND',
+        });
+      }
+
+      const verification = verifyDatabaseFileIntegrity(targetPath, {
+        requireCoreTables: false,
+      });
+      if (!verification.valid) {
+        return res.status(400).json({
+          error: `Backup file failed integrity verification and cannot be exported: ${
+            verification.error || verification.integrityStatus
+          }`,
+          code: 'BACKUP_CORRUPTED',
+        });
+      }
+
+      res.setHeader('Content-Type', 'application/x-sqlite3');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${rawName}"`
+      );
+      res.setHeader('Content-Length', String(verification.sizeBytes));
+      const stream = fs.createReadStream(targetPath);
+      stream.on('error', () => {
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'Failed to stream backup file' });
+        }
+      });
+      stream.pipe(res);
+    }
+  );
+
+  app.post('/api/database/restore', (req: Request, res: Response) => {
+    const rawName =
+      typeof req.body?.fileName === 'string' ? req.body.fileName.trim() : '';
+    const confirm = req.body?.confirm === true;
+
+    if (!confirm) {
+      return res.status(400).json({
+        error:
+          'Explicit confirmation (confirm: true) is required before restoring a database backup.',
+        code: 'RESTORE_CONFIRMATION_REQUIRED',
+      });
+    }
+
+    if (
+      !rawName ||
+      !/^[a-zA-Z0-9_.-]+\.db$/.test(rawName) ||
+      rawName.includes('..') ||
+      rawName.endsWith('.tmp')
+    ) {
+      return res.status(400).json({
+        error: 'Invalid backup file name',
+        code: 'INVALID_BACKUP_FILENAME',
+      });
+    }
+
+    const candidatePath = path.join(resolvedBackupDir, rawName);
+    if (!fs.existsSync(candidatePath)) {
+      return res.status(404).json({
+        error: `Backup "${rawName}" does not exist in ${formatSafeDisplayPath(
+          resolvedBackupDir
+        )}/`,
+        code: 'BACKUP_NOT_FOUND',
+      });
+    }
+
+    try {
+      const simulateApplyFailure =
+        req.headers['x-simulate-failure'] === 'true' ||
+        req.body?.simulateApplyFailure === true;
+      const result = restoreDatabaseFromBackup({
+        db,
+        dbPath: resolvedDbPath,
+        backupPath: candidatePath,
+        backupDir: resolvedBackupDir,
+        simulateApplyFailure,
+      });
+
+      res.json({
+        success: true,
+        message: `Restored database from ${result.restoredFrom.fileName}. A pre-restore safety backup was saved as ${result.safetyBackup.fileName}.`,
+        restoredFrom: {
+          ...result.restoredFrom,
+          backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${
+            result.restoredFrom.fileName
+          }`,
+        },
+        safetyBackup: {
+          ...result.safetyBackup,
+          backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${
+            result.safetyBackup.fileName
+          }`,
+        },
+        status: buildDatabaseStatusPayload(),
+      });
+    } catch (err: any) {
+      const isRolledBack = Boolean(err?.rolledBack);
+      const statusCode = isRolledBack ? 500 : 400;
+      res.status(statusCode).json({
+        error: err?.message || 'Database restore failed',
+        code: isRolledBack ? 'RESTORE_ROLLED_BACK' : 'RESTORE_REJECTED',
+        rolledBack: isRolledBack,
+        safetyBackupFileName: err?.safetyBackup?.fileName || null,
+      });
+    }
+  });
+
+  app.post('/api/database/retention', (req: Request, res: Response) => {
+    const rawMax = Number(req.body?.maxBackups);
+    if (!Number.isInteger(rawMax) || rawMax < 1 || rawMax > 100) {
+      return res.status(400).json({
+        error: 'Retention count (maxBackups) must be a whole number between 1 and 100.',
+        code: 'INVALID_RETENTION_COUNT',
+      });
+    }
+
+    try {
+      const savedMax = setConfiguredRetentionCount(rawMax);
+      const retentionResult = applyBackupRetention(resolvedBackupDir, savedMax);
+      const backups = listBackups(resolvedBackupDir).map((b) => ({
+        ...b,
+        backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${b.fileName}`,
+      }));
+
+      res.json({
+        success: true,
+        maxBackups: savedMax,
+        retentionResult,
+        backups,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        error: err?.message || 'Failed to apply backup retention policy',
+        code: 'RETENTION_FAILED',
+      });
+    }
+  });
+
 
   // 1b. Browser Companion Device Tokens API (All protected)
   app.get(
