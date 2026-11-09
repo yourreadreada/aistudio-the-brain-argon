@@ -1,4 +1,4 @@
-// Web AI Companion: ChatGPT, Claude, and Gemini Web Connector
+// Web AI & GitHub Companion: ChatGPT, Claude, Gemini & GitHub Repository Connector
 // Runs in the extension's popup context
 
 const apiUrlInput = document.getElementById('apiUrl');
@@ -9,6 +9,7 @@ const captureProjectBtn = document.getElementById('captureProjectBtn');
 const saveBtn = document.getElementById('saveBtn');
 const copyBtn = document.getElementById('copyBtn');
 const statusEl = document.getElementById('status');
+const scanMetricsEl = document.getElementById('scanMetrics');
 const unreachableNoticeEl = document.getElementById('unreachableNotice');
 const serverDot = document.getElementById('serverDot');
 const serverText = document.getElementById('serverText');
@@ -24,8 +25,20 @@ function getAuthHeaders(extra = {}) {
 }
 
 function setStatus(text, kind) {
+  if (!statusEl) return;
   statusEl.textContent = text;
   statusEl.className = kind || '';
+}
+
+function setScanMetrics(metrics) {
+  if (!scanMetricsEl) return;
+  if (!metrics || typeof metrics.discovered !== 'number') {
+    scanMetricsEl.style.display = 'none';
+    scanMetricsEl.textContent = '';
+    return;
+  }
+  scanMetricsEl.style.display = 'block';
+  scanMetricsEl.textContent = `Scan summary: ${metrics.discovered} discovered · ${metrics.captured} captured · ${metrics.skipped} skipped · ${metrics.failed} failed`;
 }
 
 function setUnreachableNotice(unreachableResources) {
@@ -44,7 +57,17 @@ function setUnreachableNotice(unreachableResources) {
       ? ` +${unreachableResources.length - 3} more`
       : '';
   unreachableNoticeEl.style.display = 'block';
-  unreachableNoticeEl.textContent = `Note: ${unreachableResources.length} attachment(s) could not be read directly from the browser DOM: ${names}${extra}. Download and drop binary files into Capture Hub → Import & Review.`;
+  unreachableNoticeEl.textContent = `Notice (${unreachableResources.length} skipped/binary resource(s)): ${names}${extra}. Download binary files directly and drop into Capture Hub → Import & Review.`;
+}
+
+async function readBackendError(res) {
+  try {
+    const data = await res.json();
+    if (data && data.error) {
+      return `${data.error} (HTTP ${res.status})`;
+    }
+  } catch {}
+  return `Server returned HTTP ${res.status}`;
 }
 
 async function checkServer() {
@@ -61,10 +84,13 @@ async function checkServer() {
       const current = brainSelect.value;
       brainSelect.innerHTML = list.map((b) => `<option value="${b}">${b}</option>`).join('');
       if (list.includes(current)) brainSelect.value = current;
+    } else if (res.status === 401) {
+      serverDot.className = 'server-status offline';
+      serverText.textContent = 'Auth Error (Check Device Token)';
     } else {
       throw new Error(`HTTP ${res.status}`);
     }
-  } catch (err) {
+  } catch {
     serverDot.className = 'server-status offline';
     serverText.textContent = 'Offline (Check Brain URL)';
   }
@@ -76,14 +102,13 @@ async function init() {
   if (stored.lastBrain) brainSelect.value = stored.lastBrain;
   if (stored.deviceToken && deviceTokenInput) deviceTokenInput.value = stored.deviceToken;
 
-  // Check active tab host
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tab?.url) {
       if (tab.url.includes('chatgpt.com')) targetSite.textContent = 'Active: ChatGPT Web';
       else if (tab.url.includes('claude.ai')) targetSite.textContent = 'Active: Claude Web';
       else if (tab.url.includes('gemini.google.com')) targetSite.textContent = 'Active: Gemini Web';
-      else if (tab.url.includes('github.com')) targetSite.textContent = 'Active: GitHub';
+      else if (tab.url.includes('github.com')) targetSite.textContent = 'Active: GitHub Repo';
       else targetSite.textContent = 'Web Page';
     }
   } catch {}
@@ -91,9 +116,6 @@ async function init() {
   await checkServer();
 }
 
-/**
- * Builds formatted context block from a brain's facts
- */
 function buildContextPrimer(brain, facts) {
   if (!facts || facts.length === 0) {
     return `[BRAIN CONTEXT: ${brain.toUpperCase()}]\nNo facts stored yet in this brain.`;
@@ -116,9 +138,6 @@ function buildContextPrimer(brain, facts) {
   return lines.join('\n');
 }
 
-/**
- * Script injected into the active page to insert text into the chat prompt
- */
 function injectTextIntoChat(contextText) {
   const host = window.location.hostname;
   let inputEl = null;
@@ -162,9 +181,6 @@ function injectTextIntoChat(contextText) {
   return { success: true };
 }
 
-/**
- * Script injected into the page to extract dialogue turns
- */
 function extractConversation() {
   const host = window.location.hostname;
   const turns = [];
@@ -211,14 +227,25 @@ function extractConversation() {
 }
 
 /**
- * Script injected into the active tab to capture project-associated documents,
- * custom instructions, Claude Artifacts / ChatGPT Canvas blocks, code blocks,
- * and conversation context with full provenance. Also detects opaque binary
- * attachments that cannot be read directly from the browser DOM.
+ * Self-contained async active-tab scanner injected via chrome.scripting.executeScript.
+ * Captures:
+ * - Deliberate GitHub repository context (metadata, file tree, README, active blob, and up to 6 readable repo files via session fetch)
+ * - Project instructions / custom prompts
+ * - Claude Artifacts / ChatGPT Canvas documents
+ * - Open project knowledge documents (while reporting binary attachment cards honestly)
+ * - Code blocks
+ * - Conversation turns
+ * Prevents duplicate captures within a single scan, avoids silent content truncation, and reports scan counts.
  */
-function extractProjectAndResources() {
-  const host = window.location.hostname;
+async function extractProjectAndResources() {
+  const MAX_CONTENT_CHARS = 480000;
+  const MAX_GITHUB_FILE_FETCHES = 6;
+  const BINARY_EXT_RE = /\.(pdf|docx|doc|xlsx|xls|pptx|ppt|zip|tar|gz|7z|rar|png|jpg|jpeg|gif|webp|ico|mp3|mp4|wav|mov|avi|woff|woff2|ttf|otf|eot|exe|dll|so|dylib|bin|wasm|pyc|class|jar)$/i;
+  const READABLE_TEXT_EXT_RE = /\.(md|markdown|txt|ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|c|cpp|h|hpp|cs|rb|php|swift|kt|sql|sh|bash|zsh|yaml|yml|toml|ini|env\.example|dockerfile|makefile|html|css|scss|csv|xml|json)$/i;
+
+  const host = window.location.hostname.toLowerCase();
   const pageUrl = window.location.href;
+  const origin = window.location.origin;
   const rawTitle = document.title
     ? document.title.replace(/\s*[-|·]\s*(ChatGPT|Claude|Gemini|GitHub).*$/i, '').trim()
     : 'Captured Workspace';
@@ -229,47 +256,153 @@ function extractProjectAndResources() {
   else if (host.includes('gemini.google.com')) detectedSource = 'gemini';
   else if (host.includes('github.com')) detectedSource = 'github';
 
-  // Detect active Project / Workspace name when inside Claude Projects, ChatGPT Projects, or GitHub repos
+  function parseGitHubRepoUrl(urlStr) {
+    try {
+      const parsed = new URL(urlStr);
+      if (!parsed.hostname.includes('github.com')) return null;
+      const segments = parsed.pathname.split('/').filter(Boolean);
+      if (segments.length < 2) return null;
+      const reserved = new Set([
+        'settings', 'notifications', 'explore', 'marketplace', 'pulls',
+        'issues', 'codespaces', 'sponsors', 'orgs', 'users', 'login',
+        'signup', 'features', 'pricing', 'search'
+      ]);
+      const owner = segments[0];
+      const repo = segments[1].replace(/\.git$/i, '');
+      if (reserved.has(owner.toLowerCase())) return null;
+      if (segments.length === 2) {
+        return { isGitHubRepo: true, owner, repo, branch: 'HEAD', viewType: 'repo_root', relativePath: '' };
+      }
+      const action = segments[2];
+      if (action === 'tree' || action === 'blob') {
+        return {
+          isGitHubRepo: true,
+          owner,
+          repo,
+          branch: segments[3] || 'HEAD',
+          viewType: action,
+          relativePath: segments.slice(4).join('/'),
+        };
+      }
+      return {
+        isGitHubRepo: true,
+        owner,
+        repo,
+        branch: 'HEAD',
+        viewType: 'other',
+        relativePath: segments.slice(2).join('/'),
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function inferFileType(fileName, fallback = 'md') {
+    const ext = (fileName.split('.').pop() || '').toLowerCase();
+    if (ext === 'pdf') return 'pdf';
+    if (['docx', 'doc'].includes(ext)) return 'docx';
+    if (['xlsx', 'xls', 'csv'].includes(ext)) return 'xlsx';
+    if (['pptx', 'ppt'].includes(ext)) return 'pptx';
+    if (['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'rs', 'go', 'java', 'c', 'cpp', 'h', 'cs', 'rb', 'php', 'swift', 'kt', 'sql', 'sh', 'yaml', 'yml', 'toml', 'json', 'html', 'css'].includes(ext)) {
+      return 'code';
+    }
+    if (['md', 'markdown', 'txt'].includes(ext)) return 'md';
+    return fallback;
+  }
+
+  function normalizeSig(raw) {
+    return String(raw || '')
+      .replace(/\r\n/g, '\n')
+      .replace(/^#\s+[^\n]+\n+/i, '')
+      .replace(/^>\s*Provenance:[^\n]+\n*/gim, '')
+      .replace(/^>\s*Project:[^\n]+\n*/gim, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  const ghInfo = parseGitHubRepoUrl(pageUrl);
   let projectName = '';
-  const projectHeading =
-    document.querySelector('[data-testid="project-title"], [data-testid="project-name"], nav a[href*="/project/"], nav a[href*="/g/"]') ||
-    document.querySelector('header h1, [role="navigation"] h2');
-  if (projectHeading && projectHeading.innerText?.trim()) {
-    projectName = projectHeading.innerText.trim().slice(0, 80);
-  } else if (pageUrl.includes('/project/') || pageUrl.includes('/projects/')) {
-    projectName = rawTitle;
+  if (ghInfo?.isGitHubRepo) {
+    projectName = `${ghInfo.owner}/${ghInfo.repo}`;
+  } else {
+    const projectHeading =
+      document.querySelector('[data-testid="project-title"], [data-testid="project-name"], nav a[href*="/project/"], nav a[href*="/g/"]') ||
+      document.querySelector('header h1, [role="navigation"] h2');
+    if (projectHeading && projectHeading.innerText?.trim()) {
+      projectName = projectHeading.innerText.trim().slice(0, 80);
+    } else if (pageUrl.includes('/project/') || pageUrl.includes('/projects/')) {
+      projectName = rawTitle;
+    }
   }
 
   const items = [];
   const unreachableResources = [];
   const seenSignatures = new Set();
+  const seenPaths = new Set();
+  const metrics = { discovered: 0, captured: 0, skipped: 0, failed: 0 };
 
-  function addItem({ title, fileName, filePath, fileType, content, resourceKind, tags }) {
-    const clean = (content || '').trim();
-    if (!clean || clean.length < 12) return;
-    const sig = `${resourceKind}:${title}:${clean.slice(0, 120)}:${clean.length}`;
-    if (seenSignatures.has(sig)) return;
-    seenSignatures.add(sig);
+  function addUnreachable(name, kind, reason) {
+    const cleanName = String(name || '').trim();
+    if (!cleanName) return;
+    if (unreachableResources.some((u) => u.name === cleanName && u.reason === reason)) return;
+    unreachableResources.push({ name: cleanName, kind, reason });
+  }
+
+  function addItem({ title, fileName, filePath, fileType, content, resourceKind, tags, provenanceUrl }) {
+    metrics.discovered++;
+    const clean = String(content || '').trim();
+    if (!clean || clean.length < 12) {
+      metrics.skipped++;
+      return false;
+    }
+    const sig = normalizeSig(clean);
+    if (!sig || seenSignatures.has(sig)) {
+      metrics.skipped++;
+      return false;
+    }
 
     const slug =
       (title || 'resource')
-        .replace(/[^a-zA-Z0-9_-]+/g, '_')
+        .replace(/[^a-zA-Z0-9._-]+/g, '_')
         .replace(/^_+|_+$/g, '')
         .toLowerCase() || `resource_${items.length + 1}`;
-    const resolvedFileName = fileName || `${slug}.md`;
-    const folderPrefix = projectName
-      ? `${detectedSource}-project/${projectName.replace(/[^a-zA-Z0-9_-]+/g, '_')}`
+    const resolvedFileName = fileName || (/\.[a-z0-9]{1,6}$/i.test(slug) ? slug : `${slug}.md`);
+    const folderPrefix = ghInfo?.isGitHubRepo
+      ? `${ghInfo.owner}/${ghInfo.repo}`
+      : projectName
+      ? `${detectedSource}-project/${projectName.replace(/[^a-zA-Z0-9._-]+/g, '_')}`
       : `${detectedSource}-companion`;
+    const resolvedFilePath = filePath || `${folderPrefix}/${resolvedFileName}`;
+
+    if (seenPaths.has(resolvedFilePath.toLowerCase()) && seenSignatures.has(sig)) {
+      metrics.skipped++;
+      return false;
+    }
+
+    let finalContent = clean;
+    if (clean.length > MAX_CONTENT_CHARS) {
+      const notice = `\n\n> [Notice: Resource exceeded ${MAX_CONTENT_CHARS.toLocaleString()} character staging limit (original: ${clean.length.toLocaleString()} chars). Download full file directly for complete archive import.]`;
+      finalContent = clean.slice(0, MAX_CONTENT_CHARS - notice.length) + notice;
+      addUnreachable(
+        resolvedFileName,
+        resourceKind || 'document',
+        `Content (${clean.length.toLocaleString()} chars) exceeded ${MAX_CONTENT_CHARS.toLocaleString()} char per-item staging limit`
+      );
+    }
+
+    seenSignatures.add(sig);
+    seenPaths.add(resolvedFilePath.toLowerCase());
 
     items.push({
       title: title || resolvedFileName,
       fileName: resolvedFileName,
-      filePath: filePath || `${folderPrefix}/${resolvedFileName}`,
-      fileType: fileType || 'md',
-      content: clean,
+      filePath: resolvedFilePath,
+      fileType: fileType || inferFileType(resolvedFileName, 'md'),
+      content: finalContent,
       source: detectedSource,
       projectName: projectName || undefined,
-      provenanceUrl: pageUrl,
+      provenanceUrl: provenanceUrl || pageUrl,
       resourceKind: resourceKind || 'document',
       tags: Array.from(
         new Set([
@@ -280,9 +413,233 @@ function extractProjectAndResources() {
         ])
       ),
     });
+    metrics.captured++;
+    return true;
   }
 
-  // 1. Capture Project Instructions / Custom System Prompts if visible in the DOM
+  // A. DELIBERATE GITHUB REPOSITORY SCANNING
+  if (ghInfo?.isGitHubRepo) {
+    const repoFullName = `${ghInfo.owner}/${ghInfo.repo}`;
+    const aboutEl =
+      document.querySelector('.BorderGrid-cell p.f4, [data-testid="repository-description"], .repository-content .f4') ||
+      document.querySelector('meta[name="description"]');
+    const description =
+      aboutEl?.getAttribute?.('content') ||
+      aboutEl?.innerText?.trim() ||
+      `GitHub repository ${repoFullName}`;
+    const topics = Array.from(document.querySelectorAll('a.topic-tag, [data-testid="topic-tag"]'))
+      .map((el) => el.innerText?.trim())
+      .filter(Boolean)
+      .slice(0, 15);
+    const branchEl = document.querySelector(
+      '[data-hotkey="w"] span, #branch-picker-repos-header-ref-selector span, summary[title="Switch branches or tags"] span'
+    );
+    const detectedBranch =
+      branchEl?.innerText?.trim() || (ghInfo.branch !== 'HEAD' ? ghInfo.branch : 'main');
+
+    const treeLinks = Array.from(
+      document.querySelectorAll(
+        'a[href*="/blob/"], a[href*="/tree/"], [data-testid="tree-item-file-name"], .react-directory-filename-column a'
+      )
+    );
+    const treeEntries = [];
+    const seenTreePaths = new Set();
+
+    for (const linkEl of treeLinks) {
+      const href = (linkEl.getAttribute('href') || '').trim();
+      const nameText = (linkEl.innerText || '').trim();
+      if (!href && !nameText) continue;
+      const fullUrl = href.startsWith('/') ? `${origin}${href}` : href;
+      const parsedLink = fullUrl ? parseGitHubRepoUrl(fullUrl) : null;
+      if (
+        parsedLink &&
+        parsedLink.owner.toLowerCase() === ghInfo.owner.toLowerCase() &&
+        parsedLink.repo.toLowerCase() === ghInfo.repo.toLowerCase() &&
+        (parsedLink.viewType === 'blob' || parsedLink.viewType === 'tree') &&
+        parsedLink.relativePath
+      ) {
+        const key = `${parsedLink.viewType}:${parsedLink.relativePath}`;
+        if (!seenTreePaths.has(key)) {
+          seenTreePaths.add(key);
+          treeEntries.push({
+            name: parsedLink.relativePath.split('/').pop() || nameText || parsedLink.relativePath,
+            path: parsedLink.relativePath,
+            kind: parsedLink.viewType,
+            href: fullUrl,
+            branch: parsedLink.branch || detectedBranch,
+          });
+        }
+      }
+    }
+
+    if (description || treeEntries.length > 0) {
+      const treeLines = treeEntries.map(
+        (entry) => `- \`${entry.kind === 'tree' ? entry.path + '/' : entry.path}\` (${entry.kind === 'tree' ? 'directory' : 'file'})`
+      );
+      const overviewMd = [
+        `# ${repoFullName} — Repository Overview`,
+        '',
+        `> Provenance: ${pageUrl}`,
+        `> Repository: \`${repoFullName}\``,
+        `> Active Branch: \`${detectedBranch}\``,
+        topics.length > 0 ? `> Topics: ${topics.map((t) => `\`#${t}\``).join(' ')}` : '',
+        '',
+        `## Description`,
+        description,
+        '',
+        treeLines.length > 0 ? `## Visible Repository File Tree (${treeEntries.length} entries)` : '',
+        ...treeLines,
+      ]
+        .filter((line) => line !== '')
+        .join('\n');
+
+      addItem({
+        title: `${repoFullName} — Repository Overview`,
+        fileName: 'REPOSITORY_OVERVIEW.md',
+        filePath: `${repoFullName}/REPOSITORY_OVERVIEW.md`,
+        fileType: 'md',
+        content: overviewMd,
+        resourceKind: 'document',
+        tags: ['github-repo', 'repository-metadata', ...topics.slice(0, 5)],
+      });
+    }
+
+    const readmeEl = document.querySelector(
+      '[data-testid="readme"] article, article.markdown-body, #readme .markdown-body, readme-toc article'
+    );
+    const readmeText = readmeEl?.innerText?.trim() || '';
+    if (readmeText && readmeText.length >= 20) {
+      addItem({
+        title: `${repoFullName} — README.md`,
+        fileName: 'README.md',
+        filePath: ghInfo.relativePath ? `${repoFullName}/${ghInfo.relativePath}/README.md` : `${repoFullName}/README.md`,
+        fileType: 'md',
+        content: `# ${repoFullName} — README\n\n> Provenance: ${pageUrl}\n\n${readmeText}`,
+        resourceKind: 'document',
+        tags: ['github-readme', 'documentation'],
+      });
+    }
+
+    if (ghInfo.viewType === 'blob' && ghInfo.relativePath) {
+      const blobFileName = ghInfo.relativePath.split('/').pop() || 'file.txt';
+      if (BINARY_EXT_RE.test(blobFileName)) {
+        metrics.discovered++;
+        metrics.skipped++;
+        addUnreachable(
+          ghInfo.relativePath,
+          blobFileName.split('.').pop()?.toLowerCase() || 'binary',
+          'Binary repository file cannot be ingested as plain text via DOM scanner'
+        );
+      } else {
+        const blobCodeEl =
+          document.querySelector(
+            'textarea#read-only-cursor-text-area, [data-testid="raw-blob-content"], .blob-wrapper table, .react-code-lines, article.markdown-body'
+          ) || document.querySelector('pre');
+        const blobText = (blobCodeEl?.value ?? blobCodeEl?.innerText ?? '').trim();
+        if (blobText && blobText.length >= 12) {
+          const inferredType = inferFileType(blobFileName, 'code');
+          addItem({
+            title: `${repoFullName}/${ghInfo.relativePath}`,
+            fileName: blobFileName,
+            filePath: `${repoFullName}/${ghInfo.relativePath}`,
+            fileType: inferredType,
+            content: blobText,
+            resourceKind: inferredType === 'code' ? 'code' : 'document',
+            tags: ['github-file', blobFileName.split('.').pop()?.toLowerCase() || 'file'],
+            provenanceUrl: pageUrl,
+          });
+        }
+      }
+    }
+
+    let fetchedCount = 0;
+    for (const entry of treeEntries) {
+      if (entry.kind === 'tree') continue;
+      if (/^readme(\.md|\.txt|\.rst)?$/i.test(entry.name) && readmeText && readmeText.length >= 20) {
+        continue;
+      }
+      if (BINARY_EXT_RE.test(entry.name)) {
+        metrics.discovered++;
+        metrics.skipped++;
+        addUnreachable(
+          entry.path,
+          entry.name.split('.').pop()?.toLowerCase() || 'binary',
+          'Binary file in repository tree — skipped during text scan'
+        );
+        continue;
+      }
+      const isReadable =
+        READABLE_TEXT_EXT_RE.test(entry.name) ||
+        /^(dockerfile|makefile|license|changelog|contributing|authors|gemfile|procfile)$/i.test(entry.name);
+      if (!isReadable) {
+        metrics.discovered++;
+        metrics.skipped++;
+        addUnreachable(
+          entry.path,
+          entry.name.split('.').pop()?.toLowerCase() || 'unknown',
+          'Unrecognized or non-text file extension in repository tree — not scanned'
+        );
+        continue;
+      }
+      if (fetchedCount >= MAX_GITHUB_FILE_FETCHES) {
+        metrics.discovered++;
+        metrics.skipped++;
+        addUnreachable(
+          entry.path,
+          entry.name.split('.').pop()?.toLowerCase() || 'file',
+          `Not scanned (scan budget capped at ${MAX_GITHUB_FILE_FETCHES} files per pass — open file directly to capture)`
+        );
+        continue;
+      }
+      fetchedCount++;
+      const rawUrl = `${origin}/${ghInfo.owner}/${ghInfo.repo}/raw/${entry.branch}/${entry.path}`;
+      try {
+        const res = await fetch(rawUrl, { credentials: 'include' });
+        if (!res.ok) {
+          metrics.discovered++;
+          metrics.failed++;
+          addUnreachable(
+            entry.path,
+            entry.name.split('.').pop()?.toLowerCase() || 'file',
+            `Repository file could not be fetched (HTTP ${res.status})`
+          );
+          continue;
+        }
+        const fileContent = await res.text();
+        if (!fileContent || fileContent.trim().length < 12) {
+          metrics.discovered++;
+          metrics.skipped++;
+          addUnreachable(
+            entry.path,
+            entry.name.split('.').pop()?.toLowerCase() || 'file',
+            'Repository file was empty or under 12 characters'
+          );
+          continue;
+        }
+        const inferredType = inferFileType(entry.name, 'code');
+        addItem({
+          title: `${repoFullName}/${entry.path}`,
+          fileName: entry.name,
+          filePath: `${repoFullName}/${entry.path}`,
+          fileType: inferredType,
+          content: fileContent,
+          resourceKind: inferredType === 'code' ? 'code' : 'document',
+          tags: ['github-file', entry.name.split('.').pop()?.toLowerCase() || 'source'],
+          provenanceUrl: entry.href || rawUrl,
+        });
+      } catch (err) {
+        metrics.discovered++;
+        metrics.failed++;
+        addUnreachable(
+          entry.path,
+          entry.name.split('.').pop()?.toLowerCase() || 'file',
+          `Failed to read repository file: ${err?.message || 'network error'}`
+        );
+      }
+    }
+  }
+
+  // B. AI WORKSPACE & PROJECT RESOURCES
   document
     .querySelectorAll(
       '[data-testid*="project-instructions"], [data-testid*="custom-instructions"], [aria-label*="Project instructions" i], [aria-label*="Custom instructions" i]'
@@ -301,7 +658,6 @@ function extractProjectAndResources() {
       }
     });
 
-  // 2. Capture Claude Artifacts / ChatGPT Canvas / Side-panel Documents
   document
     .querySelectorAll(
       '[data-testid*="artifact"], [role="complementary"] pre, [aria-label*="Artifact" i], [aria-label*="Canvas" i], .artifact-content'
@@ -323,7 +679,6 @@ function extractProjectAndResources() {
       }
     });
 
-  // 3. Capture Open Project Knowledge Documents or Modal Previews vs Opaque Attachment Cards
   document
     .querySelectorAll(
       '[data-testid*="project-knowledge"], [data-testid*="file-card"], [data-testid*="attachment"], [aria-label*=".pdf" i], [aria-label*=".docx" i], [aria-label*=".xlsx" i], [aria-label*=".pptx" i], [aria-label*=".md" i], [aria-label*=".txt" i]'
@@ -334,65 +689,55 @@ function extractProjectAndResources() {
         el.querySelector('[class*="name"], [class*="title"], span')?.innerText?.trim() ||
         `Project Attachment ${idx + 1}`;
       const bodyText = el.innerText?.trim() || '';
-      const isBinaryExtension = /\.(pdf|docx|xlsx|pptx|zip|png|jpg|jpeg)$/i.test(label);
+      const cleanLabel = label.split('\n')[0].trim();
+      const isBinaryExtension = BINARY_EXT_RE.test(cleanLabel);
 
-      // If the element only shows a filename/size chip (< 120 chars) for a binary file, report it honestly as unreachable from DOM
       if (isBinaryExtension && bodyText.length < 160) {
-        unreachableResources.push({
-          name: label.split('\n')[0].trim(),
-          kind: label.split('.').pop()?.toLowerCase() || 'binary',
-          reason: 'Binary attachment card is not expanded in page DOM',
-        });
+        metrics.discovered++;
+        metrics.skipped++;
+        addUnreachable(
+          cleanLabel,
+          cleanLabel.split('.').pop()?.toLowerCase() || 'binary',
+          'Binary attachment card is not expanded in page DOM'
+        );
       } else if (bodyText.length >= 80) {
         addItem({
-          title: label.split('\n')[0].trim(),
-          fileName: /\.[a-z0-9]{1,5}$/i.test(label.split('\n')[0].trim())
-            ? label.split('\n')[0].trim()
+          title: cleanLabel,
+          fileName: /\.[a-z0-9]{1,5}$/i.test(cleanLabel)
+            ? cleanLabel
             : `project_doc_${idx + 1}.md`,
           fileType: 'md',
-          content: `# ${label.split('\n')[0].trim()}\n\n> Provenance: ${pageUrl}\n\n${bodyText}`,
+          content: `# ${cleanLabel}\n\n> Provenance: ${pageUrl}\n\n${bodyText}`,
           resourceKind: 'document',
           tags: ['project-document'],
         });
       }
     });
 
-  // 4. Capture substantial Code Blocks (> 60 chars) as dedicated code resources
-  const codeBlocks = Array.from(document.querySelectorAll('pre code, pre'));
-  codeBlocks.slice(0, 8).forEach((codeEl, idx) => {
-    const codeText = codeEl.innerText?.trim();
-    if (!codeText || codeText.length < 60) return;
-    const langMatch = (codeEl.className || '').match(/language-([a-z0-9_+-]+)/i);
-    const lang = langMatch ? langMatch[1].toLowerCase() : 'txt';
-    const extMap = {
-      typescript: 'ts',
-      ts: 'ts',
-      tsx: 'tsx',
-      javascript: 'js',
-      js: 'js',
-      python: 'py',
-      py: 'py',
-      json: 'json',
-      sql: 'sql',
-      bash: 'sh',
-      sh: 'sh',
-      html: 'html',
-      css: 'css',
-      markdown: 'md',
-      md: 'md',
-    };
-    const ext = extMap[lang] || 'txt';
-    addItem({
-      title: `${rawTitle} — Code Snippet ${idx + 1} (${lang.toUpperCase()})`,
-      fileName: `snippet_${idx + 1}.${ext}`,
-      fileType: ext === 'md' ? 'md' : ext === 'json' ? 'json' : 'code',
-      content: codeText,
-      resourceKind: 'code',
-      tags: ['code-block', lang],
+  if (!ghInfo || ghInfo.viewType !== 'blob') {
+    const codeBlocks = Array.from(document.querySelectorAll('pre code, pre'));
+    codeBlocks.slice(0, 10).forEach((codeEl, idx) => {
+      const codeText = codeEl.innerText?.trim();
+      if (!codeText || codeText.length < 60) return;
+      const langMatch = (codeEl.className || '').match(/language-([a-z0-9_+-]+)/i);
+      const lang = langMatch ? langMatch[1].toLowerCase() : 'txt';
+      const extMap = {
+        typescript: 'ts', ts: 'ts', tsx: 'tsx', javascript: 'js', js: 'js',
+        python: 'py', py: 'py', json: 'json', sql: 'sql', bash: 'sh',
+        sh: 'sh', html: 'html', css: 'css', markdown: 'md', md: 'md',
+      };
+      const ext = extMap[lang] || 'txt';
+      addItem({
+        title: `${rawTitle} — Code Snippet ${idx + 1} (${lang.toUpperCase()})`,
+        fileName: `snippet_${idx + 1}.${ext}`,
+        fileType: ext === 'md' ? 'md' : 'code',
+        content: codeText,
+        resourceKind: 'code',
+        tags: ['code-block', lang],
+      });
     });
-  });
+  }
 
-  // 5. Capture Conversation Turns (or Main Page Article)
   const turns = [];
   if (host.includes('claude.ai')) {
     document
@@ -460,6 +805,7 @@ function extractProjectAndResources() {
     source: detectedSource,
     items,
     unreachableResources,
+    metrics,
   };
 }
 
@@ -484,6 +830,7 @@ function sourceForHost(url) {
 injectBtn.addEventListener('click', async () => {
   injectBtn.disabled = true;
   setUnreachableNotice([]);
+  setScanMetrics(null);
   setStatus('Fetching brain facts...', 'info');
 
   try {
@@ -491,7 +838,9 @@ injectBtn.addEventListener('click', async () => {
     const res = await fetch(`${apiUrlInput.value}/api/facts?brain=${encodeURIComponent(brain)}`, {
       headers: getAuthHeaders(),
     });
-    if (!res.ok) throw new Error(`Could not load facts for '${brain}'`);
+    if (!res.ok) {
+      throw new Error(await readBackendError(res));
+    }
     const facts = await res.json();
 
     if (!facts || facts.length === 0) {
@@ -525,14 +874,22 @@ injectBtn.addEventListener('click', async () => {
   }
 });
 
-// 2. STAGE PROJECT & RESOURCES TO REVIEW QUEUE BUTTON
+// 2. STAGE PROJECT / GITHUB REPO & RESOURCES TO REVIEW QUEUE BUTTON
 if (captureProjectBtn) {
   captureProjectBtn.addEventListener('click', async () => {
     captureProjectBtn.disabled = true;
     setUnreachableNotice([]);
-    setStatus('Scanning project documents, artifacts & conversation...', 'info');
+    setScanMetrics(null);
+    setStatus('Scanning active tab (project docs, GitHub repo files, artifacts & chat)...', 'info');
 
     try {
+      const tokenValue = deviceTokenInput?.value?.trim() || '';
+      if (!tokenValue) {
+        throw new Error(
+          'Device Token is required for staging captures. Open Capture Hub → Browser Companion to issue a brn_live_... token and paste it below.'
+        );
+      }
+
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab?.id) throw new Error('No active tab detected');
 
@@ -541,8 +898,12 @@ if (captureProjectBtn) {
         func: extractProjectAndResources,
       });
 
+      if (result?.metrics) {
+        setScanMetrics(result.metrics);
+      }
+
       if (!result || (!result.items?.length && !result.unreachableResources?.length)) {
-        setStatus('No readable project documents, artifacts, or chat turns detected on this tab.', 'err');
+        setStatus('No readable project documents, GitHub files, artifacts, or chat turns detected on this tab.', 'err');
         captureProjectBtn.disabled = false;
         return;
       }
@@ -551,7 +912,7 @@ if (captureProjectBtn) {
 
       if (!result.items || result.items.length === 0) {
         setStatus(
-          `Found ${result.unreachableResources.length} binary attachment card(s) that cannot be read from the page DOM. Download and import them in Capture Hub.`,
+          `Found ${result.unreachableResources.length} binary or unscanned resource(s) that cannot be read as text. Download and import them in Capture Hub.`,
           'err'
         );
         captureProjectBtn.disabled = false;
@@ -559,7 +920,7 @@ if (captureProjectBtn) {
       }
 
       const brain = brainSelect.value || 'coding';
-      const source = sourceForHost(result.url || '');
+      const source = result.source || sourceForHost(result.url || '');
 
       setStatus(`Staging ${result.items.length} item(s) to Capture Hub Review Queue...`, 'info');
       const res = await fetch(`${apiUrlInput.value}/api/companion/captures`, {
@@ -579,21 +940,23 @@ if (captureProjectBtn) {
         }),
       });
 
-      if (!res.ok) throw new Error(`Backend returned HTTP ${res.status}`);
+      if (!res.ok) {
+        throw new Error(await readBackendError(res));
+      }
       const staged = await res.json();
 
       await chrome.storage.local.set({
         apiUrl: apiUrlInput.value,
         lastBrain: brain,
-        deviceToken: deviceTokenInput ? deviceTokenInput.value : '',
+        deviceToken: tokenValue,
       });
 
       setStatus(
-        `✓ Staged ${staged.stagedCount || result.items.length} project resource(s) into '${brain}' Review Queue! Open Capture Hub → Import & Review to inspect and commit.`,
+        `✓ Staged ${staged.stagedCount || result.items.length} resource(s) into '${brain}' Review Queue! Open Capture Hub → Import & Review to inspect and commit.`,
         'ok'
       );
     } catch (err) {
-      setStatus(`Project capture failed: ${err.message}`, 'err');
+      setStatus(`Capture failed: ${err.message}`, 'err');
     } finally {
       captureProjectBtn.disabled = false;
     }
@@ -604,6 +967,7 @@ if (captureProjectBtn) {
 saveBtn.addEventListener('click', async () => {
   saveBtn.disabled = true;
   setUnreachableNotice([]);
+  setScanMetrics(null);
   setStatus('Extracting chat dialogue...', 'info');
 
   try {
@@ -616,7 +980,7 @@ saveBtn.addEventListener('click', async () => {
     });
 
     if (!result || !result.turns.length) {
-      setStatus("No chat text detected on this tab. Open a ChatGPT, Claude, or Gemini conversation.", 'err');
+      setStatus('No chat text detected on this tab. Open a ChatGPT, Claude, or Gemini conversation.', 'err');
       saveBtn.disabled = false;
       return;
     }
@@ -638,7 +1002,9 @@ saveBtn.addEventListener('click', async () => {
       }),
     });
 
-    if (!res.ok) throw new Error(`Backend returned HTTP ${res.status}`);
+    if (!res.ok) {
+      throw new Error(await readBackendError(res));
+    }
     const saved = await res.json();
 
     await chrome.storage.local.set({
@@ -661,6 +1027,9 @@ copyBtn.addEventListener('click', async () => {
     const res = await fetch(`${apiUrlInput.value}/api/facts?brain=${encodeURIComponent(brain)}`, {
       headers: getAuthHeaders(),
     });
+    if (!res.ok) {
+      throw new Error(await readBackendError(res));
+    }
     const facts = await res.json();
     const contextPrimer = buildContextPrimer(brain, facts);
     await navigator.clipboard.writeText(contextPrimer);

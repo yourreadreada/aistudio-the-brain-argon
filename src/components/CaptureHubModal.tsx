@@ -636,6 +636,13 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     }
   };
 
+  const handleDeleteDevice = async (id: string) => {
+    const ok = await brainStore.deleteCompanionDevice(id);
+    if (ok) {
+      await refreshCompanionState();
+    }
+  };
+
   const handleStageSampleProjectCapture = async () => {
     setCompanionStageBanner(null);
     const stageRes = await brainStore.stageCompanionProjectCapture({
@@ -2058,7 +2065,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                           <th className="py-2.5 px-3">Browser</th>
                           <th className="py-2.5 px-3">Token Prefix</th>
                           <th className="py-2.5 px-3">Created</th>
-                          <th className="py-2.5 px-3">Last Active</th>
+                          <th className="py-2.5 px-3">Status / Last Active</th>
                           <th className="py-2.5 px-3 text-right">Action</th>
                         </tr>
                       </thead>
@@ -2066,7 +2073,14 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                         {devices.map((dev) => (
                           <tr key={dev.id} className="hover:bg-white/[0.02]">
                             <td className="py-2.5 px-3 font-medium text-white">
-                              {dev.name}
+                              <div className="flex items-center gap-2">
+                                <span>{dev.name}</span>
+                                {dev.revoked_at && (
+                                  <span className="rounded bg-rose-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-rose-300">
+                                    Revoked
+                                  </span>
+                                )}
+                              </div>
                             </td>
                             <td className="py-2.5 px-3 text-white/65">
                               {dev.browser}
@@ -2078,7 +2092,11 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                               {new Date(dev.created_at).toLocaleDateString()}
                             </td>
                             <td className="py-2.5 px-3 mono text-[11px] tabular-nums">
-                              {dev.last_used_at ? (
+                              {dev.revoked_at ? (
+                                <span className="text-rose-400">
+                                  Revoked {new Date(dev.revoked_at).toLocaleDateString()}
+                                </span>
+                              ) : dev.last_used_at ? (
                                 <span className="text-emerald-400">
                                   {new Date(dev.last_used_at).toLocaleString()}
                                 </span>
@@ -2089,14 +2107,25 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                               )}
                             </td>
                             <td className="py-2.5 px-3 text-right">
-                              <button
-                                type="button"
-                                onClick={() => handleRevokeDevice(dev.id)}
-                                className="inline-flex items-center gap-1 rounded-md border border-rose-500/25 bg-rose-500/10 px-2.5 py-1 text-[11px] text-rose-300 hover:bg-rose-500/20 transition"
-                              >
-                                <Trash2 className="h-3 w-3" />
-                                <span>Revoke</span>
-                              </button>
+                              <div className="inline-flex items-center justify-end gap-1.5">
+                                {!dev.revoked_at && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRevokeDevice(dev.id)}
+                                    className="inline-flex items-center gap-1 rounded-md border border-amber-500/25 bg-amber-500/10 px-2.5 py-1 text-[11px] text-amber-200 hover:bg-amber-500/20 transition"
+                                  >
+                                    <span>Revoke</span>
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteDevice(dev.id)}
+                                  className="inline-flex items-center gap-1 rounded-md border border-rose-500/25 bg-rose-500/10 px-2.5 py-1 text-[11px] text-rose-300 hover:bg-rose-500/20 transition"
+                                >
+                                  <Trash2 className="h-3 w-3" />
+                                  <span>Delete</span>
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         ))}

@@ -1,45 +1,53 @@
-# The Brain Web AI Companion (Chrome / Edge / Brave Extension)
+# The Brain Browser Companion (`extension/` · v0.3.0)
 
-**100% Free Plan Compatible** — Connects your local Brain memory directly to web-based AI chats and project workspaces without requiring paid API tiers or cloud dependencies.
-
-Works seamlessly on:
-- **ChatGPT Web & Projects** (`https://chatgpt.com`)
-- **Claude Web, Projects & Artifacts** (`https://claude.ai`)
-- **Gemini Web** (`https://gemini.google.com`)
-- **GitHub Repositories & Docs** (`https://github.com`)
+Local-first Chromium Manifest V3 extension that connects **ChatGPT**, **Claude**, **Gemini**, and **GitHub Repositories** to your local **The Brain (Argon)** instance.
 
 ---
 
-## What It Does
+## Supported Hosts & Capabilities
 
-1. **Inject Brain Memory into Chat**: Fetches durable facts from your chosen brain (e.g., `coding`, `college`, `personal`) and injects them directly into the chat prompt box with proper grounding instructions before you send your message.
-2. **Stage Project & Resources to Review Queue**: Scans the active browser tab for **project instructions**, **Claude Artifacts / ChatGPT Canvas blocks**, **open project documents**, **code blocks**, and **conversation turns**, and stages them with full provenance into the Capture Hub **Import Review Queue** (`/api/companion/captures`) so you can review duplicates and choose Create, Merge, Replace, or Skip.
-3. **Quick-Save Current Web Chat**: Scrapes the conversation dialogue from the active tab and saves/merges it directly into your brain database.
-4. **Copy Context Snapshot**: Copies a formatted context snapshot to your clipboard for quick manual pasting anytime.
-
-### Browser Security & Attachment Boundaries
-- Readable text rendered in the active page DOM (project instructions, open document panels, artifacts, code snippets, and chat messages) is captured automatically with its source and provenance URL.
-- Closed or binary-only attachment chips (e.g., unexpanded `.pdf`, `.docx`, `.xlsx`, or `.zip` cards that only render a filename badge in the DOM) are explicitly reported in the extension popup so you can download and drop them into **Capture Hub → Import & Review**.
+- **ChatGPT Web & Projects** (`https://chatgpt.com/*`) — Inject Brain memory into prompt, quick-save chat transcripts, or stage project instructions, Canvas blocks, code snippets, and conversations into the Review Queue.
+- **Claude Web, Projects & Artifacts** (`https://claude.ai/*`) — Inject Brain memory into prompt, quick-save chat transcripts, or stage project instructions, Claude Artifacts, expanded project documents, code blocks, and conversations.
+- **Google Gemini Web** (`https://gemini.google.com/*`) — Inject Brain memory into prompt, quick-save chat transcripts, or stage conversation turns and code snippets.
+- **GitHub Repositories** (`https://github.com/*`) — Deliberate repository scanning:
+  - Captures repository overview (`REPOSITORY_OVERVIEW.md`) with description, branch, topics, and visible file tree listing.
+  - Captures visible `README.md` documentation.
+  - Captures open source file content on `/blob/<branch>/<path>` views.
+  - Fetches up to 6 readable source/documentation files from the visible repository file tree via the active browser session.
+  - Explicitly reports binary files (`.pdf`, `.png`, `.zip`, `.docx`, etc.) and unscanned files in the popup notice rather than silently dropping them.
 
 ---
 
-## 3-Step Setup (Takes 30 seconds)
+## Security & Device Token Pairing (`brn_live_...`)
 
-1. **Start The Brain Server**:
+1. Start the local Argon server:
    ```bash
    npm run dev
    ```
-   (Runs locally on `http://localhost:3000` with zero cloud dependencies).
+2. In the Argon web UI (`http://localhost:3000`), open **Capture Hub → 1. Browser Companion**.
+3. Under **Device Token Management**, enter a label (e.g., `MacBook Chrome`) and click **Issue Device Token**.
+4. Copy the generated `brn_live_...` token immediately (it is shown only once; the server stores only its SHA-256 hash).
+5. Open the Browser Companion extension popup, set **The Brain Local Server URL** to `http://localhost:3000`, and paste your `brn_live_...` token into **Device Token**.
+6. You can revoke or delete any device token at any time from **Capture Hub → 1. Browser Companion**; revoked tokens are rejected immediately (`401 Unauthorized`).
 
-2. **Load the Extension into Chrome / Edge / Brave**:
-   - In your browser, open `chrome://extensions` (or `edge://extensions` / `brave://extensions`).
-   - Enable **Developer mode** toggle in the top right corner.
-   - Click the **Load unpacked** button (top left).
-   - Select this `extension/` folder.
+---
 
-3. **Start Using It**:
-   - Pin "The Brain" icon to your browser toolbar.
-   - Open any project or conversation on **chatgpt.com**, **claude.ai**, **gemini.google.com**, or **github.com**.
-   - Click the extension icon:
-     - Click **Inject Brain Memory into Chat** to prime your chat with past context.
-     - Click **Stage Project & Resources to Review Queue** to send project docs, artifacts, code blocks, and conversation context into the Capture Hub Review Queue.
+## Installation & Packaging
+
+### Option A: Load Unpacked (Development)
+1. Open `chrome://extensions` (or `edge://extensions` / `brave://extensions`).
+2. Enable **Developer mode**.
+3. Click **Load unpacked** and select this `extension/` directory.
+
+### Option B: Build Distributable ZIP Archive
+Run the packaging script from the repository root:
+```bash
+npm run package:extension
+```
+This validates `extension/manifest.json` (Manifest V3) and all required assets, and writes:
+- `dist/extensions/the-brain-companion-chromium-v0.3.0.zip`
+- `dist/extensions/the-brain-companion-chromium.zip`
+
+### Browser Compatibility
+- **Chromium Browsers (Chrome, Edge, Brave, Arc)**: Fully supported via Manifest V3 (`activeTab`, `scripting`, `storage`).
+- **Firefox**: Requires adding `browser_specific_settings.gecko` to `manifest.json` if packaging for Firefox Add-ons (`about:debugging`).

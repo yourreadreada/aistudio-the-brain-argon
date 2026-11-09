@@ -28,6 +28,7 @@ export interface CompanionDeviceRecord {
   browser: string;
   created_at: string;
   last_used_at: string | null;
+  revoked_at?: string | null;
 }
 
 export interface CompanionUnreachableResource {
@@ -2406,18 +2407,24 @@ class BrainStorageService {
     }
   }
 
-  public async fetchCompanionDevices(): Promise<
-    {
-      id: string;
-      name: string;
-      token_prefix: string;
-      browser: string;
-      created_at: string;
-      last_used_at: string | null;
-    }[]
-  > {
+  private getCompanionLocalHeaders(extra?: Record<string, string>): Record<string, string> {
+    const headers: Record<string, string> = {
+      'X-Brain-Local-Client': 'argon-capture-hub',
+      ...(extra || {}),
+    };
+    try {
+      const savedToken = localStorage.getItem('brain_active_device_token');
+      if (savedToken) {
+        headers['Authorization'] = `Bearer ${savedToken}`;
+      }
+    } catch {}
+    return headers;
+  }
+
+  public async fetchCompanionDevices(): Promise<CompanionDeviceRecord[]> {
     try {
       const res = await fetch(`${API_BASE}/api/companion/devices`, {
+        headers: this.getCompanionLocalHeaders(),
         signal: AbortSignal.timeout(2500),
       });
       if (!res.ok) throw new Error('Failed to fetch devices');
@@ -2438,20 +2445,16 @@ class BrainStorageService {
     name: string,
     browser: string = 'Chromium / Manifest V3'
   ): Promise<{
-    device: {
-      id: string;
-      name: string;
-      token_prefix: string;
-      browser: string;
-      created_at: string;
-      last_used_at: string | null;
-    };
+    device: CompanionDeviceRecord;
     token: string;
   }> {
     try {
       const res = await fetch(`${API_BASE}/api/companion/devices`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: this.getCompanionLocalHeaders({
+          'Content-Type': 'application/json',
+          'X-Brain-UI-Intent': 'enroll-device',
+        }),
         body: JSON.stringify({ name, browser }),
       });
       if (!res.ok) throw new Error('Backend create failed');
@@ -2462,13 +2465,14 @@ class BrainStorageService {
       const id = `dev_${Date.now().toString(36)}`;
       const secret = Math.random().toString(36).slice(2, 12) + Date.now().toString(36);
       const token = `brn_live_${secret}`;
-      const device = {
+      const device: CompanionDeviceRecord = {
         id,
         name: name.trim() || 'Browser Companion',
         token_prefix: `${token.slice(0, 13)}…${token.slice(-4)}`,
         browser,
         created_at: new Date().toISOString(),
         last_used_at: null,
+        revoked_at: null,
       };
       const existing = await this.fetchCompanionDevices();
       localStorage.setItem(
@@ -2481,8 +2485,34 @@ class BrainStorageService {
 
   public async revokeCompanionDevice(id: string): Promise<boolean> {
     try {
+      const res = await fetch(
+        `${API_BASE}/api/companion/devices/${encodeURIComponent(id)}/revoke`,
+        {
+          method: 'POST',
+          headers: this.getCompanionLocalHeaders(),
+        }
+      );
+      if (res.ok) {
+        await this.fetchCompanionDevices();
+        return true;
+      }
+    } catch {}
+    try {
+      const existing = await this.fetchCompanionDevices();
+      const nowIso = new Date().toISOString();
+      const updated = existing.map((d) =>
+        d.id === id ? { ...d, revoked_at: nowIso } : d
+      );
+      localStorage.setItem('brain_companion_devices_v1', JSON.stringify(updated));
+    } catch {}
+    return true;
+  }
+
+  public async deleteCompanionDevice(id: string): Promise<boolean> {
+    try {
       await fetch(`${API_BASE}/api/companion/devices/${encodeURIComponent(id)}`, {
         method: 'DELETE',
+        headers: this.getCompanionLocalHeaders(),
       });
     } catch {}
     try {
@@ -2499,6 +2529,7 @@ class BrainStorageService {
   public async fetchCompanionCaptures(): Promise<CompanionCaptureItem[]> {
     try {
       const res = await fetch(`${API_BASE}/api/companion/captures`, {
+        headers: this.getCompanionLocalHeaders(),
         signal: AbortSignal.timeout(2500),
       });
       if (!res.ok) throw new Error('Failed to fetch companion captures');
@@ -2560,7 +2591,10 @@ class BrainStorageService {
     try {
       const res = await fetch(`${API_BASE}/api/companion/captures`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: this.getCompanionLocalHeaders({
+          'Content-Type': 'application/json',
+          'X-Brain-UI-Intent': 'stage-capture',
+        }),
         body: JSON.stringify({
           brain: defaultBrain,
           source: defaultSource,
@@ -2572,7 +2606,11 @@ class BrainStorageService {
       });
       if (res.ok) {
         const data = await res.json();
-        const staged: CompanionCaptureItem[] = Array.isArray(data.items) ? data.items : [];
+        const staged: CompanionCaptureItem[] = Array.isArray(data.items)
+          ? data.items
+          : Array.isArray(data.captures)
+          ? data.captures
+          : [];
         const mergedMap = new Map<string, CompanionCaptureItem>();
         for (const item of [...staged, ...this.companionCaptures]) {
           mergedMap.set(item.id, item);
@@ -2674,6 +2712,7 @@ class BrainStorageService {
     try {
       await fetch(`${API_BASE}/api/companion/captures/${encodeURIComponent(id)}`, {
         method: 'DELETE',
+        headers: this.getCompanionLocalHeaders(),
       });
     } catch {}
     try {
@@ -2690,6 +2729,7 @@ class BrainStorageService {
     try {
       await fetch(`${API_BASE}/api/companion/captures/clear`, {
         method: 'POST',
+        headers: this.getCompanionLocalHeaders(),
       });
     } catch {}
     try {

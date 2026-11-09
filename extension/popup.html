@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <style>
   body {
-    width: 320px;
+    width: 340px;
     margin: 0;
     padding: 16px;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -127,6 +127,17 @@
     color: #a5b4fc;
     border: 1px solid rgba(99, 102, 241, 0.25);
   }
+  #scanMetrics {
+    display: none;
+    margin-top: 8px;
+    padding: 6px 9px;
+    border-radius: 6px;
+    font-size: 10.5px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    background: rgba(15, 23, 42, 0.8);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #cbd5e1;
+  }
   .server-row {
     display: flex;
     align-items: center;
@@ -150,7 +161,7 @@
 <body>
   <div class="header">
     <div class="brand">THE BRAIN</div>
-    <span class="badge">100% Free Companion</span>
+    <span class="badge">v0.3.0 Companion</span>
   </div>
 
   <label for="brainSelect">Active Memory Brain</label>
@@ -166,9 +177,9 @@
       Inject Brain Memory into Chat
     </button>
 
-    <!-- Stage Project Documents, Artifacts & Conversation into Review Queue -->
+    <!-- Stage Project Documents, GitHub Repo Context, Artifacts & Conversation into Review Queue -->
     <button id="captureProjectBtn" class="btn-secondary" style="border-color: rgba(157, 180, 255, 0.4); background: rgba(157, 180, 255, 0.12); color: #dbeafe; font-weight: 600;">
-      Stage Project &amp; Resources to Review Queue
+      Stage Project / GitHub Repo to Review Queue
     </button>
 
     <!-- Save Current Web Chat into Brain -->
@@ -183,6 +194,7 @@
   </div>
 
   <div id="status"></div>
+  <div id="scanMetrics"></div>
   <div id="unreachableNotice" style="display: none; margin-top: 8px; padding: 7px 9px; border-radius: 6px; font-size: 10.5px; line-height: 1.35; background: rgba(245, 158, 11, 0.12); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.3);"></div>
 
   <div class="server-row">
@@ -190,14 +202,14 @@
       <span id="serverDot" class="server-status"></span>
       <span id="serverText">Connecting...</span>
     </span>
-    <span id="targetSite">ChatGPT / Claude / Gemini</span>
+    <span id="targetSite">ChatGPT / Claude / Gemini / GitHub</span>
   </div>
 
   <div style="margin-top: 10px;">
-    <label for="apiUrl" style="font-size: 9.5px; color: #475569;">The Brain Web URL (e.g. http://localhost:3000 or App URL)</label>
-    <input id="apiUrl" value="http://localhost:3000" placeholder="http://localhost:3000 or https://..." style="margin-bottom: 6px; padding: 4px 6px; font-size: 10.5px; font-family: monospace;">
-    <label for="deviceToken" style="font-size: 9.5px; color: #475569;">Device Token (from Capture Hub → Browser Companion)</label>
-    <input id="deviceToken" type="password" value="" placeholder="brn_live_... (optional for local)" style="margin-bottom: 0; padding: 4px 6px; font-size: 10.5px; font-family: monospace;">
+    <label for="apiUrl" style="font-size: 9.5px; color: #64748b;">The Brain Local Server URL</label>
+    <input id="apiUrl" value="http://localhost:3000" placeholder="http://localhost:3000" style="margin-bottom: 6px; padding: 4px 6px; font-size: 10.5px; font-family: monospace;">
+    <label for="deviceToken" style="font-size: 9.5px; color: #64748b;">Device Token (Required for Companion Staging)</label>
+    <input id="deviceToken" type="password" value="" placeholder="brn_live_... (Issue in Capture Hub)" style="margin-bottom: 0; padding: 4px 6px; font-size: 10.5px; font-family: monospace;">
   </div>
 
   <script src="popup.js"></script>
