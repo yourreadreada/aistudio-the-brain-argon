@@ -3,14 +3,30 @@ import { WelcomeView } from './components/WelcomeView';
 import { BrainView } from './components/BrainView';
 
 export default function App() {
-  const [currentView, setCurrentView] = useState<'welcome' | 'brain'>('brain');
+  const [currentView, setCurrentView] = useState<'welcome' | 'brain'>(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('autostart') === '1' || params.get('view') === 'brain') {
+        return 'brain';
+      }
+    }
+    return 'welcome';
+  });
   const [userLabel, setUserLabel] = useState<string>('Local Developer');
   const [initialBrain, setInitialBrain] = useState<string>('coding');
 
   // Cinematic Warp Transition State
   const [isWarping, setIsWarping] = useState(false);
   const [veilActive, setVeilActive] = useState(false);
-  const [brainRevealed, setBrainRevealed] = useState(true);
+  const [brainRevealed, setBrainRevealed] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('autostart') === '1' || params.get('view') === 'brain') {
+        return true;
+      }
+    }
+    return false;
+  });
 
   const handleEnterBrain = (selectedBrain?: string, label?: string) => {
     if (selectedBrain) setInitialBrain(selectedBrain);

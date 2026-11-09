@@ -14,6 +14,7 @@ interface AddFactModalProps {
   onClose: () => void;
   currentBrain: string;
   brains: string[];
+  defaultSource?: AISource | null;
   onAddFact: (
     brain: string,
     content: string,
@@ -28,10 +29,11 @@ export const AddFactModal: React.FC<AddFactModalProps> = ({
   onClose,
   currentBrain,
   brains,
+  defaultSource,
   onAddFact,
 }) => {
   const [targetBrain, setTargetBrain] = useState(currentBrain);
-  const [source, setSource] = useState<AISource>('claude');
+  const [source, setSource] = useState<AISource>(defaultSource || 'claude');
   const [content, setContent] = useState('');
   const [customBrain, setCustomBrain] = useState('');
   const [isCreatingBrain, setIsCreatingBrain] = useState(false);
@@ -39,6 +41,15 @@ export const AddFactModal: React.FC<AddFactModalProps> = ({
   const [attachedFileName, setAttachedFileName] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  React.useEffect(() => {
+    if (isOpen) {
+      setTargetBrain(currentBrain);
+      if (defaultSource) {
+        setSource(defaultSource);
+      }
+    }
+  }, [isOpen, currentBrain, defaultSource]);
 
   if (!isOpen) return null;
 

@@ -1019,6 +1019,14 @@ function copyDatabaseStateFromAttached(
         }
       }
 
+      // Synchronize sqlite_sequence for facts so AUTOINCREMENT continues cleanly after restore
+      try {
+        targetDb.exec(`DELETE FROM main.sqlite_sequence WHERE name = 'facts'`);
+        targetDb.exec(
+          `INSERT INTO main.sqlite_sequence (name, seq) SELECT 'facts', COALESCE(MAX(id), 0) FROM main.facts`
+        );
+      } catch {}
+
       if (simulateApplyFailure) {
         throw new Error(
           'Simulated failure while applying staged restore to live database'
@@ -1212,16 +1220,30 @@ export function restoreDatabaseFromBackup(
     const schemaVersionAfterRestore = Number(schemaVersionRow?.maxVer || 0);
 
     const backupStat = fs.statSync(backupPath);
+    let sidecar: Partial<BackupMetadata> = {};
+    const metaPath = `${backupPath}.meta.json`;
+    if (fs.existsSync(metaPath)) {
+      try {
+        sidecar = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      } catch {}
+    }
+    const restoredKind: BackupKind =
+      sidecar.kind === 'pre-migration' ||
+      sidecar.kind === 'pre-restore-safety' ||
+      sidecar.kind === 'manual'
+        ? sidecar.kind
+        : 'manual';
+
     const restoredFrom: BackupMetadata = {
       fileName: path.basename(backupPath),
       backupPath,
-      createdAt: backupStat.mtime.toISOString(),
+      createdAt: sidecar.createdAt || backupStat.mtime.toISOString(),
       sizeBytes: backupStat.size,
       verified: true,
       integrityStatus: 'ok',
       schemaVersion: candidateVerification.schemaVersion,
       factsCount: candidateVerification.factsCount,
-      kind: 'manual',
+      kind: restoredKind,
     };
 
     return {

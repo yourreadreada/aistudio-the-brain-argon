@@ -41,6 +41,7 @@ interface BrainViewProps {
 }
 
 export const BrainView: React.FC<BrainViewProps> = ({
+  userEmail,
   initialBrainName,
   onSwitchToLogin,
 }) => {
@@ -73,10 +74,13 @@ export const BrainView: React.FC<BrainViewProps> = ({
 
   const [brains, setBrains] = useState<string[]>([]);
   const [facts, setFacts] = useState<Fact[]>([]);
+  const [allBrainFacts, setAllBrainFacts] = useState<Fact[]>([]);
   const [brainCounts, setBrainCounts] = useState<Record<string, number>>({});
   const [sourceCounts, setSourceCounts] = useState<Record<string, number>>({});
   const [fileTypeCounts, setFileTypeCounts] = useState<Record<string, number>>({});
   const [selectedFact, setSelectedFact] = useState<Fact | null>(null);
+  const [selectedSource, setSelectedSource] = useState<AISource | null>(null);
+  const [addFactDefaultSource, setAddFactDefaultSource] = useState<AISource | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [activeSourceFilter, setActiveSourceFilter] = useState<AISource | null>(null);
   const [activeFileTypeFilter, setActiveFileTypeFilter] = useState<FactFileType | null>(null);
@@ -162,6 +166,8 @@ export const BrainView: React.FC<BrainViewProps> = ({
     if (!brainList.includes(currentBrain) && brainList.length > 0) {
       setCurrentBrain(brainList[0]);
     }
+    const unfilteredBrainFacts = brainStore.recall(currentBrain, '', null, null);
+    setAllBrainFacts(unfilteredBrainFacts);
     const currentFacts = brainStore.recall(
       currentBrain,
       searchQuery,
@@ -426,6 +432,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
           onSelectBrain={(b) => {
             setCurrentBrain(b);
             setSelectedFact(null);
+            setSelectedSource(null);
           }}
           onCreateBrain={handleCreateBrain}
           onDeleteBrain={handleOpenDeleteBrain}
@@ -433,20 +440,31 @@ export const BrainView: React.FC<BrainViewProps> = ({
           viewMode={viewMode}
           onSelectViewMode={setViewMode}
           activeSourceFilter={activeSourceFilter}
-          onSelectSourceFilter={setActiveSourceFilter}
+          onSelectSourceFilter={(src) => {
+            setActiveSourceFilter(src);
+            setSelectedFact(null);
+            setSelectedSource(src);
+          }}
           activeFileTypeFilter={activeFileTypeFilter}
           onSelectFileTypeFilter={setActiveFileTypeFilter}
           isRecentActivityOpen={isRecentActivityOpen}
           onToggleRecentActivity={() => {
             setIsRecentActivityOpen((prev) => !prev);
-            if (!isRecentActivityOpen) setSelectedFact(null);
+            if (!isRecentActivityOpen) {
+              setSelectedFact(null);
+              setSelectedSource(null);
+            }
           }}
           recentActivityCount={activities.length}
-          onOpenAddFact={() => setIsAddFactOpen(true)}
+          onOpenAddFact={() => {
+            setAddFactDefaultSource(null);
+            setIsAddFactOpen(true);
+          }}
           onOpenIngest={(tab) => handleOpenCaptureHub(tab || 'import')}
           onOpenGuidedConfig={handleOpenGuidedConfig}
           onExportSnapshot={handleExportSnapshot}
           onSwitchToWelcome={onSwitchToLogin}
+          userIdentity={userEmail}
         />
       </div>
 
@@ -470,6 +488,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
               onSelectBrain={(b) => {
                 setCurrentBrain(b);
                 setSelectedFact(null);
+                setSelectedSource(null);
                 setIsMobileSidebarOpen(false);
               }}
               onCreateBrain={handleCreateBrain}
@@ -484,7 +503,11 @@ export const BrainView: React.FC<BrainViewProps> = ({
                 setIsMobileSidebarOpen(false);
               }}
               activeSourceFilter={activeSourceFilter}
-              onSelectSourceFilter={setActiveSourceFilter}
+              onSelectSourceFilter={(src) => {
+                setActiveSourceFilter(src);
+                setSelectedFact(null);
+                setSelectedSource(src);
+              }}
               activeFileTypeFilter={activeFileTypeFilter}
               onSelectFileTypeFilter={setActiveFileTypeFilter}
               isRecentActivityOpen={isRecentActivityOpen}
@@ -495,6 +518,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
               recentActivityCount={activities.length}
               onOpenAddFact={() => {
                 setIsMobileSidebarOpen(false);
+                setAddFactDefaultSource(null);
                 setIsAddFactOpen(true);
               }}
               onOpenIngest={(tab) => {
@@ -507,6 +531,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
               }}
               onExportSnapshot={handleExportSnapshot}
               onSwitchToWelcome={onSwitchToLogin}
+              userIdentity={userEmail}
             />
           </div>
         </div>
@@ -587,11 +612,25 @@ export const BrainView: React.FC<BrainViewProps> = ({
             <>
               <BrainViewerCanvas
                 brainName={currentBrain}
-                facts={facts}
+                facts={
+                  searchQuery.trim() || activeFileTypeFilter
+                    ? facts
+                    : allBrainFacts
+                }
                 selectedFactId={selectedFact?.id || null}
+                selectedSource={selectedSource}
                 onSelectFact={handleFactSelected}
+                onSelectSource={(src) => {
+                  setSelectedSource(src);
+                  setActiveSourceFilter(src);
+                  if (src) {
+                    setSelectedFact(null);
+                    setIsRecentActivityOpen(false);
+                  }
+                }}
                 searchQuery={searchQuery}
                 activeSourceFilter={activeSourceFilter}
+                isInspectorOpen={Boolean(selectedFact || selectedSource)}
               />
 
               {/* Empty state overlay on canvas if zero facts */}
@@ -1090,13 +1129,42 @@ export const BrainView: React.FC<BrainViewProps> = ({
             </div>
           )}
 
-          {/* Slide-over Inspection & Correction Panel */}
+          {/* Slide-over Inspection & Correction Panel (Supports both Fact Node & Source Hub inspection) */}
           <FactPanel
             fact={selectedFact}
-            onClose={() => setSelectedFact(null)}
+            selectedSource={selectedSource}
+            currentBrain={currentBrain}
+            allBrainFacts={allBrainFacts}
+            connectionStatus={connectionStatus}
+            onClose={() => {
+              setSelectedFact(null);
+              setSelectedSource(null);
+            }}
+            onSelectFact={(f) => {
+              handleFactSelected(f);
+            }}
+            onSelectSource={(src) => {
+              setSelectedFact(null);
+              setSelectedSource(src);
+            }}
             onSaveCorrection={handleSaveCorrection}
             onDeleteFact={handleDeleteFact}
             onUpdateTags={handleUpdateFactTags}
+            onOpenAddFactForSource={(src) => {
+              setAddFactDefaultSource(src);
+              setIsAddFactOpen(true);
+            }}
+            onResyncSource={(src) => {
+              if (src === 'claude' || src === 'gemini' || src === 'gpt') {
+                handleOpenGuidedConfig(src === 'gpt' ? 'chatgpt' : src);
+              } else {
+                handleOpenCaptureHub('import');
+              }
+            }}
+            onOpenSourceInTable={(src) => {
+              setActiveSourceFilter(src);
+              setViewMode('list');
+            }}
           />
 
           {/* Slide-over Recent Activity Panel */}
@@ -1113,9 +1181,13 @@ export const BrainView: React.FC<BrainViewProps> = ({
       {/* Modals */}
       <AddFactModal
         isOpen={isAddFactOpen}
-        onClose={() => setIsAddFactOpen(false)}
+        onClose={() => {
+          setIsAddFactOpen(false);
+          setAddFactDefaultSource(null);
+        }}
         currentBrain={currentBrain}
         brains={brains}
+        defaultSource={addFactDefaultSource}
         onAddFact={handleAddFact}
       />
 

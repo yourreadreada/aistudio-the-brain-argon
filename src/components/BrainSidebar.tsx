@@ -7,11 +7,12 @@ import {
   Sparkles,
   History,
   Plus,
-  FolderGit2,
+  Code2,
   GraduationCap,
   User,
   BrainCircuit,
   Trash2,
+  Settings,
   Settings2,
   FileCode2,
   FileText,
@@ -23,7 +24,8 @@ import {
   LogOut,
   Check,
   X,
-  Database,
+  ChevronDown,
+  ExternalLink,
 } from 'lucide-react';
 import {
   AISource,
@@ -36,7 +38,6 @@ import { GuidedService } from './GuidedConnectionModal';
 import { CaptureHubTab } from './CaptureHubModal';
 
 export type WorkspaceViewMode = 'graph' | 'list' | 'simulator' | 'settings';
-
 
 interface BrainSidebarProps {
   isCollapsed: boolean;
@@ -65,6 +66,7 @@ interface BrainSidebarProps {
   onOpenGuidedConfig: (service?: GuidedService) => void;
   onExportSnapshot: () => void;
   onSwitchToWelcome: () => void;
+  userIdentity?: string;
 }
 
 export const BrainSidebar: React.FC<BrainSidebarProps> = ({
@@ -88,15 +90,15 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
   onSelectFileTypeFilter,
   isRecentActivityOpen,
   onToggleRecentActivity,
-  recentActivityCount,
   onOpenAddFact,
   onOpenIngest,
-  onOpenGuidedConfig,
   onExportSnapshot,
   onSwitchToWelcome,
+  userIdentity = 'Local Developer',
 }) => {
   const [isCreatingBrain, setIsCreatingBrain] = useState(false);
   const [newBrainName, setNewBrainName] = useState('');
+  const [isWorkspaceSwitcherOpen, setIsWorkspaceSwitcherOpen] = useState(false);
 
   const handleCreateSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -110,7 +112,7 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
   const getBrainIcon = (brainName: string) => {
     const lower = brainName.toLowerCase();
     if (lower === 'coding' || lower.includes('dev') || lower.includes('code')) {
-      return <FolderGit2 className="h-4 w-4 shrink-0" />;
+      return <Code2 className="h-4 w-4 shrink-0" />;
     }
     if (lower === 'college' || lower.includes('uni') || lower.includes('study')) {
       return <GraduationCap className="h-4 w-4 shrink-0" />;
@@ -181,24 +183,107 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
 
       {/* Scrollable Navigation Content */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden py-3 px-2.5 space-y-5 scrollbar-thin">
-        {/* Quick Primary Action in Collapsed Mode */}
-        {isCollapsed && (
+        {/* Top Workspace Selector Card (Expanded) or Quick Action (Collapsed) */}
+        {!isCollapsed ? (
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setIsWorkspaceSwitcherOpen((prev) => !prev)}
+              aria-expanded={isWorkspaceSwitcherOpen}
+              className="flex w-full items-center justify-between gap-2.5 rounded-xl border border-white/12 bg-white/[0.04] p-2.5 text-left transition hover:border-white/25 hover:bg-white/[0.07]"
+            >
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white text-black shadow-sm">
+                  {getBrainIcon(currentBrain)}
+                </div>
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold capitalize text-white truncate">
+                    {currentBrain}
+                  </div>
+                  <div className="mono text-[10.5px] tabular-nums text-white/45 truncate">
+                    {totalFactsInBrain} {totalFactsInBrain === 1 ? 'memory' : 'memories'} · local
+                  </div>
+                </div>
+              </div>
+              <ChevronDown
+                className={`h-3.5 w-3.5 shrink-0 text-white/45 transition-transform ${
+                  isWorkspaceSwitcherOpen ? 'rotate-180 text-white' : ''
+                }`}
+              />
+            </button>
+
+            {isWorkspaceSwitcherOpen && (
+              <div className="mt-1.5 rounded-xl border border-white/15 bg-[#0a0d1a] p-1.5 shadow-2xl space-y-0.5">
+                {brains.map((b) => {
+                  const isCurrent = b === currentBrain;
+                  const c = brainCounts[b] || 0;
+                  return (
+                    <button
+                      key={b}
+                      type="button"
+                      onClick={() => {
+                        onSelectBrain(b);
+                        setIsWorkspaceSwitcherOpen(false);
+                      }}
+                      className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-xs transition ${
+                        isCurrent
+                          ? 'bg-white/[0.12] text-white font-medium'
+                          : 'text-white/65 hover:bg-white/[0.05] hover:text-white'
+                      }`}
+                    >
+                      <span className="flex items-center gap-2 capitalize truncate">
+                        {getBrainIcon(b)}
+                        <span>{b}</span>
+                      </span>
+                      <span className="mono text-[10.5px] tabular-nums text-white/45">
+                        {c}
+                      </span>
+                    </button>
+                  );
+                })}
+                <div className="border-t border-white/10 pt-1 mt-1 flex items-center justify-between px-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsWorkspaceSwitcherOpen(false);
+                      setIsCreatingBrain(true);
+                    }}
+                    className="mono text-[10.5px] text-white/60 hover:text-white py-1 px-1.5"
+                  >
+                    + New brain
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsWorkspaceSwitcherOpen(false);
+                      onOpenManageBrains();
+                    }}
+                    className="mono text-[10.5px] text-white/50 hover:text-white py-1 px-1.5"
+                  >
+                    Manage
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : (
           <div className="flex flex-col items-center gap-1.5">
             <button
               type="button"
               onClick={onOpenAddFact}
               className="flex h-9 w-9 items-center justify-center rounded-lg bg-white text-black transition hover:bg-white/90"
               title="Store Fact"
+              aria-label="Store Fact"
             >
               <Plus className="h-4 w-4" />
             </button>
           </div>
         )}
 
-        {/* SECTION 1: Workspace Views */}
+        {/* SECTION 1: Workspace View */}
         <div>
           {!isCollapsed && (
-            <div className="px-2 pb-1.5 text-[11px] font-medium text-white/45">
+            <div className="px-2 pb-1.5 text-[10.5px] font-medium uppercase tracking-[0.12em] text-white/40">
               Workspace View
             </div>
           )}
@@ -206,7 +291,7 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
             <button
               type="button"
               onClick={() => onSelectViewMode('graph')}
-              title="Neural Graph View"
+              title="Neural Graph"
               className={`flex w-full items-center rounded-lg text-xs font-medium transition-colors ${
                 isCollapsed ? 'justify-center py-2.5' : 'justify-between px-2.5 py-2'
               } ${
@@ -229,7 +314,7 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
             <button
               type="button"
               onClick={() => onSelectViewMode('list')}
-              title="Memory Ledger Table"
+              title="Memory Table"
               className={`flex w-full items-center rounded-lg text-xs font-medium transition-colors ${
                 isCollapsed ? 'justify-center py-2.5' : 'justify-between px-2.5 py-2'
               } ${
@@ -252,7 +337,7 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
             <button
               type="button"
               onClick={() => onSelectViewMode('simulator')}
-              title="Live AI Memory Sync & Simulator"
+              title="AI Sync Studio"
               className={`flex w-full items-center rounded-lg text-xs font-medium transition-colors ${
                 isCollapsed ? 'justify-center py-2.5' : 'justify-between px-2.5 py-2'
               } ${
@@ -266,14 +351,16 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
                 {!isCollapsed && <span>AI Sync Studio</span>}
               </span>
               {!isCollapsed && (
-                <span className="mono text-[10px] text-white/40">2-Way</span>
+                <span className="mono rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
+                  2-way
+                </span>
               )}
             </button>
 
             <button
               type="button"
               onClick={onToggleRecentActivity}
-              title="Recent Activity Feed"
+              title="Activity Log"
               className={`flex w-full items-center rounded-lg text-xs font-medium transition-colors ${
                 isCollapsed ? 'justify-center py-2.5' : 'justify-between px-2.5 py-2'
               } ${
@@ -291,32 +378,34 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
             <button
               type="button"
               onClick={() => onSelectViewMode('settings')}
-              title="Database & Backup Settings"
+              title="Settings"
+              aria-label="Settings"
+              aria-current={viewMode === 'settings' ? 'page' : undefined}
               className={`flex w-full items-center rounded-lg text-xs font-medium transition-colors ${
                 isCollapsed ? 'justify-center py-2.5' : 'justify-between px-2.5 py-2'
               } ${
                 viewMode === 'settings'
-                  ? 'bg-white/[0.1] text-white'
+                  ? 'bg-white/[0.12] text-white shadow-sm'
                   : 'text-white/60 hover:bg-white/[0.04] hover:text-white'
               }`}
             >
               <span className="flex items-center gap-2.5 whitespace-nowrap">
-                <Database className="h-4 w-4 shrink-0 text-emerald-400" />
+                <Settings
+                  className={`h-4 w-4 shrink-0 transition-colors ${
+                    viewMode === 'settings' ? 'text-white' : 'text-white/65'
+                  }`}
+                />
                 {!isCollapsed && <span>Settings</span>}
               </span>
-              {!isCollapsed && (
-                <span className="mono text-[10px] text-white/40">DB</span>
-              )}
             </button>
           </div>
         </div>
 
-
-        {/* SECTION 2: Brains (Workspaces) */}
+        {/* SECTION 2: Memory Brains */}
         <div className="border-t border-white/10 pt-4">
           {!isCollapsed ? (
             <div className="flex items-center justify-between px-2 pb-1.5">
-              <span className="text-[11px] font-medium text-white/45">
+              <span className="text-[10.5px] font-medium uppercase tracking-[0.12em] text-white/40">
                 Memory Brains
               </span>
               <div className="flex items-center gap-1">
@@ -398,14 +487,22 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
                   <button
                     type="button"
                     onClick={() => onSelectBrain(b)}
-                    title={`Brain: ${b} (${count} facts)`}
+                    title={`Brain: ${b} (${count} memories)`}
                     className={`flex min-w-0 flex-1 items-center gap-2.5 text-left text-xs ${
                       isCollapsed ? 'justify-center' : ''
                     }`}
                   >
-                    <span className={isSelected ? 'text-white' : 'text-white/50'}>
-                      {getBrainIcon(b)}
-                    </span>
+                    {!isCollapsed ? (
+                      <span
+                        className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                          isSelected ? 'bg-white' : 'bg-white/30'
+                        }`}
+                      />
+                    ) : (
+                      <span className={isSelected ? 'text-white' : 'text-white/50'}>
+                        {getBrainIcon(b)}
+                      </span>
+                    )}
                     {!isCollapsed && (
                       <span className="truncate capitalize whitespace-nowrap">{b}</span>
                     )}
@@ -437,11 +534,11 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
           </div>
         </div>
 
-        {/* SECTION 3: AI Source Filter */}
+        {/* SECTION 3: AI Sources */}
         <div className="border-t border-white/10 pt-4">
           {!isCollapsed && (
             <div className="flex items-center justify-between px-2 pb-1.5">
-              <span className="text-[11px] font-medium text-white/45">
+              <span className="text-[10.5px] font-medium uppercase tracking-[0.12em] text-white/40">
                 AI Sources
               </span>
               {activeSourceFilter && (
@@ -471,7 +568,7 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
             >
               <span className="flex items-center gap-2.5 whitespace-nowrap">
                 <Layers className="h-3.5 w-3.5 shrink-0 text-white/60" />
-                {!isCollapsed && <span>All Sources</span>}
+                {!isCollapsed && <span>All sources</span>}
               </span>
               {!isCollapsed && (
                 <span className="mono text-[11px] tabular-nums text-white/40">
@@ -490,7 +587,7 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
                   key={src}
                   type="button"
                   onClick={() => onSelectSourceFilter(isSelected ? null : src)}
-                  title={`${meta.name} (${count} facts)`}
+                  title={`${meta.name} (${count} memories)`}
                   className={`flex w-full items-center rounded-lg text-xs transition-colors ${
                     isCollapsed ? 'justify-center py-2' : 'justify-between px-2.5 py-1.5'
                   } ${
@@ -501,7 +598,7 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
                 >
                   <span className="flex items-center gap-2.5 min-w-0">
                     <span
-                      className="h-2.5 w-2.5 shrink-0 rounded-sm"
+                      className="h-2 w-2 shrink-0 rounded-full"
                       style={{ backgroundColor: meta.color }}
                     />
                     {!isCollapsed && (
@@ -519,11 +616,11 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
           </div>
         </div>
 
-        {/* SECTION 4: Document Format Filter (Expanded Mode) */}
+        {/* SECTION 4: Content Formats (Expanded Mode) */}
         {!isCollapsed && activeFileTypes.length > 0 && (
           <div className="border-t border-white/10 pt-4">
             <div className="flex items-center justify-between px-2 pb-1.5">
-              <span className="text-[11px] font-medium text-white/45">
+              <span className="text-[10.5px] font-medium uppercase tracking-[0.12em] text-white/40">
                 Content Formats
               </span>
               {activeFileTypeFilter && (
@@ -570,44 +667,65 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
       </div>
 
       {/* Sidebar Bottom Utility Footer */}
-      <div className="shrink-0 border-t border-white/10 p-2.5 space-y-1 bg-[#05070f]">
+      <div className="shrink-0 border-t border-white/10 p-2.5 space-y-2 bg-[#05070f]">
         {!isCollapsed ? (
           <>
+            <button
+              type="button"
+              onClick={() => onOpenIngest('companion')}
+              className="flex w-full items-center justify-between rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2 text-left transition hover:border-white/25 hover:bg-white/[0.06]"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-400" />
+                <div className="min-w-0">
+                  <div className="text-xs font-medium text-white truncate">
+                    Browser Companion
+                  </div>
+                  <div className="mono text-[10px] text-white/45 truncate">
+                    Local extension & tokens
+                  </div>
+                </div>
+              </div>
+              <ExternalLink className="h-3.5 w-3.5 shrink-0 text-white/40" />
+            </button>
+
             <div className="grid grid-cols-2 gap-1.5">
               <button
                 type="button"
                 onClick={() => onOpenIngest('import')}
-                className="flex items-center justify-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.03] px-2.5 py-1.5 text-xs font-medium text-white/75 transition hover:border-white/25 hover:bg-white/[0.07] hover:text-white whitespace-nowrap"
+                className="flex items-center justify-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.03] px-2.5 py-1.5 text-xs font-medium text-white/80 transition hover:border-white/25 hover:bg-white/[0.07] hover:text-white whitespace-nowrap"
               >
                 <FileText className="h-3.5 w-3.5 shrink-0" />
-                <span>Capture Hub</span>
+                <span>Capture</span>
               </button>
               <button
                 type="button"
-                onClick={() => onOpenIngest('export')}
-                className="flex items-center justify-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.03] px-2.5 py-1.5 text-xs font-medium text-white/75 transition hover:border-white/25 hover:bg-white/[0.07] hover:text-white whitespace-nowrap"
-                title="Export Brain into portable Markdown (.md)"
+                onClick={onExportSnapshot}
+                className="flex items-center justify-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.03] px-2.5 py-1.5 text-xs font-medium text-white/80 transition hover:border-white/25 hover:bg-white/[0.07] hover:text-white whitespace-nowrap"
+                title="Copy portable Markdown (.md) snapshot of current Brain"
               >
                 <Download className="h-3.5 w-3.5 shrink-0" />
                 <span>Export MD</span>
               </button>
             </div>
-            <div className="flex items-center justify-between pt-1 px-1">
-              <button
-                type="button"
-                onClick={() => onOpenIngest('companion')}
-                className="text-[11px] text-white/50 hover:text-white transition whitespace-nowrap"
-              >
-                Browser Companion
-              </button>
+
+            <div className="flex items-center justify-between border-t border-white/10 pt-2 px-1">
+              <div className="min-w-0">
+                <div className="text-xs font-medium text-white/85 truncate">
+                  {userIdentity}
+                </div>
+                <div className="mono text-[10px] text-white/40 truncate">
+                  local SQLite workspace
+                </div>
+              </div>
               <button
                 type="button"
                 onClick={onSwitchToWelcome}
-                className="flex items-center gap-1 text-[11px] text-white/45 hover:text-white transition whitespace-nowrap"
-                title="Switch to Welcome Portal"
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white/45 hover:bg-white/[0.06] hover:text-white transition"
+                title="Return to Welcome Screen"
+                aria-label="Return to Welcome Screen"
               >
-                <span>Portal</span>
-                <LogOut className="h-3 w-3" />
+                <LogOut className="h-3.5 w-3.5" />
               </button>
             </div>
           </>
@@ -615,9 +733,10 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
           <div className="flex flex-col items-center gap-1.5">
             <button
               type="button"
-              onClick={() => onOpenIngest('export')}
+              onClick={onExportSnapshot}
               className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.06] hover:text-white"
               title="Export Portable Markdown"
+              aria-label="Export Portable Markdown"
             >
               <Download className="h-4 w-4" />
             </button>
@@ -625,7 +744,8 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
               type="button"
               onClick={onSwitchToWelcome}
               className="flex h-8 w-8 items-center justify-center rounded-lg text-white/50 hover:bg-white/[0.06] hover:text-white"
-              title="Welcome Portal"
+              title="Return to Welcome Screen"
+              aria-label="Return to Welcome Screen"
             >
               <LogOut className="h-4 w-4" />
             </button>

@@ -1,16 +1,35 @@
 import React, { useState, useEffect } from 'react';
+import {
+  Code2,
+  GraduationCap,
+  User,
+  BrainCircuit,
+  Check,
+  Database,
+  Search,
+  MousePointerClick,
+  Plug,
+  IdCard,
+} from 'lucide-react';
 import { Constellation, ConstellationMood } from './Constellation';
 import { BrainLogo } from './BrainLogo';
 import { brainStore } from '../services/brainStorage';
 import { DeleteBrainModal } from './DeleteBrainModal';
+import { SOURCE_PALETTE, AISource } from '../types/brain';
 
 interface WelcomeViewProps {
   onEnterBrain: (selectedBrain?: string, userLabel?: string) => void;
   isEnteringExternal?: boolean;
 }
 
-export const WelcomeView: React.FC<WelcomeViewProps> = ({ onEnterBrain, isEnteringExternal = false }) => {
-  const [brains, setBrains] = useState<string[]>(brainStore.getBrains());
+export const WelcomeView: React.FC<WelcomeViewProps> = ({
+  onEnterBrain,
+  isEnteringExternal = false,
+}) => {
+  const [brains, setBrains] = useState<string[]>(() => brainStore.getBrains());
+  const [brainCounts, setBrainCounts] = useState<Record<string, number>>(() =>
+    brainStore.getFactCountsByBrain()
+  );
   const [selectedBrain, setSelectedBrain] = useState<string>(() => {
     const list = brainStore.getBrains();
     return list.includes('coding') ? 'coding' : list[0] || 'coding';
@@ -23,13 +42,16 @@ export const WelcomeView: React.FC<WelcomeViewProps> = ({ onEnterBrain, isEnteri
   const [brainToDelete, setBrainToDelete] = useState<string | null>(null);
 
   useEffect(() => {
-    const unsubscribe = brainStore.subscribe(() => {
+    const syncState = () => {
       const updated = brainStore.getBrains();
       setBrains(updated);
+      setBrainCounts(brainStore.getFactCountsByBrain());
       if (!updated.includes(selectedBrain) && updated.length > 0) {
         setSelectedBrain(updated[0]);
       }
-    });
+    };
+    syncState();
+    const unsubscribe = brainStore.subscribe(syncState);
     return unsubscribe;
   }, [selectedBrain]);
 
@@ -45,216 +67,323 @@ export const WelcomeView: React.FC<WelcomeViewProps> = ({ onEnterBrain, isEnteri
     if (e) e.preventDefault();
     if (isEntering) return;
     setIsEnteringLocal(true);
-    // Notify parent to start warp sequence
-    onEnterBrain(selectedBrain, userLabel || 'Local Developer');
+    onEnterBrain(selectedBrain, userLabel.trim() || 'Local Developer');
   };
 
+  const handleCreateNewBrain = () => {
+    const name = newBrainInput.trim().toLowerCase();
+    if (!name) return;
+    brainStore.createBrain(name);
+    setSelectedBrain(name);
+    setNewBrainInput('');
+    setIsCreatingBrain(false);
+  };
+
+  const getBrainIcon = (brainName: string) => {
+    const lower = brainName.toLowerCase();
+    if (lower === 'coding' || lower.includes('dev') || lower.includes('code')) {
+      return <Code2 className="h-4 w-4" />;
+    }
+    if (lower === 'college' || lower.includes('uni') || lower.includes('study')) {
+      return <GraduationCap className="h-4 w-4" />;
+    }
+    if (lower === 'personal' || lower.includes('life')) {
+      return <User className="h-4 w-4" />;
+    }
+    return <BrainCircuit className="h-4 w-4" />;
+  };
+
+  const formatBrainTitle = (name: string) =>
+    name ? name.charAt(0).toUpperCase() + name.slice(1) : 'Coding';
+
+  const sourceKeys = Object.keys(SOURCE_PALETTE) as AISource[];
+
   return (
-    <main className="relative min-h-[100svh] overflow-hidden bg-[#03040a]">
-      {/* Colourful Multi-Source Interactive Constellation Canvas */}
+    <main className="relative min-h-[100svh] overflow-x-hidden bg-[#03040a] text-white selection:bg-white/20">
+      {/* Multi-Source Interactive Neural Constellation Hero */}
       <Constellation mood={mood} />
 
-      {/* Grid line ambient overlay */}
+      {/* Subtle spatial grid overlay */}
       <div
         aria-hidden="true"
-        className="pointer-events-none absolute inset-0 transition-opacity ease-out [background-image:linear-gradient(rgba(255,255,255,.025)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,.025)_1px,transparent_1px)] [background-size:56px_56px] [mask-image:radial-gradient(circle_at_center,black,transparent_80%)]"
+        className="pointer-events-none absolute inset-0 transition-opacity ease-out [background-image:linear-gradient(rgba(255,255,255,.022)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,.022)_1px,transparent_1px)] [background-size:56px_56px] [mask-image:radial-gradient(circle_at_center,black,transparent_82%)]"
         style={{
-          opacity: isEntering ? 0 : 0.18,
+          opacity: isEntering ? 0 : 0.2,
           transitionDuration: '420ms',
         }}
       />
 
-      {/* Radial shadow backdrop behind form */}
+      {/* Soft dark vignette behind left workspace column */}
       <div
         aria-hidden="true"
-        className="pointer-events-none absolute left-1/2 top-1/2 h-[460px] w-[500px] -translate-x-1/2 -translate-y-1/2 transition-opacity ease-out lg:left-[28%] lg:h-[480px] lg:w-[540px]"
+        className="pointer-events-none absolute left-1/2 top-1/2 h-[640px] w-[580px] -translate-x-1/2 -translate-y-1/2 transition-opacity ease-out lg:left-[28%] lg:h-[720px] lg:w-[660px]"
         style={{
           background:
-            'radial-gradient(closest-side, rgba(5,5,8,0.92) 0%, rgba(5,5,8,0.72) 58%, rgba(3,4,10,0) 100%)',
+            'radial-gradient(closest-side, rgba(4,5,11,0.94) 0%, rgba(4,5,11,0.78) 58%, rgba(3,4,10,0) 100%)',
           opacity: isEntering ? 0 : 1,
           transitionDuration: '300ms',
         }}
       />
 
-      {/* Welcome Card Container */}
-      <div className="relative flex min-h-[100svh] items-center justify-center px-6 lg:justify-start lg:px-[10%]">
-        <div
-          className="w-full max-w-[380px] transition-[opacity,transform] ease-out"
-          style={{
-            opacity: isEntering ? 0 : 1,
-            transform: isEntering ? 'translateY(8px)' : 'none',
-            transitionDuration: '420ms',
-          }}
-        >
-          {/* Logo Mark */}
-          <div
-            className="rise mb-6 flex items-center gap-3 text-ink-soft"
-            style={{ animationDelay: '100ms' }}
-          >
-            <div className="flex h-8 w-8 items-center justify-center rounded-xl border border-white/20 bg-white/10 text-white backdrop-blur-md">
-              <BrainLogo size={18} />
+      {/* Foreground Content Layout */}
+      <div
+        className="relative z-10 mx-auto flex min-h-[100svh] w-full max-w-[1380px] flex-col justify-between px-6 py-8 sm:px-10 lg:px-16 lg:py-10 transition-[opacity,transform] ease-out"
+        style={{
+          opacity: isEntering ? 0 : 1,
+          transform: isEntering ? 'translateY(8px)' : 'none',
+          transitionDuration: '420ms',
+        }}
+      >
+        {/* Top Brand Lockup (Clean, focused product identity without developer console links or status pills) */}
+        <header className="rise flex items-center justify-between" style={{ animationDelay: '60ms' }}>
+          <div className="flex items-center gap-3.5">
+            <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/15 bg-white/[0.06] text-white shadow-inner backdrop-blur-md">
+              <BrainLogo size={20} />
             </div>
             <div className="flex flex-col">
-              <span className="mono text-[14px] font-semibold tracking-wider text-white">
-                THE BRAIN
+              <span className="text-[15px] font-semibold tracking-tight text-white">
+                The Brain
               </span>
-              <span className="mono text-[10px] text-ink-ghost tracking-widest uppercase">
+              <span className="mono text-[10px] tracking-[0.2em] text-white/45 uppercase">
                 Central Memory System
               </span>
             </div>
           </div>
+        </header>
 
-          {/* Heading */}
-          <h1
-            className="rise text-[26px] font-medium leading-tight text-white tracking-tight"
-            style={{ animationDelay: '180ms' }}
-          >
-            Welcome to The Brain
-          </h1>
+        {/* Main Hero & Workspace Selection Column */}
+        <div className="my-auto py-8 lg:py-6">
+          <div className="w-full max-w-[440px]">
+            {/* Main Tagline */}
+            <h1
+              className="rise text-[38px] sm:text-[46px] font-bold leading-[1.08] tracking-tight text-white"
+              style={{ animationDelay: '130ms' }}
+            >
+              <span className="block">One memory.</span>
+              <span className="block bg-gradient-to-r from-[#D85A30] via-[#9B72CF] to-[#378ADD] bg-clip-text text-transparent">
+                Every AI you use.
+              </span>
+            </h1>
 
-          {/* Value Prop Subtitle */}
-          <p
-            className="rise mt-2.5 text-xs text-ink-faint leading-relaxed"
-            style={{ animationDelay: '260ms' }}
-          >
-            One local memory that follows you across Claude, ChatGPT, Gemini, Cursor, GitHub, and local tools. Stop re-explaining context and burning tokens.
-          </p>
+            {/* Supporting Description */}
+            <p
+              className="rise mt-4 text-[14px] leading-relaxed text-white/60"
+              style={{ animationDelay: '200ms' }}
+            >
+              A local memory that follows you across Claude, ChatGPT, Gemini, Cursor, GitHub and your local models. Stop re-explaining context and burning tokens.
+            </p>
 
-          {/* Starter Config */}
-          <form
-            onSubmit={handleLaunch}
-            className="rise mt-6 flex flex-col gap-4"
-            style={{ animationDelay: '340ms' }}
-          >
-            {/* Quick Brain Selector */}
-            <div>
-              <div className="flex items-center justify-between mb-2">
-                <label className="mono text-[11px] uppercase tracking-wider text-ink-ghost">
+            {/* Workspace Brain Selection & Launch Card */}
+            <form
+              onSubmit={handleLaunch}
+              className="rise mt-7 rounded-2xl border border-white/12 bg-[#080a14]/88 p-5 shadow-2xl backdrop-blur-xl"
+              style={{ animationDelay: '270ms' }}
+            >
+              {/* Choose Workspace Brain Header */}
+              <div className="flex items-center justify-between mb-3">
+                <span className="mono text-[10.5px] font-medium uppercase tracking-[0.14em] text-white/50">
                   Choose Workspace Brain
-                </label>
+                </span>
                 <button
                   type="button"
-                  onClick={() => setIsCreatingBrain(!isCreatingBrain)}
-                  className="mono text-[10.5px] text-indigo-400 hover:text-indigo-300 transition"
+                  onClick={() => setIsCreatingBrain((prev) => !prev)}
+                  className="mono text-[11px] font-medium text-white/65 transition hover:text-white"
                 >
-                  {isCreatingBrain ? 'Cancel' : '+ New Brain'}
+                  {isCreatingBrain ? 'Cancel' : '+ New brain'}
                 </button>
               </div>
 
+              {/* Inline New Brain Creation */}
               {isCreatingBrain && (
-                <div className="flex gap-1.5 mb-2.5">
+                <div className="mb-3 flex gap-2">
                   <input
                     type="text"
-                    placeholder="New brain name..."
+                    placeholder="New brain name (e.g. research)..."
                     value={newBrainInput}
                     onChange={(e) => setNewBrainInput(e.target.value)}
-                    className="mono flex-1 rounded-xl border border-white/25 bg-black/60 px-3 py-1.5 text-xs text-white outline-none placeholder:text-white/30"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        handleCreateNewBrain();
+                      }
+                    }}
+                    className="mono flex-1 rounded-xl border border-white/20 bg-black/60 px-3 py-2 text-xs text-white outline-none placeholder:text-white/35 focus:border-white/45"
                   />
                   <button
                     type="button"
-                    onClick={() => {
-                      if (newBrainInput.trim()) {
-                        const name = newBrainInput.trim().toLowerCase();
-                        brainStore.createBrain(name);
-                        setSelectedBrain(name);
-                        setNewBrainInput('');
-                        setIsCreatingBrain(false);
-                      }
-                    }}
-                    className="mono rounded-xl bg-white/90 px-3 py-1.5 text-xs font-semibold text-black hover:bg-white"
+                    onClick={handleCreateNewBrain}
+                    className="mono rounded-xl bg-white px-3.5 py-2 text-xs font-semibold text-black transition hover:bg-white/90"
                   >
                     Add
                   </button>
                 </div>
               )}
 
-              <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto scrollbar-thin">
+              {/* Workspace Brain Cards Grid */}
+              <div
+                role="radiogroup"
+                aria-label="Choose Workspace Brain"
+                className="grid grid-cols-3 gap-2.5 max-h-52 overflow-y-auto pr-0.5 scrollbar-thin"
+              >
                 {brains.map((b) => {
                   const isSelected = selectedBrain === b;
+                  const count = brainCounts[b] || 0;
                   return (
                     <div
                       key={b}
-                      className={`mono flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium capitalize transition ${
+                      onClick={() => setSelectedBrain(b)}
+                      role="radio"
+                      aria-checked={isSelected}
+                      aria-label={`${formatBrainTitle(b)} (${count} ${count === 1 ? 'memory' : 'memories'})`}
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          setSelectedBrain(b);
+                        }
+                      }}
+                      className={`group relative flex cursor-pointer flex-col justify-between rounded-xl border p-3 text-left transition-all ${
                         isSelected
-                          ? 'border-white/50 bg-white/20 text-white shadow-lg shadow-white/5'
-                          : 'border-white/15 bg-black/40 text-white/60 hover:border-white/30 hover:text-white'
+                          ? 'border-white/45 bg-white/[0.09] text-white shadow-lg shadow-black/40'
+                          : 'border-white/10 bg-white/[0.02] text-white/65 hover:border-white/25 hover:bg-white/[0.05] hover:text-white'
                       }`}
                     >
-                      <button
-                        type="button"
-                        onClick={() => setSelectedBrain(b)}
-                        className="text-left"
-                      >
-                        {b}
-                      </button>
-                      {brains.length > 1 && (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setBrainToDelete(b);
-                          }}
-                          className="text-white/30 hover:text-rose-400 transition ml-1 text-[11px]"
-                          title={`Delete brain "${b}"`}
+                      <div className="flex items-center justify-between gap-1">
+                        <span
+                          className={`transition-colors ${
+                            isSelected ? 'text-white' : 'text-white/50 group-hover:text-white/75'
+                          }`}
                         >
-                          ✕
-                        </button>
-                      )}
+                          {getBrainIcon(b)}
+                        </span>
+
+                        <div className="flex items-center gap-1">
+                          {brains.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setBrainToDelete(b);
+                              }}
+                              className="opacity-0 group-hover:opacity-100 text-white/35 hover:text-rose-400 transition-opacity text-[11px] px-0.5"
+                              title={`Delete brain "${b}"`}
+                              aria-label={`Delete brain ${b}`}
+                            >
+                              ×
+                            </button>
+                          )}
+                          <span
+                            className={`flex h-4 w-4 items-center justify-center rounded-full border transition-colors ${
+                              isSelected
+                                ? 'border-white bg-white text-black'
+                                : 'border-white/20 bg-transparent'
+                            }`}
+                          >
+                            {isSelected && <Check className="h-2.5 w-2.5 stroke-[3]" />}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="mt-3">
+                        <div className="text-[13px] font-semibold capitalize tracking-tight text-white truncate">
+                          {b}
+                        </div>
+                        <div className="mono mt-0.5 text-[10.5px] tabular-nums text-white/45">
+                          {count} {count === 1 ? 'memory' : 'memories'}
+                        </div>
+                      </div>
                     </div>
                   );
                 })}
               </div>
-            </div>
 
-            {/* Optional Workspace Label */}
-            <div>
-              <label className="mono block text-[11px] uppercase tracking-wider text-ink-ghost mb-1.5">
-                Workspace / Identity <span className="text-white/30">(optional)</span>
-              </label>
-              <input
-                type="text"
-                placeholder="e.g. My Projects, Alex's Lab"
-                value={userLabel}
-                onChange={(e) => setUserLabel(e.target.value)}
-                className="w-full rounded-xl border border-white/20 bg-black/40 px-3.5 py-2.5 text-xs text-white outline-none backdrop-blur-md transition placeholder:text-white/30 focus:border-white/45 focus:bg-black/60"
-              />
-            </div>
+              {/* Optional Workspace Identity */}
+              <div className="mt-4">
+                <label
+                  htmlFor="workspace-identity-input"
+                  className="mono block text-[10.5px] uppercase tracking-[0.14em] text-white/45 mb-1.5"
+                >
+                  Workspace Identity <span className="text-white/30 lowercase tracking-normal">— optional</span>
+                </label>
+                <div className="relative flex items-center">
+                  <IdCard className="pointer-events-none absolute left-3.5 h-3.5 w-3.5 text-white/35" />
+                  <input
+                    id="workspace-identity-input"
+                    type="text"
+                    placeholder="e.g. My Projects, Alex's Lab"
+                    value={userLabel}
+                    onChange={(e) => setUserLabel(e.target.value)}
+                    className="w-full rounded-xl border border-white/12 bg-black/50 pl-9 pr-3.5 py-2.5 text-xs text-white outline-none transition placeholder:text-white/30 focus:border-white/35 focus:bg-black/70"
+                  />
+                </div>
+              </div>
 
-            {/* Direct Launch CTA */}
-            <button
-              type="submit"
-              disabled={isEntering}
-              onMouseEnter={() => setIsHoveredLaunch(true)}
-              onMouseLeave={() => setIsHoveredLaunch(false)}
-              className="mono mt-2 min-h-11 w-full rounded-xl bg-white px-4 py-3.5 text-xs font-semibold text-black transition-all hover:bg-white/90 active:scale-[0.98] disabled:opacity-50 flex items-center justify-center gap-2 shadow-xl shadow-white/10"
+              {/* Primary Launch Action */}
+              <button
+                type="submit"
+                disabled={isEntering}
+                onMouseEnter={() => setIsHoveredLaunch(true)}
+                onMouseLeave={() => setIsHoveredLaunch(false)}
+                className="mt-4 flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-white px-4 py-3 text-[13px] font-semibold text-black shadow-xl shadow-white/5 transition-all hover:bg-white/92 active:scale-[0.99] disabled:opacity-50"
+              >
+                <span>
+                  {isEntering
+                    ? 'Opening The Brain…'
+                    : `Launch ${formatBrainTitle(selectedBrain)} brain`}
+                </span>
+                <span aria-hidden="true" className="text-black/70">
+                  →
+                </span>
+              </button>
+
+              {/* Unified Multi-Source Footer inside Card */}
+              <div className="mt-4 flex items-center justify-between border-t border-white/10 pt-3.5 text-[11px]">
+                <span className="text-white/45">Multi-source unified</span>
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-1.5">
+                    {sourceKeys.map((srcKey) => (
+                      <span
+                        key={srcKey}
+                        className="h-2 w-2 rounded-full"
+                        style={{ backgroundColor: SOURCE_PALETTE[srcKey].color }}
+                        title={SOURCE_PALETTE[srcKey].name}
+                      />
+                    ))}
+                  </div>
+                  <span className="mono text-[10.5px] tabular-nums text-white/50">
+                    {sourceKeys.length} sources
+                  </span>
+                </div>
+              </div>
+            </form>
+
+            {/* Core Capability Highlights */}
+            <div
+              className="rise mt-5 grid grid-cols-2 gap-x-6 gap-y-2.5 px-1 text-[11.5px] text-white/50"
+              style={{ animationDelay: '340ms' }}
             >
-              <span>{isEntering ? 'Opening The Brain…' : 'Launch The Brain'}</span>
-              <span className="text-black/60">→</span>
-            </button>
-          </form>
-
-          {/* Multi-AI Feature Highlights */}
-          <div
-            className="rise mt-7 border-t border-white/10 pt-4"
-            style={{ animationDelay: '420ms' }}
-          >
-            <div className="flex items-center justify-between text-[11px]">
-              <span className="mono text-white/40">Multi-source unified:</span>
-              <div className="flex items-center gap-1.5">
-                <span className="h-2 w-2 rounded-full bg-[#D85A30]" title="Claude" />
-                <span className="h-2 w-2 rounded-full bg-[#378ADD]" title="ChatGPT" />
-                <span className="h-2 w-2 rounded-full bg-[#1D9E75]" title="Gemini" />
-                <span className="h-2 w-2 rounded-full bg-[#7F77DD]" title="GitHub" />
-                <span className="h-2 w-2 rounded-full bg-[#D4537E]" title="Moodle" />
-                <span className="h-2 w-2 rounded-full bg-[#3D9BB8]" title="Cursor" />
-                <span className="h-2 w-2 rounded-full bg-[#B8923D]" title="Local AI" />
+              <div className="flex items-center gap-2">
+                <Database className="h-3.5 w-3.5 text-white/35 shrink-0" />
+                <span>Local SQLite storage</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <Search className="h-3.5 w-3.5 text-white/35 shrink-0" />
+                <span>Full-text recall</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <MousePointerClick className="h-3.5 w-3.5 text-white/35 shrink-0" />
+                <span>Click-to-correct</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <Plug className="h-3.5 w-3.5 text-white/35 shrink-0" />
+                <span>MCP integration ready</span>
               </div>
             </div>
-            <p className="mono mt-2 text-[10px] text-white/40 leading-relaxed">
-              Local SQLite storage · Full-text search (recall) · Click-to-correct · MCP integration ready
-            </p>
           </div>
         </div>
+
+        {/* Subtle bottom spacer for balanced vertical rhythm */}
+        <div className="h-2" />
       </div>
 
       {brainToDelete && (

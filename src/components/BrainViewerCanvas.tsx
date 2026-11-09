@@ -9,13 +9,18 @@ import {
   getFactFileType,
 } from '../types/brain';
 
+export type GraphLayoutMode = 'radial' | 'force' | 'timeline';
+
 interface BrainViewerCanvasProps {
   brainName: string;
   facts: Fact[];
   selectedFactId: number | null;
+  selectedSource?: AISource | null;
   onSelectFact: (fact: Fact | null) => void;
+  onSelectSource?: (source: AISource | null) => void;
   searchQuery: string;
   activeSourceFilter: string | null;
+  isInspectorOpen?: boolean;
 }
 
 interface GraphNode {
@@ -73,22 +78,33 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
   brainName,
   facts,
   selectedFactId,
+  selectedSource = null,
   onSelectFact,
+  onSelectSource,
   searchQuery,
   activeSourceFilter,
+  isInspectorOpen = false,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [hoveredFact, setHoveredFact] = useState<Fact | null>(null);
+  const [hoveredSourceHub, setHoveredSourceHub] = useState<AISource | null>(null);
   const [hoveredCluster, setHoveredCluster] = useState<ClusterMeta | null>(null);
   const [tooltipPos, setTooltipPos] = useState<{ x: number; y: number } | null>(null);
   const [currentZoomDisplay, setCurrentZoomDisplay] = useState(100);
+  const [layoutMode, setLayoutMode] = useState<GraphLayoutMode>('radial');
 
   // Performance Optimization Refs for 60/120fps animation loop without React teardown
   const selectedFactIdRef = useRef(selectedFactId);
   selectedFactIdRef.current = selectedFactId;
 
+  const selectedSourceRef = useRef(selectedSource);
+  selectedSourceRef.current = selectedSource;
+
   const hoveredFactRef = useRef(hoveredFact);
   hoveredFactRef.current = hoveredFact;
+
+  const hoveredSourceHubRef = useRef(hoveredSourceHub);
+  hoveredSourceHubRef.current = hoveredSourceHub;
 
   const hoveredClusterRef = useRef(hoveredCluster);
   hoveredClusterRef.current = hoveredCluster;
@@ -103,6 +119,39 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
   const [showHeatMap, setShowHeatMap] = useState(false);
   const showHeatMapRef = useRef(showHeatMap);
   showHeatMapRef.current = showHeatMap;
+
+  // Real Workspace Summary Stats (computed from actual facts in current brain)
+  const workspaceStats = useMemo(() => {
+    const activeSourcesCount = new Set(facts.map((f) => f.source)).size;
+    const totalPaletteSources = Object.keys(SOURCE_PALETTE).length;
+    let latestMs = 0;
+    for (const f of facts) {
+      const t = new Date(f.updated_at).getTime();
+      if (!Number.isNaN(t) && t > latestMs) {
+        latestMs = t;
+      }
+    }
+    let lastSyncLabel = '—';
+    if (latestMs > 0) {
+      const diffSec = Math.max(0, Math.floor((Date.now() - latestMs) / 1000));
+      if (diffSec < 60) lastSyncLabel = 'Just now';
+      else if (diffSec < 3600) lastSyncLabel = `${Math.floor(diffSec / 60)}m ago`;
+      else if (diffSec < 86400) lastSyncLabel = `${Math.floor(diffSec / 3600)}h ago`;
+      else if (diffSec < 86400 * 7) lastSyncLabel = `${Math.floor(diffSec / 86400)}d ago`;
+      else {
+        lastSyncLabel = new Date(latestMs).toLocaleDateString(undefined, {
+          month: 'short',
+          day: 'numeric',
+        });
+      }
+    }
+    return {
+      memoriesCount: facts.length,
+      activeSourcesCount,
+      totalPaletteSources,
+      lastSyncLabel,
+    };
+  }, [facts]);
 
   // Pan & Zoom
   const panRef = useRef({ x: 0, y: 0, zoom: 1 });
@@ -268,7 +317,7 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
         speed: 0.00035,
         twspeed: 0.001,
         label: palette.name,
-        subtext: `${countForSource} facts`,
+        subtext: `${countForSource} ${countForSource === 1 ? 'fact' : 'facts'}`,
         branchLevel: 1,
       });
 
@@ -478,6 +527,124 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
       }
     }
 
+    // 5. Apply Layout Mode Transformations (Radial vs Force vs Timeline)
+    if (layoutMode === 'force' && nodeList.length > 1) {
+      // Deterministic organic force relaxation that pulls cross-linked / related nodes closer
+      // while keeping source hubs anchored as distinct gravitational basins
+      const iterations = 28;
+      for (let iter = 0; iter < iterations; iter++) {
+        // Gentle repulsion between non-center nodes so they don't collide
+        for (let i = 1; i < nodeList.length; i++) {
+          for (let j = i + 1; j < nodeList.length; j++) {
+            const na = nodeList[i];
+            const nb = nodeList[j];
+            const dx = nb.unclusteredBaseX - na.unclusteredBaseX;
+            const dy = nb.unclusteredBaseY - na.unclusteredBaseY;
+            const distSq = Math.max(64, dx * dx + dy * dy);
+            const minDist = na.isSourceHub || nb.isSourceHub ? 110 : 42;
+            if (distSq < minDist * minDist) {
+              const dist = Math.sqrt(distSq);
+              const push = ((minDist - dist) / dist) * 0.22;
+              if (!na.isCenter) {
+                na.unclusteredBaseX -= dx * push;
+                na.unclusteredBaseY -= dy * push;
+              }
+              if (!nb.isCenter) {
+                nb.unclusteredBaseX += dx * push;
+                nb.unclusteredBaseY += dy * push;
+              }
+            }
+          }
+        }
+        // Spring attraction along synaptic links (especially cross-source links)
+        for (const ln of lineList) {
+          const na = nodeList[ln.a];
+          const nb = nodeList[ln.b];
+          if (!na || !nb) continue;
+          const dx = nb.unclusteredBaseX - na.unclusteredBaseX;
+          const dy = nb.unclusteredBaseY - na.unclusteredBaseY;
+          const dist = Math.max(1, Math.hypot(dx, dy));
+          const targetDist = ln.isCrossLink ? 120 : na.isCenter ? 155 : 48;
+          const pull = ((dist - targetDist) / dist) * (ln.isCrossLink ? 0.08 : 0.14);
+          if (!na.isCenter && !na.isSourceHub) {
+            na.unclusteredBaseX += dx * pull;
+            na.unclusteredBaseY += dy * pull;
+          }
+          if (!nb.isCenter && !nb.isSourceHub) {
+            nb.unclusteredBaseX -= dx * pull;
+            nb.unclusteredBaseY -= dy * pull;
+          }
+        }
+      }
+      for (const nd of nodeList) {
+        nd.baseX = nd.unclusteredBaseX;
+        nd.baseY = nd.unclusteredBaseY;
+        nd.x = nd.baseX;
+        nd.y = nd.baseY;
+        if (nd.isSourceHub && nd.sourceKey) {
+          const cl = clusterMetaList.find((c) => c.source === nd.sourceKey);
+          if (cl) {
+            cl.x = nd.baseX;
+            cl.y = nd.baseY;
+          }
+        }
+      }
+    } else if (layoutMode === 'timeline') {
+      // Chronological Timeline Layout:
+      // Source hubs align vertically on the left column, and facts distribute horizontally from oldest (left) to newest (right)
+      const chronFacts = [...facts].sort(
+        (a, b) => new Date(a.updated_at).getTime() - new Date(b.updated_at).getTime()
+      );
+      const rankById = new Map<number, number>();
+      chronFacts.forEach((f, idx) => rankById.set(f.id, idx));
+
+      const rowSpan = Math.min(340, Math.max(180, sourcesToDisplay.length * 58));
+      const rowYBySource = new Map<AISource, number>();
+      sourcesToDisplay.forEach((src, sIdx) => {
+        const yPos =
+          sourcesToDisplay.length === 1
+            ? 0
+            : -rowSpan / 2 + (sIdx / (sourcesToDisplay.length - 1)) * rowSpan;
+        rowYBySource.set(src, yPos);
+      });
+
+      for (const nd of nodeList) {
+        if (nd.isCenter) {
+          nd.unclusteredBaseX = -265;
+          nd.unclusteredBaseY = 0;
+        } else if (nd.isSourceHub && nd.sourceKey) {
+          const sy = rowYBySource.get(nd.sourceKey) ?? 0;
+          nd.unclusteredBaseX = -155;
+          nd.unclusteredBaseY = sy;
+          nd.clusterHubX = -155;
+          nd.clusterHubY = sy;
+          const cl = clusterMetaList.find((c) => c.source === nd.sourceKey);
+          if (cl) {
+            cl.x = -155;
+            cl.y = sy;
+          }
+        } else if (nd.fact) {
+          const sy = rowYBySource.get(nd.fact.source) ?? 0;
+          const rank = rankById.get(nd.fact.id) ?? 0;
+          const tNorm = chronFacts.length <= 1 ? 0.5 : rank / (chronFacts.length - 1);
+          const tx = -65 + tNorm * 340;
+          const ty = sy + ((nd.fact.id % 3) - 1) * 14;
+          nd.unclusteredBaseX = tx;
+          nd.unclusteredBaseY = ty;
+          nd.clusterHubX = -155;
+          nd.clusterHubY = sy;
+        } else {
+          // Sub-branch node
+          nd.unclusteredBaseX = nd.clusterHubX + 45;
+          nd.unclusteredBaseY = nd.clusterHubY;
+        }
+        nd.baseX = nd.unclusteredBaseX;
+        nd.baseY = nd.unclusteredBaseY;
+        nd.x = nd.baseX;
+        nd.y = nd.baseY;
+      }
+    }
+
     // Pre-group lines by tier for zero-redundancy O(1) single-pass rendering
     const tierGroups: GraphLine[][] = [[], [], []];
     lineList.forEach((ln) => {
@@ -492,7 +659,7 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
       sourceClusters: clusterMetaList,
       factNodes: nodeList.filter((n) => Boolean(n.fact)),
     };
-  }, [facts, brainName]);
+  }, [facts, brainName, layoutMode]);
 
   // Smooth Pan & Zoom Animator
   const animatePanZoom = (targetX: number, targetY: number, targetZoom: number, duration = 400) => {
@@ -871,8 +1038,8 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
       for (let i = 0; i < nodes.length; i++) {
         const nd = nodes[i];
         if (nd.isCenter) {
-          nd.x = cx;
-          nd.y = cy;
+          nd.x = cx + nd.unclusteredBaseX * zoom;
+          nd.y = cy + nd.unclusteredBaseY * zoom;
         } else {
           // Dynamic positional clustering:
           // Fact nodes smoothly contract toward their parent cluster hub as you zoom out!
@@ -921,19 +1088,16 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
           const isFactLine = Boolean(nb.fact);
           let opacity = ln.baseOpacity;
 
-          // Staggered reveal timing:
-          // Tier 2 (center to source hubs) draws first: 0.3s to 1.1s
-          // Tier 1 (sub-branches) draws second: 0.8s to 1.6s
-          // Tier 0 (fact lines) bloom out in waves: 1.25s to 2.4s
-          let lineDelay = 0.35;
+          // Fast, responsive reveal timing so satellite fact nodes are visible immediately on launch
+          let lineDelay = 0.08;
           if (ln.tier === 2) {
-            lineDelay = 0.3 + (ln.b % 6) * 0.12;
+            lineDelay = 0.05 + (ln.b % 6) * 0.04;
           } else if (ln.tier === 1) {
-            lineDelay = 0.8 + (ln.b % 6) * 0.14;
+            lineDelay = 0.15 + (ln.b % 6) * 0.04;
           } else {
-            lineDelay = 1.25 + (ln.b % 8) * 0.14;
+            lineDelay = 0.22 + (ln.b % 8) * 0.04;
           }
-          const lineAppear = Math.max(0, Math.min(1, (revealSec - lineDelay) / 0.65));
+          const lineAppear = Math.max(0, Math.min(1, (revealSec - lineDelay) / 0.35));
           if (lineAppear <= 0.001) continue;
           const lineEase = 1 - Math.pow(1 - lineAppear, 3);
           opacity *= lineEase * tabSwitchEase;
@@ -944,12 +1108,14 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
           }
 
           if (selectedFactId && nb.fact) {
-            opacity = nb.fact.id === selectedFactId ? 0.9 : 0.04;
+            opacity = nb.fact.id === selectedFactId ? 0.95 : 0.12;
           } else if (isSearchActive && nb.fact) {
             const matches =
               (!activeSourceFilter || nb.fact.source === activeSourceFilter) &&
               (!lowerSearch || (nb.factContentLower ? nb.factContentLower.includes(lowerSearch) : false));
-            opacity = matches ? 0.8 : 0.05;
+            opacity = matches ? 0.85 : 0.16;
+          } else if (activeSourceFilter && nb.isSourceHub && nb.sourceKey) {
+            opacity = nb.sourceKey === activeSourceFilter ? 0.85 : 0.25;
           }
 
           // Spatial culling: skip lines completely offscreen
@@ -1013,39 +1179,36 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
         const isSelected = nd.fact && nd.fact.id === selectedFactId;
         const isHovered = nd.fact && hoveredFact?.id === nd.fact.id;
 
-        // Progressive Awakening Stagger:
-        // Center hub ignites first (0.1s)
-        // Source hubs ignite in rotation (0.55s - 1.2s)
-        // Sub-branches (0.95s - 1.5s)
-        // Fact nodes cascade in waves (1.35s - 2.5s)
-        let nodeDelay = 0.1;
+        let nodeDelay = 0.04;
         if (nd.isCenter) {
-          nodeDelay = 0.1;
+          nodeDelay = 0.02;
         } else if (nd.isSourceHub) {
-          nodeDelay = 0.55 + (i % 6) * 0.14;
+          nodeDelay = 0.08 + (i % 6) * 0.04;
         } else if (nd.branchLevel === 2) {
-          nodeDelay = 0.95 + (i % 5) * 0.14;
+          nodeDelay = 0.16 + (i % 5) * 0.04;
         } else {
           const factSeed = nd.fact ? ((nd.fact.id * 19) % 9) : (i % 9);
-          nodeDelay = 1.35 + factSeed * 0.14;
+          nodeDelay = 0.22 + factSeed * 0.04;
         }
 
-        const nodeAppear = Math.max(0, Math.min(1, (revealSec - nodeDelay) / 0.65));
+        const nodeAppear = Math.max(0, Math.min(1, (revealSec - nodeDelay) / 0.35));
         if (nodeAppear <= 0.001) continue;
         const nodeEase = 1 - Math.pow(1 - nodeAppear, 3);
 
-        let alpha = 0.85;
+        let alpha = 0.88;
         if (nd.fact) {
           if (selectedFactId) {
-            alpha = isSelected ? 1 : 0.14;
+            alpha = isSelected ? 1 : 0.22;
           } else if (isSearchActive) {
             const matches =
               (!activeSourceFilter || nd.fact.source === activeSourceFilter) &&
               (!lowerSearch || (nd.factContentLower ? nd.factContentLower.includes(lowerSearch) : false));
-            alpha = matches ? (isHovered ? 1 : 0.92) : 0.14;
+            alpha = matches ? (isHovered ? 1 : 0.95) : 0.28;
           } else {
-            alpha = 0.58 + 0.32 * Math.sin(now * nd.twspeed + nd.phase2);
+            alpha = 0.68 + 0.28 * Math.sin(now * nd.twspeed + nd.phase2);
           }
+        } else if (nd.isSourceHub && activeSourceFilter) {
+          alpha = nd.sourceKey === activeSourceFilter ? 1 : 0.55;
         }
         alpha *= nodeEase * tabSwitchEase;
 
@@ -1096,8 +1259,8 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
 
 
         // Monospace Typography Labels (Level of Detail: hide small fact labels when clustered or not yet awakened)
-        const labelDelay = nd.isCenter ? 0.45 : nd.isSourceHub ? 1.1 : 1.95;
-        const labelAppear = Math.max(0, Math.min(1, (revealSec - labelDelay) / 0.5));
+        const labelDelay = nd.isCenter ? 0.1 : nd.isSourceHub ? 0.2 : 0.35;
+        const labelAppear = Math.max(0, Math.min(1, (revealSec - labelDelay) / 0.3));
         const showLabel =
           labelAppear > 0.05 &&
           (nd.isCenter ||
@@ -1120,12 +1283,16 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
         }
       }
 
-      animId = requestAnimationFrame(render);
+      timerId = window.setTimeout(() => {
+        animId = requestAnimationFrame(render);
+      }, 16);
     }
 
+    let timerId = 0;
     animId = requestAnimationFrame(render);
 
     return () => {
+      window.clearTimeout(timerId);
       cancelAnimationFrame(animId);
       window.removeEventListener('resize', resize);
       window.removeEventListener('pointermove', handlePointerMove);
@@ -1191,9 +1358,21 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
       setHoveredCluster(null);
     }
 
-    // Hit test individual fact nodes with fast bounding-box pre-filtering
+    // Hit test source hubs and individual fact nodes
     let hitFact: Fact | null = null;
+    let hitSourceHub: AISource | null = null;
     for (const nd of nodes) {
+      if (nd.isSourceHub && nd.sourceKey) {
+        const hubThreshold = Math.max(16, nd.r * 3.0);
+        if (
+          Math.abs(mouseX - nd.x) <= hubThreshold &&
+          Math.abs(mouseY - nd.y) <= hubThreshold &&
+          Math.hypot(mouseX - nd.x, mouseY - nd.y) <= hubThreshold
+        ) {
+          hitSourceHub = nd.sourceKey;
+          break;
+        }
+      }
       if (!nd.fact) continue;
       const threshold = Math.max(12, nd.r * 2.8);
       if (Math.abs(mouseX - nd.x) > threshold || Math.abs(mouseY - nd.y) > threshold) {
@@ -1204,6 +1383,10 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
         hitFact = nd.fact;
         break;
       }
+    }
+
+    if (hoveredSourceHubRef.current !== hitSourceHub) {
+      setHoveredSourceHub(hitSourceHub);
     }
 
     // Only update React state if hovered target actually changed to prevent render storms
@@ -1224,9 +1407,18 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
       const zoom = panRef.current.zoom;
       const clusterWeight = Math.max(0, Math.min(1, (0.85 - zoom) / 0.40));
 
-      // If user clicked on a cluster bubble when zoomed out -> smoothly zoom into that cluster!
+      // If user clicked on a cluster bubble when zoomed out -> smoothly zoom into that cluster and open Source Inspector
       if (clusterWeight > 0.35 && hoveredCluster) {
         animatePanZoom(-hoveredCluster.x * 1.15, -hoveredCluster.y * 1.15, 1.15);
+        if (onSelectSource) {
+          onSelectSource(hoveredCluster.source);
+        }
+        return;
+      }
+
+      if (hoveredSourceHub && onSelectSource) {
+        onSelectFact(null);
+        onSelectSource(hoveredSourceHub);
         return;
       }
 
@@ -1234,6 +1426,9 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
         onSelectFact(hoveredFact);
       } else {
         onSelectFact(null);
+        if (onSelectSource) {
+          onSelectSource(null);
+        }
       }
     }
   };
@@ -1272,48 +1467,133 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
         onWheel={handleWheel}
       />
 
-      {/* Floating View Controls with Zoom LOD & Cluster Mode Indicator */}
-      <div className="pointer-events-auto absolute bottom-5 left-5 flex items-center gap-2 rounded-xl border border-white/10 bg-black/60 px-3 py-1.5 backdrop-blur-md">
+      {/* Top-Left Compact Workspace Statistics (Memories, Sources, Last Sync) */}
+      <div className="pointer-events-none absolute top-4 left-5 z-20 flex items-center gap-2">
+        <div className="rounded-xl border border-white/10 bg-[#070913]/85 px-3.5 py-2 backdrop-blur-md">
+          <div className="mono text-[9.5px] uppercase tracking-wider text-white/40">
+            Memories
+          </div>
+          <div className="mono mt-0.5 text-sm font-semibold tabular-nums text-white">
+            {workspaceStats.memoriesCount}
+          </div>
+        </div>
+
+        <div className="rounded-xl border border-white/10 bg-[#070913]/85 px-3.5 py-2 backdrop-blur-md">
+          <div className="mono text-[9.5px] uppercase tracking-wider text-white/40">
+            Sources
+          </div>
+          <div className="mono mt-0.5 text-sm font-semibold tabular-nums text-white">
+            {workspaceStats.activeSourcesCount}
+            <span className="text-white/40">/{workspaceStats.totalPaletteSources}</span>
+          </div>
+        </div>
+
+        <div className="rounded-xl border border-white/10 bg-[#070913]/85 px-3.5 py-2 backdrop-blur-md">
+          <div className="mono text-[9.5px] uppercase tracking-wider text-white/40">
+            Last Sync
+          </div>
+          <div className="mono mt-0.5 text-sm font-semibold tabular-nums text-white">
+            {workspaceStats.lastSyncLabel}
+          </div>
+        </div>
+      </div>
+
+      {/* Top-Right Graph Layout Switcher (Radial | Force | Timeline) */}
+      <div
+        role="group"
+        aria-label="Graph layout mode"
+        className={`pointer-events-auto absolute top-4 z-20 flex items-center gap-0.5 rounded-xl border border-white/12 bg-[#070913]/88 p-1 backdrop-blur-md transition-[right] duration-200 ${
+          isInspectorOpen ? 'right-5 xl:right-[396px]' : 'right-5'
+        }`}
+      >
+        {(['radial', 'force', 'timeline'] as GraphLayoutMode[]).map((mode) => {
+          const active = layoutMode === mode;
+          return (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => {
+                setLayoutMode(mode);
+                brainSwitchTimeRef.current = performance.now();
+              }}
+              className={`rounded-lg px-2.5 py-1 text-xs font-medium capitalize transition ${
+                active
+                  ? 'bg-white/[0.14] text-white shadow-sm'
+                  : 'text-white/55 hover:text-white'
+              }`}
+            >
+              {mode}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Bottom-Left Graph Legend */}
+      <div className="pointer-events-none absolute bottom-5 left-5 hidden lg:flex items-center gap-3 rounded-xl border border-white/10 bg-black/60 px-3 py-1.5 backdrop-blur-md mono text-[10.5px] text-white/55">
+        <span className="flex items-center gap-1.5">
+          <span className="inline-block h-2 w-2 rounded-full border border-white/70" />
+          <span>Source</span>
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="inline-block h-1.5 w-1.5 rounded-full bg-white/80" />
+          <span>Fact</span>
+        </span>
+        <span className="flex items-center gap-1.5">
+          <span className="inline-block w-3 border-t border-dashed border-white/60" />
+          <span>Sync</span>
+        </span>
+      </div>
+
+      {/* Bottom-Center Floating View Controls with Zoom LOD, Recenter, Cluster & Heat-Map */}
+      <div className="pointer-events-auto absolute bottom-5 left-1/2 -translate-x-1/2 flex items-center gap-2.5 rounded-xl border border-white/10 bg-black/65 px-3.5 py-1.5 backdrop-blur-md">
         <button
-          onClick={() => {
-            const newZoom = Math.min(3.0, panRef.current.zoom * 1.2);
-            panRef.current.zoom = newZoom;
-            setCurrentZoomDisplay(Math.round(newZoom * 100));
-          }}
-          className="mono text-xs text-white/70 transition hover:text-white"
-          title="Zoom In"
-        >
-          +
-        </button>
-        <div className="h-3 w-px bg-white/20" />
-        <button
+          type="button"
           onClick={() => {
             const newZoom = Math.max(0.4, panRef.current.zoom * 0.8);
             panRef.current.zoom = newZoom;
             setCurrentZoomDisplay(Math.round(newZoom * 100));
           }}
-          className="mono text-xs text-white/70 transition hover:text-white"
+          className="mono text-xs text-white/70 transition hover:text-white px-1"
           title="Zoom Out"
+          aria-label="Zoom Out"
         >
           −
         </button>
-        <div className="h-3 w-px bg-white/20" />
+        <span className="mono text-[11px] tabular-nums text-white/80 min-w-[36px] text-center">
+          {currentZoomDisplay}%
+        </span>
         <button
+          type="button"
+          onClick={() => {
+            const newZoom = Math.min(3.0, panRef.current.zoom * 1.2);
+            panRef.current.zoom = newZoom;
+            setCurrentZoomDisplay(Math.round(newZoom * 100));
+          }}
+          className="mono text-xs text-white/70 transition hover:text-white px-1"
+          title="Zoom In"
+          aria-label="Zoom In"
+        >
+          +
+        </button>
+        <div className="h-3 w-px bg-white/15" />
+        <button
+          type="button"
           onClick={resetView}
-          className="mono text-[11px] text-white/50 transition hover:text-white"
+          className="mono text-[11px] text-white/60 transition hover:text-white"
         >
           Recenter
         </button>
 
-        <div className="h-3 w-px bg-white/20" />
+        <div className="h-3 w-px bg-white/15" />
 
         {/* Quick Automatic Cluster / Detail View Switcher */}
         <button
+          type="button"
           onClick={toggleClusterOverview}
           className={`mono flex items-center gap-1.5 rounded-lg px-2 py-0.5 text-[10px] transition ${
             isCurrentlyClustered
               ? 'border border-indigo-400/40 bg-indigo-500/20 text-indigo-200'
-              : 'text-white/40 hover:text-white'
+              : 'text-white/50 hover:text-white'
           }`}
           title="Click to toggle between clustered overview and detailed inspection"
         >
@@ -1322,30 +1602,29 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
               isCurrentlyClustered ? 'bg-indigo-400' : 'bg-white/40'
             }`}
           />
-          <span>{isCurrentlyClustered ? `Clustered (${currentZoomDisplay}%)` : `Detail (${currentZoomDisplay}%)`}</span>
+          <span>{isCurrentlyClustered ? 'Clustered' : 'Detail'}</span>
         </button>
 
-        <div className="h-3 w-px bg-white/20" />
+        <div className="h-3 w-px bg-white/15" />
 
         {/* D3 Knowledge Density Heat-Map Toggle */}
         <button
+          type="button"
           onClick={() => setShowHeatMap((prev) => !prev)}
           className={`mono flex items-center gap-1.5 rounded-lg px-2 py-0.5 text-[10px] transition ${
             showHeatMap
               ? 'border border-amber-500/50 bg-amber-500/20 text-amber-200 shadow-md shadow-amber-500/20'
-              : 'text-white/40 hover:text-white'
+              : 'text-white/55 hover:text-white'
           }`}
           title="Toggle D3.js Knowledge Density Heat-Map Overlay"
         >
-          <span className="text-[11px]">{showHeatMap ? '🔥' : '♨'}</span>
-          <span>{showHeatMap ? 'Heat Map: ON' : 'Heat Map'}</span>
+          <span>{showHeatMap ? 'Heat map: ON' : 'Heat map'}</span>
         </button>
-
       </div>
 
       {/* Floating Thermal Density Legend when Heat-Map is active */}
       {showHeatMap && (
-        <div className="pointer-events-none absolute bottom-5 right-24 hidden sm:flex items-center gap-2 rounded-xl border border-white/10 bg-black/60 px-3 py-1.5 backdrop-blur-md text-[10px] font-mono text-white/70">
+        <div className="pointer-events-none absolute bottom-16 left-1/2 -translate-x-1/2 hidden sm:flex items-center gap-2 rounded-xl border border-white/10 bg-black/60 px-3 py-1.5 backdrop-blur-md text-[10px] font-mono text-white/70">
           <span>Density:</span>
           <span className="text-white/40">Low</span>
           <div className="h-2 w-16 rounded-full bg-gradient-to-r from-[#000004] via-[#bb3754] to-[#fcffa4]" />

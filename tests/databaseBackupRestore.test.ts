@@ -603,6 +603,23 @@ describe('Argon — Database, Backup, Restore & Settings Completion Suite', () =
           );
           assert.equal(badDownloadRes.status, 400);
 
+          // Missing backup download must return 404
+          const missingDownloadRes = await fetch(
+            `${baseUrl}/api/database/backups/brain_backup_missing.db/download`
+          );
+          assert.equal(missingDownloadRes.status, 404);
+
+          // Corrupted backup download must be rejected with 400 BACKUP_CORRUPTED
+          const corruptExportName = 'brain_backup_corrupt_export.db';
+          const corruptExportPath = path.join(backupDir, corruptExportName);
+          fs.writeFileSync(corruptExportPath, 'CORRUPTED_BYTES_NOT_SQLITE', 'utf8');
+          const corruptDownloadRes = await fetch(
+            `${baseUrl}/api/database/backups/${corruptExportName}/download`
+          );
+          assert.equal(corruptDownloadRes.status, 400);
+          assert.equal((await corruptDownloadRes.json()).code, 'BACKUP_CORRUPTED');
+          fs.unlinkSync(corruptExportPath);
+
           // 5. Add a second fact to live DB so we can test restore via HTTP
           db.prepare(
             `INSERT INTO facts (brain, content, source, file_name, created_at, updated_at)
@@ -678,5 +695,55 @@ describe('Argon — Database, Backup, Restore & Settings Completion Suite', () =
         db.close();
       }
     });
+
+    it('upgrades older v1 pre-migration backups during staged restore and synchronizes sqlite_sequence', () => {
+      const legacyBackupPath = path.join(tempRoot, 'legacy-v1-backup.db');
+      const legacyDb = new DatabaseSync(legacyBackupPath);
+      try {
+        // Apply only v1 migration to simulate a legacy v1 snapshot
+        runSchemaMigrations(legacyDb, undefined, undefined, [SCHEMA_MIGRATIONS[0]]);
+        const now = new Date().toISOString();
+        legacyDb
+          .prepare(
+            `INSERT INTO facts (brain, content, source, created_at, updated_at)
+             VALUES ('coding', 'Legacy v1 Fact Content', 'claude', ?, ?)`
+          )
+          .run(now, now);
+      } finally {
+        legacyDb.close();
+      }
+
+      const targetDbPath = path.join(tempRoot, 'target-v4-for-legacy-restore.db');
+      const targetBackupDir = path.join(tempRoot, 'target-v4-legacy-backups');
+      const { db } = initializeDatabase(targetDbPath, {
+        backupDir: targetBackupDir,
+        seedOnBrandNewDb: true,
+      });
+
+      try {
+        const res = restoreDatabaseFromBackup({
+          db,
+          dbPath: targetDbPath,
+          backupPath: legacyBackupPath,
+          backupDir: targetBackupDir,
+        });
+        assert.equal(res.success, true);
+        assert.equal(res.factsCountAfterRestore, 1);
+        assert.equal(res.schemaVersionAfterRestore, 4);
+
+        // Insert a new fact after restore and verify its AUTOINCREMENT id is 2
+        const now = new Date().toISOString();
+        const insertRes = db
+          .prepare(
+            `INSERT INTO facts (brain, content, source, created_at, updated_at)
+             VALUES ('coding', 'Post-restore Fact #2', 'gpt', ?, ?)`
+          )
+          .run(now, now);
+        assert.equal(Number(insertRes.lastInsertRowid), 2);
+      } finally {
+        db.close();
+      }
+    });
   });
 });
+

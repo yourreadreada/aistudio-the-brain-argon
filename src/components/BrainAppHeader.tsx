@@ -1,5 +1,5 @@
 import React from 'react';
-import { Menu, Plus, Upload, Puzzle, Database } from 'lucide-react';
+import { Menu, Plus, Upload, Puzzle } from 'lucide-react';
 import { AISource, Fact, FactFileType, SOURCE_PALETTE, FILE_TYPE_CONFIG } from '../types/brain';
 import { GlobalSearchBar } from './GlobalSearchBar';
 import { GuidedService } from './GuidedConnectionModal';
@@ -45,8 +45,6 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
   onSelectFileTypeFilter,
   onOpenAddFact,
   onOpenIngest,
-  onOpenSettings,
-  isSettingsActive = false,
   onToggleMobileSidebar,
   totalFactsCount = 0,
 }) => {
@@ -67,16 +65,15 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
 
         <nav aria-label="Breadcrumb" className="flex items-center gap-2 text-xs whitespace-nowrap">
           <span className="text-white/45 hidden sm:inline">Workspaces</span>
-          <span className="text-white/25 hidden sm:inline" aria-hidden="true">/</span>
+          <span className="text-white/25 hidden sm:inline" aria-hidden="true">›</span>
           <span className="font-semibold text-white capitalize">{currentBrain}</span>
-          <span className="text-white/30" aria-hidden="true">·</span>
-          <span className="mono text-[11px] tabular-nums text-white/50">
+          <span className="mono rounded-md border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] tabular-nums text-white/60">
             {totalFactsCount} {totalFactsCount === 1 ? 'node' : 'nodes'}
           </span>
 
           {activeSourceFilter && (
             <>
-              <span className="text-white/25" aria-hidden="true">/</span>
+              <span className="text-white/25" aria-hidden="true">›</span>
               <button
                 type="button"
                 onClick={() => onSelectSourceFilter(null)}
@@ -91,7 +88,7 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
 
           {activeFileTypeFilter && onSelectFileTypeFilter && (
             <>
-              <span className="text-white/25" aria-hidden="true">/</span>
+              <span className="text-white/25" aria-hidden="true">›</span>
               <button
                 type="button"
                 onClick={() => onSelectFileTypeFilter(null)}
@@ -116,24 +113,8 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
         />
       </div>
 
-      {/* Zone 3: Primary Workspace Actions */}
+      {/* Zone 3: Primary Workspace Actions (Companion, Capture Hub, Store Fact) */}
       <div className="flex items-center gap-2 shrink-0">
-        {onOpenSettings && (
-          <button
-            type="button"
-            onClick={onOpenSettings}
-            className={`hidden md:flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition whitespace-nowrap shrink-0 ${
-              isSettingsActive
-                ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-200'
-                : 'border-white/12 bg-white/[0.02] text-white/75 hover:border-white/25 hover:bg-white/[0.06] hover:text-white'
-            }`}
-            title="Database & Backup Settings"
-          >
-            <Database className="h-3.5 w-3.5 text-emerald-400" />
-            <span>Settings</span>
-          </button>
-        )}
-
         <button
           type="button"
           onClick={() => onOpenIngest('companion')}

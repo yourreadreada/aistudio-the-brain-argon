@@ -385,6 +385,31 @@ export const Constellation: React.FC<ConstellationProps> = ({
           (1 - 0.62 * enterEase);
       }
 
+      // Soft multi-source cluster nebulae on major branch hubs (UXPilot-inspired depth using Brain source palette)
+      const hubNebulaFactor =
+        Math.min(1, Math.max(0, (elapsed - 0.15) / 0.9)) *
+        (1 - blurFactor) *
+        isDesktop;
+      if (hubNebulaFactor > 0.02) {
+        const majorCount = Math.min(8, nodes.length - 1);
+        for (let b = 1; b <= majorCount; b++) {
+          const hubNode = nodes[b];
+          if (!hubNode) continue;
+          const hx = posX[b];
+          const hy = posY[b];
+          const [r, g, bl] = hubNode.rgb;
+          const nebRadius = Math.max(48, radius * 0.24);
+          const nebGrad = ctx.createRadialGradient(hx, hy, 0, hx, hy, nebRadius);
+          nebGrad.addColorStop(0, `rgba(${r}, ${g}, ${bl}, ${0.14 * hubNebulaFactor})`);
+          nebGrad.addColorStop(0.45, `rgba(${r}, ${g}, ${bl}, ${0.05 * hubNebulaFactor})`);
+          nebGrad.addColorStop(1, 'rgba(3, 4, 10, 0)');
+          ctx.fillStyle = nebGrad;
+          ctx.beginPath();
+          ctx.arc(hx, hy, nebRadius, 0, 6.2832);
+          ctx.fill();
+        }
+      }
+
       // Draw links in colorful tiers
       for (let l = 0; l < links.length; l++) {
         const link = links[l];
@@ -397,14 +422,17 @@ export const Constellation: React.FC<ConstellationProps> = ({
         if (avgAlpha < 0.03) continue;
 
         const [r, g, b] = link.rgb;
+        const isCoreLink = link.a === 0;
         const strokeOpacity =
-          (0.045 + 0.14 * avgAlpha) * isDesktop * Math.pow(1 - blurFactor, 1.6);
+          (isCoreLink ? 0.12 + 0.22 * avgAlpha : 0.055 + 0.16 * avgAlpha) *
+          isDesktop *
+          Math.pow(1 - blurFactor, 1.6);
 
         ctx.beginPath();
         ctx.moveTo(posX[link.a], posY[link.a]);
         ctx.lineTo(posX[link.b], posY[link.b]);
         ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${strokeOpacity})`;
-        ctx.lineWidth = 0.7;
+        ctx.lineWidth = isCoreLink ? 1.05 : 0.75;
         ctx.stroke();
       }
 
@@ -417,16 +445,24 @@ export const Constellation: React.FC<ConstellationProps> = ({
         const alpha = Math.min(0.98, 0.94 * alphaArray[i] * isDesktop);
 
         // Luminous soft halo on larger nodes
-        if (nodeR > 1.4) {
+        if (nodeR > 1.35) {
           ctx.beginPath();
-          ctx.arc(posX[i], posY[i], nodeR + 3.5, 0, 6.2832);
-          ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha * 0.28})`;
+          ctx.arc(posX[i], posY[i], nodeR + (i === 0 ? 11 : 4.2), 0, 6.2832);
+          ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha * (i === 0 ? 0.22 : 0.28)})`;
           ctx.fill();
+
+          if (i <= 8) {
+            ctx.beginPath();
+            ctx.arc(posX[i], posY[i], nodeR + (i === 0 ? 5.5 : 2.4), 0, 6.2832);
+            ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${alpha * 0.55})`;
+            ctx.lineWidth = i === 0 ? 1.3 : 0.9;
+            ctx.stroke();
+          }
         }
 
         // Solid colorful core
         ctx.beginPath();
-        ctx.arc(posX[i], posY[i], nodeR, 0, 6.2832);
+        ctx.arc(posX[i], posY[i], i === 0 ? Math.max(4.2, nodeR * 1.45) : nodeR, 0, 6.2832);
         ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
         ctx.fill();
       }
@@ -434,10 +470,10 @@ export const Constellation: React.FC<ConstellationProps> = ({
       // Multi-spectral chromatic central haze
       const hazeFactor =
         Math.min(1, Math.max(0, elapsed - 0.1)) *
-        (currentMood === 'typing' ? 1 : 0.75) *
+        (currentMood === 'typing' ? 1 : 0.82) *
         (1 - blurFactor);
       if (hazeFactor > 0.02) {
-        const glowRadius = 0.42 * radius + enterEase * dims.radius * 0.1;
+        const glowRadius = 0.44 * radius + enterEase * dims.radius * 0.1;
         const glowGrad = ctx.createRadialGradient(
           centerX,
           centerY,
@@ -446,9 +482,9 @@ export const Constellation: React.FC<ConstellationProps> = ({
           centerY,
           glowRadius
         );
-        glowGrad.addColorStop(0, `rgba(255, 255, 255, ${0.08 * hazeFactor})`);
-        glowGrad.addColorStop(0.3, `rgba(157, 180, 255, ${0.06 * hazeFactor})`);
-        glowGrad.addColorStop(0.65, `rgba(216, 90, 48, ${0.03 * hazeFactor})`);
+        glowGrad.addColorStop(0, `rgba(255, 255, 255, ${0.12 * hazeFactor})`);
+        glowGrad.addColorStop(0.22, `rgba(157, 180, 255, ${0.07 * hazeFactor})`);
+        glowGrad.addColorStop(0.58, `rgba(216, 90, 48, ${0.03 * hazeFactor})`);
         glowGrad.addColorStop(1, 'rgba(3, 4, 10, 0)');
 
         ctx.fillStyle = glowGrad;
@@ -468,12 +504,16 @@ export const Constellation: React.FC<ConstellationProps> = ({
         ctx.fillRect(0, 0, width, height);
       }
 
-      animId = requestAnimationFrame(render);
+      timerId = window.setTimeout(() => {
+        animId = requestAnimationFrame(render);
+      }, 16);
     }
 
+    let timerId = 0;
     animId = requestAnimationFrame(render);
 
     return () => {
+      window.clearTimeout(timerId);
       cancelAnimationFrame(animId);
       window.removeEventListener('resize', resize);
       if (interactive) {

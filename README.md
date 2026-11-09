@@ -108,7 +108,7 @@ npm run db:seed-demo
 
 ## 3. Settings Page — Database & Backup Controls
 
-Accessible from the left sidebar (**Settings**) or top header bar (**Settings**), `src/components/DatabaseSettingsView.tsx` provides real, functional controls backed by `/api/database/*`:
+Accessed from the left sidebar under **Workspace View → Settings** (using the gear icon, with tooltip support when collapsed and no duplicate Settings button in the top application header), `src/components/DatabaseSettingsView.tsx` provides functional database and backup controls backed by `/api/database/*`:
 - **Live SQLite Database Status**: Displays health status, database location (`data/brain.db`), SQLite engine & WAL journal mode, schema version, `PRAGMA integrity_check` status, total facts, workspaces count, and file size.
 - **Backup Storage & Retention Controls**: Displays backup directory (`data/backups/`), verified backup count, latest backup timestamp, and an interactive retention limit (`1–100` verified backups) with **Apply Retention** (never deleting the last known-good backup).
 - **Create Backup**: Captures a new verified SQLite snapshot (`POST /api/database/backups`) and refreshes the backup list.
