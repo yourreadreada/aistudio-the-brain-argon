@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Database,
   HardDrive,
@@ -12,11 +12,15 @@ import {
   Clock,
   Sliders,
   ArrowLeft,
+  Trash2,
+  Upload,
+  FileCheck2,
 } from 'lucide-react';
 import {
   brainStore,
   DatabaseBackupItem,
   DatabaseStatusPayload,
+  ExternalBackupInspectionResult,
 } from '../services/brainStorage';
 
 interface DatabaseSettingsViewProps {
@@ -62,6 +66,11 @@ function formatBackupKindLabel(kind: DatabaseBackupItem['kind']): {
         label: 'Pre-Restore Safety',
         className: 'border-sky-500/30 bg-sky-500/10 text-sky-300',
       };
+    case 'external-import':
+      return {
+        label: 'External Import',
+        className: 'border-purple-500/30 bg-purple-500/10 text-purple-300',
+      };
     default:
       return {
         label: 'Manual Snapshot',
@@ -78,10 +87,25 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
   const [loading, setLoading] = useState<boolean>(true);
   const [creatingBackup, setCreatingBackup] = useState<boolean>(false);
   const [savingRetention, setSavingRetention] = useState<boolean>(false);
+  const [exportingFileName, setExportingFileName] = useState<string | null>(null);
   const [restoringFileName, setRestoringFileName] = useState<string | null>(null);
+  const [deletingFileName, setDeletingFileName] = useState<string | null>(null);
+  const [cleaningInvalid, setCleaningInvalid] = useState<boolean>(false);
+
   const [confirmRestoreTarget, setConfirmRestoreTarget] =
     useState<DatabaseBackupItem | null>(null);
+  const [confirmDeleteTarget, setConfirmDeleteTarget] =
+    useState<DatabaseBackupItem | null>(null);
   const [retentionInput, setRetentionInput] = useState<string>('10');
+
+  // External Backup Inspection & Restore State
+  const [externalFile, setExternalFile] = useState<File | null>(null);
+  const [inspectingExternal, setInspectingExternal] = useState<boolean>(false);
+  const [externalInspection, setExternalInspection] =
+    useState<ExternalBackupInspectionResult | null>(null);
+  const [confirmExternalRestore, setConfirmExternalRestore] = useState<boolean>(false);
+  const [restoringExternal, setRestoringExternal] = useState<boolean>(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [banner, setBanner] = useState<{
     type: 'success' | 'warning' | 'error';
@@ -120,7 +144,7 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
         type: 'success',
         message: `Created verified SQLite snapshot "${res.backup.fileName}" (${formatByteSize(
           res.backup.sizeBytes
-        )}, ${res.backup.factsCount} facts).`,
+        )}, ${res.backup.factsCount} facts, SQLite format 3\\0 verified).`,
       });
     } catch (err: any) {
       setBanner({
@@ -194,7 +218,12 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
     }
   };
 
-  const handleDownloadBackup = (backup: DatabaseBackupItem) => {
+  /**
+   * Section 9.A: Client-verified binary export.
+   * Fetches binary stream, verifies 16-byte "SQLite format 3\0" magic header in browser memory,
+   * rejects HTML/cookie-check pages, and triggers download from verified Blob.
+   */
+  const handleDownloadBackup = async (backup: DatabaseBackupItem) => {
     if (!backup.verified) {
       setBanner({
         type: 'warning',
@@ -202,16 +231,149 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
       });
       return;
     }
-    const url = brainStore.getBackupDownloadUrl(backup.fileName);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = backup.fileName;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    setExportingFileName(backup.fileName);
+    setBanner(null);
+    try {
+      const result = await brainStore.exportVerifiedBackupBlob(backup.fileName);
+      const blobUrl = URL.createObjectURL(result.blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = result.fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 2500);
+
+      setBanner({
+        type: 'success',
+        message: `Exported verified binary SQLite backup "${result.fileName}" (${formatByteSize(
+          result.sizeBytes
+        )} · 16-byte "SQLite format 3\\0" header verified in client memory).`,
+      });
+    } catch (err: any) {
+      setBanner({
+        type: 'error',
+        message: err?.message || 'Backup export failed client binary verification.',
+      });
+    } finally {
+      setExportingFileName(null);
+    }
+  };
+
+  const handleDeleteBackup = async (backup: DatabaseBackupItem) => {
+    setDeletingFileName(backup.fileName);
+    setBanner(null);
+    try {
+      const res = await brainStore.deleteDatabaseBackup(backup.fileName);
+      setStatusData(res.status);
+      setConfirmDeleteTarget(null);
+      setBanner({
+        type: 'success',
+        message: `Deleted backup "${res.deletedFile}".`,
+      });
+    } catch (err: any) {
+      setBanner({
+        type: 'error',
+        message: err?.message || 'Failed to delete backup.',
+      });
+    } finally {
+      setDeletingFileName(null);
+    }
+  };
+
+  const handleCleanupInvalidBackups = async () => {
+    setCleaningInvalid(true);
+    setBanner(null);
+    try {
+      const res = await brainStore.cleanupInvalidBackups();
+      setStatusData(res.status);
+      setBanner({
+        type: 'success',
+        message:
+          res.deletedCount > 0
+            ? `Cleaned up ${res.deletedCount} invalid/corrupted backup file(s).`
+            : 'No invalid backups found to remove.',
+      });
+    } catch (err: any) {
+      setBanner({
+        type: 'error',
+        message: err?.message || 'Failed to clean up invalid backups.',
+      });
+    } finally {
+      setCleaningInvalid(false);
+    }
+  };
+
+  const handleSelectExternalFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setExternalFile(file);
+    setConfirmExternalRestore(false);
+    setInspectingExternal(true);
+    setBanner(null);
+    try {
+      const inspection = await brainStore.inspectExternalBackupFile(file);
+      setExternalInspection(inspection);
+      if (inspection.valid) {
+        setBanner({
+          type: 'success',
+          message: `Verified external SQLite file "${file.name}": ${inspection.factsCount} records across ${
+            Object.keys(inspection.brainsBreakdown || {}).length
+          } workspace(s), schema v${inspection.schemaVersion}, PRAGMA integrity_check = ok.`,
+        });
+      } else {
+        setBanner({
+          type: 'error',
+          message:
+            inspection.error ||
+            `External file "${file.name}" failed SQLite integrity verification (${inspection.integrityStatus}).`,
+        });
+      }
+    } catch (err: any) {
+      setExternalInspection(null);
+      setBanner({
+        type: 'error',
+        message: err?.message || 'Failed to inspect external SQLite file.',
+      });
+    } finally {
+      setInspectingExternal(false);
+    }
+  };
+
+  const handleRestoreExternalFile = async () => {
+    if (!externalFile || !externalInspection?.valid) return;
+    setRestoringExternal(true);
+    setBanner(null);
+    try {
+      const res = await brainStore.restoreFromExternalBackupFile(externalFile);
+      setStatusData(res.status);
+      setConfirmExternalRestore(false);
+      setExternalFile(null);
+      setExternalInspection(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      setBanner({
+        type: 'success',
+        message: res.message,
+      });
+      if (onAfterRestore) {
+        onAfterRestore();
+      }
+    } catch (err: any) {
+      setBanner({
+        type: 'error',
+        message:
+          err?.message ||
+          'External database restore failed. Pre-restore live database was preserved.',
+      });
+      await loadDatabaseStatus(true);
+    } finally {
+      setRestoringExternal(false);
+    }
   };
 
   const backups = statusData?.backups || [];
+  const verifiedCount = backups.filter((b) => b.verified).length;
+  const invalidCount = backups.filter((b) => !b.verified).length;
 
   return (
     <div className="relative h-full w-full overflow-y-auto px-4 py-6 md:px-8 md:py-8">
@@ -232,13 +394,13 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
               )}
               <Database className="h-5 w-5 text-emerald-400" />
               <h1 className="text-lg font-semibold tracking-tight text-white">
-                Database & Backup Settings
+                Database, Backup & Recovery
               </h1>
             </div>
             <p className="mt-1 text-xs text-white/55">
               Local SQLite persistence, transactionally consistent snapshots (
-              <code className="mono text-white/75">VACUUM INTO</code>), integrity
-              verification, and staged restore with automatic safety rollback.
+              <code className="mono text-white/75">VACUUM INTO</code>), client-verified binary export,
+              and internal or external <code className="mono text-white/75">.db</code> restore with automatic safety rollback.
             </p>
           </div>
 
@@ -303,7 +465,7 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
           </div>
         )}
 
-        {/* Section 1: Database Status & Paths */}
+        {/* Section 1: Database Status & Retention Controls */}
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <div className="rounded-xl border border-white/10 bg-[#070b18]/90 p-5">
             <div className="flex items-center justify-between">
@@ -345,7 +507,7 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
               <div className="flex items-center justify-between gap-2 border-b border-white/[0.06] pb-2">
                 <dt className="text-white/50">Schema Version & Integrity</dt>
                 <dd className="mono text-white/85">
-                  v{statusData?.schemaVersion ?? 4} ·{' '}
+                  v{statusData?.schemaVersion ?? 5} ·{' '}
                   <span className="text-emerald-400">
                     PRAGMA integrity_check = {statusData?.integrityStatus || 'ok'}
                   </span>
@@ -362,17 +524,30 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
             </dl>
           </div>
 
-          {/* Section 2: Backup Status & Retention Controls */}
+          {/* Section 2: Backup Counts & Retention Controls */}
           <div className="rounded-xl border border-white/10 bg-[#070b18]/90 p-5">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-white/60">
                 <Sliders className="h-4 w-4 text-[#9db4ff]" />
                 <span>Backup Storage & Retention</span>
               </div>
-              <span className="mono text-[11px] text-white/55">
-                {statusData?.backupsSummary.verifiedBackups ?? 0} verified /{' '}
-                {statusData?.backupsSummary.totalBackups ?? 0} total
-              </span>
+              <div className="flex items-center gap-1.5 mono text-[10.5px]">
+                <span className="rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-emerald-300">
+                  {verifiedCount} verified
+                </span>
+                <span
+                  className={`rounded border px-1.5 py-0.5 ${
+                    invalidCount > 0
+                      ? 'border-rose-500/35 bg-rose-500/10 text-rose-300'
+                      : 'border-white/10 bg-white/[0.03] text-white/45'
+                  }`}
+                >
+                  {invalidCount} invalid
+                </span>
+                <span className="rounded border border-white/12 bg-white/[0.04] px-1.5 py-0.5 text-white/75">
+                  {backups.length} total
+                </span>
+              </div>
             </div>
 
             <dl className="mt-4 space-y-2.5 text-xs">
@@ -427,7 +602,184 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
           </div>
         </div>
 
-        {/* Restore Confirmation Dialog (Inline High-Visibility Step) */}
+        {/* Section 9.C & 9.D: External Backup Verification & Restore from External .db File */}
+        <div className="rounded-xl border border-indigo-500/25 bg-[#070b18]/95 p-5 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-indigo-300">
+                <FileCheck2 className="h-4 w-4 text-indigo-400" />
+                <span>Restore from External Backup / Verify Downloaded .db File</span>
+              </div>
+              <p className="mt-1 text-xs text-white/55">
+                Select any downloaded <code className="mono text-white/80">.db</code> or{' '}
+                <code className="mono text-white/80">.sqlite</code> backup file from your computer to verify its binary{' '}
+                <code className="mono text-white/80">SQLite format 3\0</code> header, inspect its workspace records, or restore it into this Argon installation.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".db,.sqlite,.sqlite3,.bak,application/x-sqlite3,application/octet-stream"
+                onChange={handleSelectExternalFile}
+                className="hidden"
+                id="external-backup-file-input"
+              />
+              <label
+                htmlFor="external-backup-file-input"
+                className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-indigo-400/35 bg-indigo-500/15 px-3.5 py-2 text-xs font-semibold text-indigo-200 transition hover:border-indigo-400/60 hover:bg-indigo-500/25"
+              >
+                <Upload className="h-3.5 w-3.5" />
+                <span>{inspectingExternal ? 'Inspecting File…' : 'Select External .db File'}</span>
+              </label>
+            </div>
+          </div>
+
+          {externalInspection && (
+            <div
+              className={`rounded-xl border p-4 text-xs space-y-3 ${
+                externalInspection.valid
+                  ? 'border-emerald-500/35 bg-emerald-500/[0.06]'
+                  : 'border-rose-500/40 bg-rose-500/[0.08]'
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  {externalInspection.valid ? (
+                    <ShieldCheck className="h-4 w-4 text-emerald-400" />
+                  ) : (
+                    <AlertTriangle className="h-4 w-4 text-rose-400" />
+                  )}
+                  <span className="mono font-semibold text-white">
+                    {externalInspection.fileName}
+                  </span>
+                  <span className="mono text-[11px] text-white/55">
+                    ({formatByteSize(externalInspection.sizeBytes)})
+                  </span>
+                </div>
+
+                <span
+                  className={`mono rounded border px-2 py-0.5 text-[10.5px] font-medium ${
+                    externalInspection.valid
+                      ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                      : 'border-rose-500/40 bg-rose-500/15 text-rose-300'
+                  }`}
+                >
+                  {externalInspection.valid
+                    ? 'SQLite Header & PRAGMA integrity_check = ok'
+                    : `Invalid (${externalInspection.integrityStatus})`}
+                </span>
+              </div>
+
+              {externalInspection.valid ? (
+                <>
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 pt-1">
+                    <div className="rounded-lg border border-white/10 bg-black/30 p-2.5">
+                      <div className="mono text-[10px] uppercase text-white/45">Total Memories</div>
+                      <div className="mono mt-0.5 text-sm font-semibold text-white">
+                        {externalInspection.factsCount}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-white/10 bg-black/30 p-2.5">
+                      <div className="mono text-[10px] uppercase text-white/45">Schema Version</div>
+                      <div className="mono mt-0.5 text-sm font-semibold text-white">
+                        v{externalInspection.schemaVersion}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-white/10 bg-black/30 p-2.5">
+                      <div className="mono text-[10px] uppercase text-white/45">Workspaces</div>
+                      <div className="mono mt-0.5 text-[11px] text-white/90 truncate">
+                        {Object.entries(externalInspection.brainsBreakdown || {})
+                          .map(([b, c]) => `${b}: ${c}`)
+                          .join(' · ') || 'None'}
+                      </div>
+                    </div>
+                    <div className="rounded-lg border border-white/10 bg-black/30 p-2.5">
+                      <div className="mono text-[10px] uppercase text-white/45">AI Sources</div>
+                      <div className="mono mt-0.5 text-[11px] text-white/90 truncate">
+                        {Object.keys(externalInspection.sourcesBreakdown || {}).length} sources
+                      </div>
+                    </div>
+                  </div>
+
+                  {!confirmExternalRestore ? (
+                    <div className="flex items-center justify-between gap-3 pt-2">
+                      <span className="text-[11px] text-white/60">
+                        File passed binary SQLite verification and is ready for staged restore.
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setConfirmExternalRestore(true)}
+                          className="flex items-center gap-1.5 rounded-lg bg-amber-400 px-3.5 py-1.5 text-xs font-semibold text-black transition hover:bg-amber-300"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" />
+                          <span>Restore from External Backup…</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setExternalFile(null);
+                            setExternalInspection(null);
+                            if (fileInputRef.current) fileInputRef.current.value = '';
+                          }}
+                          className="rounded-lg border border-white/15 bg-white/[0.04] px-3 py-1.5 text-xs text-white/75 hover:text-white"
+                        >
+                          Clear
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3.5 space-y-2.5">
+                      <div className="flex items-start gap-2.5">
+                        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
+                        <div className="space-y-1">
+                          <div className="font-semibold text-white">
+                            Overwrite Current Database with External Backup &ldquo;{externalInspection.fileName}&rdquo;?
+                          </div>
+                          <p className="text-[11px] text-white/80 leading-relaxed">
+                            Argon will first save a <strong className="text-white">Pre-Restore Safety Backup</strong> of your current database ({statusData?.factsCount ?? 0} facts), stage and migrate the external database ({externalInspection.factsCount} facts), and automatically roll back if any integrity check fails.
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2.5 pt-1">
+                        <button
+                          type="button"
+                          disabled={restoringExternal}
+                          onClick={handleRestoreExternalFile}
+                          className="flex items-center gap-1.5 rounded-lg bg-amber-400 px-3.5 py-1.5 text-xs font-semibold text-black transition hover:bg-amber-300 disabled:opacity-50"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" />
+                          <span>
+                            {restoringExternal
+                              ? 'Staging & Restoring External DB…'
+                              : 'Confirm & Restore External Backup'}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={restoringExternal}
+                          onClick={() => setConfirmExternalRestore(false)}
+                          className="rounded-lg border border-white/15 bg-black/40 px-3 py-1.5 text-xs text-white/80 hover:text-white"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <p className="text-rose-200 leading-relaxed">
+                  {externalInspection.error ||
+                    'This file is not a valid SQLite database and cannot be restored.'}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Internal Restore Confirmation Dialog */}
         {confirmRestoreTarget && (
           <div className="rounded-xl border border-amber-500/40 bg-amber-500/[0.08] p-5">
             <div className="flex items-start gap-3">
@@ -479,19 +831,70 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
           </div>
         )}
 
+        {/* Delete Backup Confirmation Dialog */}
+        {confirmDeleteTarget && (
+          <div className="rounded-xl border border-rose-500/40 bg-rose-500/[0.08] p-4">
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex items-center gap-2.5 text-xs text-rose-200">
+                <Trash2 className="h-4 w-4 shrink-0 text-rose-400" />
+                <span>
+                  Permanently delete backup file{' '}
+                  <strong className="mono text-white">{confirmDeleteTarget.fileName}</strong>?
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={deletingFileName !== null}
+                  onClick={() => handleDeleteBackup(confirmDeleteTarget)}
+                  className="rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-rose-500 disabled:opacity-50"
+                >
+                  {deletingFileName === confirmDeleteTarget.fileName
+                    ? 'Deleting…'
+                    : 'Confirm Delete'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmDeleteTarget(null)}
+                  className="rounded-lg border border-white/15 bg-black/40 px-3 py-1.5 text-xs text-white/75 hover:text-white"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Section 3: Available Backups List */}
         <div className="rounded-xl border border-white/10 bg-[#070b18]/90">
-          <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 px-5 py-4">
             <div className="flex items-center gap-2">
               <Clock className="h-4 w-4 text-white/60" />
               <h2 className="text-xs font-semibold uppercase tracking-wider text-white/80">
                 Available Backups ({backups.length})
               </h2>
             </div>
-            <span className="text-[11px] text-white/45">
-              Each snapshot is verified with SQLite{' '}
-              <code className="mono text-white/70">PRAGMA integrity_check</code>
-            </span>
+            <div className="flex items-center gap-3">
+              {invalidCount > 0 && (
+                <button
+                  type="button"
+                  disabled={cleaningInvalid}
+                  onClick={handleCleanupInvalidBackups}
+                  className="flex items-center gap-1.5 rounded-lg border border-rose-500/35 bg-rose-500/10 px-2.5 py-1 text-[11px] font-medium text-rose-200 transition hover:bg-rose-500/20 disabled:opacity-50"
+                >
+                  <Trash2 className="h-3 w-3" />
+                  <span>
+                    {cleaningInvalid
+                      ? 'Cleaning Invalid…'
+                      : `Delete All Invalid (${invalidCount})`}
+                  </span>
+                </button>
+              )}
+              <span className="text-[11px] text-white/45">
+                Verified with <code className="mono text-white/70">SQLite format 3\0</code> &{' '}
+                <code className="mono text-white/70">PRAGMA integrity_check</code>
+              </span>
+            </div>
           </div>
 
           {loading ? (
@@ -517,6 +920,9 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
               {backups.map((backup) => {
                 const kindBadge = formatBackupKindLabel(backup.kind);
                 const isRestoringThis = restoringFileName === backup.fileName;
+                const isExportingThis = exportingFileName === backup.fileName;
+                const isLastKnownGood = backup.verified && verifiedCount <= 1;
+
                 return (
                   <div
                     key={backup.fileName}
@@ -557,16 +963,16 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
                       <button
                         type="button"
                         onClick={() => handleDownloadBackup(backup)}
-                        disabled={!backup.verified}
+                        disabled={!backup.verified || isExportingThis}
                         className="flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.04] px-2.5 py-1.5 text-xs font-medium text-white/85 transition hover:border-white/30 hover:bg-white/[0.08] disabled:cursor-not-allowed disabled:opacity-40"
                         title={
                           backup.verified
-                            ? `Download ${backup.fileName}`
+                            ? `Verify binary header & download ${backup.fileName}`
                             : 'Corrupted backups cannot be exported'
                         }
                       >
                         <Download className="h-3.5 w-3.5" />
-                        <span>Export</span>
+                        <span>{isExportingThis ? 'Verifying…' : 'Export .db'}</span>
                       </button>
 
                       <button
@@ -584,6 +990,20 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
                         <span>
                           {isRestoringThis ? 'Restoring…' : 'Restore'}
                         </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDeleteTarget(backup)}
+                        disabled={isLastKnownGood}
+                        className="flex items-center justify-center rounded-lg border border-white/12 bg-white/[0.03] p-1.5 text-white/55 transition hover:border-rose-500/40 hover:bg-rose-500/10 hover:text-rose-300 disabled:cursor-not-allowed disabled:opacity-30"
+                        title={
+                          isLastKnownGood
+                            ? 'Protected: Cannot delete the last remaining verified backup'
+                            : `Delete ${backup.fileName}`
+                        }
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
                       </button>
                     </div>
                   </div>

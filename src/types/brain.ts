@@ -127,7 +127,29 @@ export function inferFileTypeFromExtension(filenameOrExt: string): FactFileType 
   if (['docx', 'doc', 'rtf'].includes(ext)) return 'docx';
   if (['xlsx', 'xls', 'csv'].includes(ext)) return 'xlsx';
   if (['pptx', 'ppt', 'key'].includes(ext)) return 'pptx';
-  if (['ts', 'tsx', 'js', 'jsx', 'py', 'rs', 'cpp', 'c', 'java', 'go', 'html', 'css', 'json', 'sql', 'sh', 'yaml', 'yml'].includes(ext)) return 'code';
+  if (
+    [
+      'ts',
+      'tsx',
+      'js',
+      'jsx',
+      'py',
+      'rs',
+      'cpp',
+      'c',
+      'java',
+      'go',
+      'html',
+      'css',
+      'json',
+      'sql',
+      'sh',
+      'yaml',
+      'yml',
+    ].includes(ext)
+  ) {
+    return 'code';
+  }
   if (['md', 'markdown', 'txt'].includes(ext)) return 'md';
   if (['png', 'jpg', 'jpeg', 'webp', 'svg', 'gif'].includes(ext)) return 'img';
   return 'chat';
@@ -143,17 +165,49 @@ export function getFactFileType(fact: Fact): FactFileType {
     if (ext === 'docx' || ext === 'doc') return 'docx';
     if (ext === 'xlsx' || ext === 'xls' || ext === 'csv') return 'xlsx';
     if (ext === 'pptx' || ext === 'ppt') return 'pptx';
-    if (['ts', 'js', 'py', 'rs', 'cpp', 'java', 'html', 'css', 'json'].includes(ext || '')) return 'code';
-    if (ext === 'md' || ext === 'markdown') return 'md';
-    if (['png', 'jpg', 'jpeg', 'webp', 'svg'].includes(ext || '')) return 'img';
+    if (
+      [
+        'ts',
+        'tsx',
+        'js',
+        'jsx',
+        'py',
+        'rs',
+        'cpp',
+        'c',
+        'java',
+        'go',
+        'html',
+        'css',
+        'json',
+        'sql',
+        'sh',
+        'yaml',
+        'yml',
+      ].includes(ext || '')
+    ) {
+      return 'code';
+    }
+    if (ext === 'md' || ext === 'markdown' || ext === 'txt') return 'md';
+    if (['png', 'jpg', 'jpeg', 'webp', 'svg', 'gif'].includes(ext || '')) {
+      return 'img';
+    }
   }
 
   // Infer from content patterns
   const content = fact.content;
-  if (content.startsWith('## Page ') || content.includes('.pdf') || (fact.tags && fact.tags.includes('pdf'))) {
+  if (
+    content.startsWith('## Page ') ||
+    content.includes('.pdf') ||
+    (fact.tags && fact.tags.includes('pdf'))
+  ) {
     return 'pdf';
   }
-  if (content.startsWith('## Sheet:') || content.includes('.xlsx') || (content.includes('|') && content.includes('\n|'))) {
+  if (
+    content.startsWith('## Sheet:') ||
+    content.includes('.xlsx') ||
+    (content.includes('|') && content.includes('\n|'))
+  ) {
     return 'xlsx';
   }
   if (content.startsWith('## Slide ') || content.includes('.pptx')) {
@@ -192,8 +246,16 @@ export type IngestStrategy = 'semantic' | 'single' | 'branching' | 'chunk';
 export type MergeStrategy = 'auto-merge' | 'replace' | 'new-branch';
 
 export interface SemanticSection {
+  id?: string;
   index: number;
-  type: 'chat-turn' | 'heading' | 'slide' | 'sheet' | 'code-block' | 'paragraph';
+  type:
+    | 'chat-turn'
+    | 'heading'
+    | 'slide'
+    | 'sheet'
+    | 'code-block'
+    | 'paragraph';
+  kind?: string;
   title?: string;
   content: string;
   speaker?: 'user' | 'assistant' | 'system' | 'note';
@@ -230,6 +292,57 @@ export type ReviewItemStatus =
   | 'skipped'
   | 'error';
 
+export type ExtractionStatus =
+  | 'ok'
+  | 'success'
+  | 'warning'
+  | 'error'
+  | 'failed'
+  | 'metadata_only';
+
+export interface StructuredDocumentPayload {
+  kind?: string;
+  format?: string;
+  mimeType?: string;
+  summary?: string;
+  language?: string;
+  pages?: Array<{ pageNumber: number; text: string }>;
+  ocrStatus?: 'not_required' | 'not_run' | 'embedded_text_extracted' | 'completed';
+  sheets?: Array<{
+    name: string;
+    headers: string[];
+    columns?: string[];
+    rows: string[][];
+    totalRows: number;
+    totalCols: number;
+  }>;
+  slides?: Array<{
+    slideNumber: number;
+    title: string;
+    bullets: string[];
+    notes?: string;
+  }>;
+  docxStructure?: {
+    headings: Array<{ level: number; text: string }>;
+    tablesCount: number;
+    paragraphsCount: number;
+  };
+  imageMeta?: {
+    width?: number;
+    height?: number;
+    dataUrl?: string;
+    ocrStatus: 'not_run' | 'embedded_metadata_extracted';
+  };
+  imagePreviewDataUrl?: string;
+  imageDimensions?: { width: number; height: number };
+  codeMeta?: {
+    language: string;
+    lineCount: number;
+  };
+  jsonStructure?: any;
+  htmlPreviewText?: string;
+}
+
 export interface ImportItemProgress {
   mode: 'determinate' | 'indeterminate';
   phase?: 'uploading' | 'extracting' | 'importing' | 'processing';
@@ -256,12 +369,14 @@ export interface ImportReviewItem {
   title: string;
   fileName: string;
   filePath?: string;
+  sourceFolder?: string;
   fileType?: FactFileType;
   archiveParent?: string;
   extension: string;
   sizeBytes: number;
   text: string;
   source: AISource;
+  sourceAttributionBasis?: 'folder_path' | 'explicit_header' | 'filename' | 'content_heuristic' | 'manual_override';
   destinationBrain: string;
   itemCount: number;
   itemUnitLabel: string;
@@ -275,6 +390,17 @@ export interface ImportReviewItem {
   tags: string[];
   progress?: ImportItemProgress;
   simulateFailureOnce?: boolean;
+  // Provenance & extraction metadata
+  originalCreatedAt?: string | null;
+  importedAt?: string;
+  importBatchId?: string;
+  checksum?: string;
+  extractionStatus?: ExtractionStatus;
+  extractionWarnings?: string[];
+  relatedSources?: AISource[];
+  fixtureId?: string;
+  topicKey?: string;
+  structuredData?: StructuredDocumentPayload;
 }
 
 export interface BatchExecutionProgress {
@@ -305,15 +431,342 @@ export interface Fact {
   fileType?: FactFileType;
   fileName?: string;
   filePath?: string;
+  sourceFolder?: string;
   parentId?: number;
   isDocumentRoot?: boolean;
   isUnifiedContextNode?: boolean;
   documentTitle?: string;
   semanticSectionCount?: number;
   mergeHistory?: FactMergeRecord[];
+  // Provenance & Integrity Metadata
+  originalCreatedAt?: string | null;
+  importedAt?: string;
+  importBatchId?: string;
+  checksum?: string;
+  extractionStatus?: ExtractionStatus;
+  extractionWarnings?: string[];
+  relatedSources?: AISource[];
+  fixtureId?: string;
+  topicKey?: string;
+  fileSizeBytes?: number;
+  structuredData?: StructuredDocumentPayload;
   created_at: string;
   updated_at: string;
 }
+
+// ============================================================================
+// SECTION 2: NEURAL GRAPH — RELATIONSHIPS & DATA CORRECTNESS
+// ============================================================================
+
+export type GraphRelationshipType = 'source' | 'semantic' | 'explicit';
+
+export interface GraphRelationshipEdge {
+  id: string;
+  fromId: string;
+  toId: string;
+  fromFactId?: number;
+  toFactId?: number;
+  fromSource?: AISource;
+  toSource?: AISource;
+  type: GraphRelationshipType;
+  score: number; // 0.0 to 1.0
+  label?: string;
+  basis?: string;
+  explanation: string;
+  sharedTerms?: string[];
+  sharedTags?: string[];
+  sharedKeywords?: string[];
+  crossSource?: boolean;
+}
+
+// ============================================================================
+// SECTION 8: ACTIVITY LOG — FULL AUDIT & DIAGNOSTICS
+// ============================================================================
+
+export type ActivityLogCategory =
+  | 'viewed'
+  | 'created'
+  | 'modified'
+  | 'deleted'
+  | 'imported'
+  | 'exported'
+  | 'export'
+  | 'import'
+  | 'archive_extract'
+  | 'provenance'
+  | 'create'
+  | 'edit'
+  | 'delete'
+  | 'tag_update'
+  | 'search'
+  | 'backup_create'
+  | 'backup_verify'
+  | 'backup_export'
+  | 'backup_delete'
+  | 'restore_internal'
+  | 'restore_external'
+  | 'migration'
+  | 'memory_create'
+  | 'memory_edit'
+  | 'search_execution'
+  | 'merged'
+  | 'replaced'
+  | 'skipped'
+  | 'backup_created'
+  | 'backup_exported'
+  | 'backup_deleted'
+  | 'restore_started'
+  | 'restore_completed'
+  | 'restore_failed'
+  | 'db_initialized'
+  | 'migration_executed'
+  | 'integrity_check'
+  | 'ai_sync'
+  | 'error'
+  | 'warning';
+
+export type ActivityLogStatus = 'success' | 'warning' | 'error' | 'info';
+
+export interface ActivityLogEntry {
+  id: string;
+  operationId?: string;
+  timestamp: string;
+  category: ActivityLogCategory;
+  action?: string;
+  status: ActivityLogStatus;
+  durationMs?: number;
+  brain?: string;
+  source?: AISource | string;
+  factId?: number | null;
+  recordId?: number | null;
+  fileName?: string | null;
+  batchOrBackupId?: string | null;
+  summary: string;
+  details?: Record<string, any>;
+  errorCategory?: string | null;
+  recoveryAction?: string | null;
+}
+
+// Legacy compatibility types for quick recent activity drawer
+export type ActivityAction = 'accessed' | 'modified' | 'created';
+
+export interface RecentActivityItem {
+  id: string;
+  factId: number;
+  brain: string;
+  source: AISource;
+  snippet: string;
+  action: ActivityAction;
+  timestamp: string;
+}
+
+// ============================================================================
+// SECTIONS 10 & 11: AI ENTITIES, WORMHOLES & SPINAL CORD ARCHITECTURE
+// ============================================================================
+
+export type AIEntitySyncStatus =
+  | 'local_gateway_ready'
+  | 'companion_paired'
+  | 'manual_import_only'
+  | 'offline';
+
+export interface AIEntity {
+  id: AISource;
+  displayName: string;
+  provider?: string;
+  providerFamily: string;
+  transportChannel?: string;
+  capabilities: string[];
+  supportedImportFormats: string[];
+  supportedExportFormats: string[];
+  syncStatus: AIEntitySyncStatus;
+  permissionsScope: string[];
+  provenanceRules: {
+    folderPrefixes: string[];
+    headerMatchers: string[];
+  };
+}
+
+export interface WormholeTransfer {
+  id: string;
+  originEntity: AISource;
+  destinationEntity: AISource | 'workspace';
+  destinationBrain: string;
+  transferredFactIds: number[];
+  direction: 'ingest' | 'grounding_export' | 'cross_entity_bridge';
+  timestamp: string;
+  transformationSummary: string;
+  validationStatus: 'verified' | 'filtered' | 'rejected';
+  auditOperationId: string;
+}
+
+export interface SpinalCordTransportBoundary {
+  protocolVersion: string;
+  localBindingOnly: boolean;
+  host: string;
+  port?: number;
+  lanExposureEnabled?: boolean;
+  remoteAccessEnabled?: boolean;
+  authenticatedEndpoints: string[];
+  validationGuarantees: string[];
+  auditRetentionPolicy: string;
+}
+
+export const AI_ENTITIES_REGISTRY: Record<AISource, AIEntity> = {
+  claude: {
+    id: 'claude',
+    displayName: 'Claude',
+    providerFamily: 'Anthropic (Provider-Neutral Adapter)',
+    capabilities: [
+      'Conversation Export Ingestion',
+      'Artifacts & Project Instructions Capture',
+      'One-Click Context Primer Generation',
+      'Local MCP Bridge Recall/Remember',
+    ],
+    supportedImportFormats: ['.md', '.json', '.pdf', '.docx', '.xlsx', '.pptx', '.csv', '.txt', '.zip'],
+    supportedExportFormats: ['Markdown Primer (.md)', 'JSON Context Bundle'],
+    syncStatus: 'local_gateway_ready',
+    permissionsScope: ['read:workspace_facts', 'write:staged_review_queue'],
+    provenanceRules: {
+      folderPrefixes: ['01_claude', 'claude'],
+      headerMatchers: ['Primary Source: Claude', 'Primary Source: 01_claude'],
+    },
+  },
+  gpt: {
+    id: 'gpt',
+    displayName: 'ChatGPT',
+    providerFamily: 'OpenAI (Provider-Neutral Adapter)',
+    capabilities: [
+      'Full Account Archive (conversations.json) Ingestion',
+      'Canvas & Code Block Extraction',
+      'Custom Instructions Grounding Export',
+      'Browser Companion DOM Capture',
+    ],
+    supportedImportFormats: ['.json', '.md', '.pdf', '.docx', '.xlsx', '.pptx', '.csv', '.txt', '.zip'],
+    supportedExportFormats: ['Custom Instructions (.md)', 'Portable Markdown'],
+    syncStatus: 'local_gateway_ready',
+    permissionsScope: ['read:workspace_facts', 'write:staged_review_queue'],
+    provenanceRules: {
+      folderPrefixes: ['02_chatgpt', 'chatgpt', 'gpt', 'openai'],
+      headerMatchers: ['Primary Source: ChatGPT', 'Primary Source: 02_chatgpt', 'Primary Source: GPT'],
+    },
+  },
+  gemini: {
+    id: 'gemini',
+    displayName: 'Gemini',
+    providerFamily: 'Google DeepMind (Provider-Neutral Adapter)',
+    capabilities: [
+      'Multimodal Document & Research Ingestion',
+      'Structured Grounding Context Export',
+      'Browser Companion DOM Capture',
+      'Optional Server-Side Live Recall Verification',
+    ],
+    supportedImportFormats: ['.md', '.pdf', '.docx', '.xlsx', '.pptx', '.csv', '.json', '.png', '.jpg', '.zip'],
+    supportedExportFormats: ['Gemini Workspace Context (.md)', 'JSON Context Bundle'],
+    syncStatus: 'local_gateway_ready',
+    permissionsScope: ['read:workspace_facts', 'write:staged_review_queue'],
+    provenanceRules: {
+      folderPrefixes: ['03_gemini', 'gemini'],
+      headerMatchers: ['Primary Source: Gemini', 'Primary Source: 03_gemini'],
+    },
+  },
+  github: {
+    id: 'github',
+    displayName: 'GitHub',
+    providerFamily: 'Git / Code Forge Adapter',
+    capabilities: [
+      'Repository Source Code & Architecture ADR Ingestion',
+      'Issue, PR & Release Notes Extraction',
+      'Cross-Source Code Provenance Linking',
+    ],
+    supportedImportFormats: ['.ts', '.tsx', '.js', '.py', '.rs', '.go', '.md', '.json', '.yaml', '.pdf', '.pptx', '.xlsx', '.zip'],
+    supportedExportFormats: ['ADR Markdown (.md)', 'Repository Context Bundle'],
+    syncStatus: 'manual_import_only',
+    permissionsScope: ['read:workspace_facts', 'write:staged_review_queue'],
+    provenanceRules: {
+      folderPrefixes: ['04_github', 'github'],
+      headerMatchers: ['Primary Source: GitHub', 'Primary Source: 04_github'],
+    },
+  },
+  moodle: {
+    id: 'moodle',
+    displayName: 'Moodle',
+    providerFamily: 'Academic LMS Adapter',
+    capabilities: [
+      'Lecture Slides (.pptx), Handouts (.pdf) & Rubrics (.docx) Extraction',
+      'Lab Grades & Tabular Schedule (.xlsx/.csv) Parsing',
+      'Coursework Topic Clustering',
+    ],
+    supportedImportFormats: ['.pdf', '.docx', '.pptx', '.xlsx', '.csv', '.md', '.txt', '.html', '.zip'],
+    supportedExportFormats: ['Study Guide Markdown (.md)'],
+    syncStatus: 'manual_import_only',
+    permissionsScope: ['read:workspace_facts', 'write:staged_review_queue'],
+    provenanceRules: {
+      folderPrefixes: ['05_moodle', 'moodle'],
+      headerMatchers: ['Primary Source: Moodle', 'Primary Source: 05_moodle'],
+    },
+  },
+  cursor: {
+    id: 'cursor',
+    displayName: 'Cursor / Antigravity',
+    providerFamily: 'IDE Agent & Composer Adapter',
+    capabilities: [
+      'Composer Session & Rules (.cursorrules) Ingestion',
+      'Local MCP Server Recall & Remember Integration',
+      'Multi-File Refactor Context Grounding',
+    ],
+    supportedImportFormats: ['.md', '.ts', '.tsx', '.py', '.json', '.yaml', '.pdf', '.docx', '.xlsx', '.pptx', '.zip'],
+    supportedExportFormats: ['.cursorrules Markdown', 'MCP Context Payload'],
+    syncStatus: 'local_gateway_ready',
+    permissionsScope: ['read:workspace_facts', 'write:workspace_facts'],
+    provenanceRules: {
+      folderPrefixes: ['06_cursor_antigravity', '06_cursor', 'cursor', 'antigravity'],
+      headerMatchers: ['Primary Source: Cursor', 'Primary Source: Cursor / Antigravity', 'Primary Source: 06_cursor_antigravity'],
+    },
+  },
+  'local-ai': {
+    id: 'local-ai',
+    displayName: 'Local AI / Ollama',
+    providerFamily: 'Local Inference Runtime Adapter',
+    capabilities: [
+      'Offline Model Generation & Benchmark Log Ingestion',
+      'Zero-Egress Local SQLite Context Grounding',
+      'Local MCP Stdio / HTTP Bridge Support',
+    ],
+    supportedImportFormats: ['.md', '.json', '.txt', '.csv', '.pdf', '.docx', '.xlsx', '.pptx', '.py', '.sh', '.zip'],
+    supportedExportFormats: ['System Prompt Markdown (.md)', 'JSONL Context'],
+    syncStatus: 'local_gateway_ready',
+    permissionsScope: ['read:workspace_facts', 'write:workspace_facts'],
+    provenanceRules: {
+      folderPrefixes: ['07_local_ai_ollama', '07_local_ai', 'local-ai', 'local_ai', 'ollama'],
+      headerMatchers: ['Primary Source: Local AI', 'Primary Source: Local AI / Ollama', 'Primary Source: 07_local_ai_ollama', 'Primary Source: Ollama'],
+    },
+  },
+};
+
+export const SPINAL_CORD_BOUNDARY: SpinalCordTransportBoundary = {
+  protocolVersion: 'Argon-SpinalCord/1.2 (Local-First)',
+  localBindingOnly: true,
+  host: '127.0.0.1',
+  port: 3000,
+  lanExposureEnabled: false,
+  remoteAccessEnabled: false,
+  authenticatedEndpoints: [
+    'POST /api/facts/ingest-item',
+    'POST /api/companion/capture',
+    'POST /api/companion/capture-project',
+    'POST /api/database/backups',
+    'POST /api/database/restore',
+    'POST /api/database/restore-external',
+  ],
+  validationGuarantees: [
+    'Strict folder/header source provenance precedence over body keywords',
+    'SHA-256 content checksum computation and duplicate state verification',
+    'SQLite 16-byte magic header + PRAGMA integrity_check on all backups and restores',
+    'Automatic token and secret redaction on all Activity Log diagnostics and exports',
+  ],
+  auditRetentionPolicy: 'Durable SQLite activity_logs table with structured JSON/CSV export',
+};
 
 export interface SourceMeta {
   id: AISource;
@@ -384,15 +837,3 @@ export const SOURCE_PALETTE: Record<AISource, SourceMeta> = {
 };
 
 export const DEFAULT_BRAINS = ['coding', 'college', 'personal'];
-
-export type ActivityAction = 'accessed' | 'modified' | 'created';
-
-export interface RecentActivityItem {
-  id: string; // unique event id
-  factId: number;
-  brain: string;
-  source: AISource;
-  snippet: string;
-  action: ActivityAction;
-  timestamp: string;
-}

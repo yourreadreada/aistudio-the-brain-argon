@@ -75,8 +75,8 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
   useEffect(() => {
     if (!filterQuery.trim()) {
       if (isOpen) {
-        // Show recent or starter suggestions when empty
-        const suggestions = brainStore.recall(currentBrain).slice(0, 6);
+        // Show recent suggestions when empty, but allow browsing up to 25 recent nodes
+        const suggestions = brainStore.recall(currentBrain).slice(0, 25);
         setResults(suggestions);
       } else {
         setResults([]);
@@ -150,7 +150,7 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
         <input
           ref={inputRef}
           type="text"
-          placeholder={`Search neural nodes in ${currentBrain}... (⌘K)`}
+          placeholder={`Search titles, content, files, tags, Fixture ID in ${currentBrain}... (⌘K)`}
           value={localQuery}
           onChange={(e) => {
             setLocalQuery(e.target.value);
@@ -166,7 +166,8 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
           {localQuery ? (
             <button
               onClick={clearQuery}
-              className="mono rounded px-1 text-[11px] text-white/40 hover:text-white"
+              title="Clear search"
+              className="mono rounded px-1.5 text-[12px] text-white/50 hover:bg-white/10 hover:text-white"
             >
               ×
             </button>
@@ -180,7 +181,7 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
 
       {/* Floating Global Search Results Dropdown */}
       {isOpen && (
-        <div className="absolute left-0 right-0 top-full z-50 mt-2 max-h-[440px] overflow-hidden rounded-2xl border border-white/20 bg-[#060814]/95 shadow-2xl backdrop-blur-2xl">
+        <div className="absolute left-0 right-0 top-full z-50 mt-2 max-h-[520px] overflow-hidden rounded-2xl border border-white/20 bg-[#060814]/95 shadow-2xl backdrop-blur-2xl">
           {/* Header Controls: Scope & Count */}
           <div className="flex items-center justify-between border-b border-white/10 px-3.5 py-2 text-[11px]">
             <div className="flex items-center gap-1.5">
@@ -207,18 +208,20 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
               </button>
             </div>
 
-            <span className="mono text-[10px] text-white/40">
-              {results.length} node{results.length === 1 ? '' : 's'}
+            <span className="mono text-[10px] text-emerald-300/90 font-medium">
+              {filterQuery.trim()
+                ? `${results.length} matching node${results.length === 1 ? '' : 's'}`
+                : `Recent (${results.length})`}
             </span>
           </div>
 
-          {/* Results List */}
-          <div className="max-h-[340px] overflow-y-auto p-1.5 scrollbar-thin">
+          {/* Results List — Full scrollable list without artificial truncation */}
+          <div className="max-h-[410px] overflow-y-auto p-1.5 scrollbar-thin">
             {results.length === 0 ? (
               <div className="py-8 text-center">
-                <p className="text-xs text-white/50">No neural nodes match "{filterQuery}"</p>
-                <p className="mono mt-1 text-[10.5px] text-white/30">
-                  Try searching by keyword, title, source origin, or node ID (e.g. #3)
+                <p className="text-xs text-white/60">No neural nodes match "{filterQuery}"</p>
+                <p className="mono mt-1 text-[10.5px] text-white/35">
+                  Try searching by title, filename, path, Fixture ID (e.g. BRAIN-GRAPH-ADD-091), tag, source, or #ID
                 </p>
               </div>
             ) : (
@@ -228,6 +231,10 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
                   color: '#fff',
                   name: fact.source,
                 };
+                const title = fact.documentTitle || fact.fileName || `Memory #${fact.id}`;
+                const relevance = filterQuery.trim()
+                  ? brainStore.computeRelevanceScore(fact, filterQuery, currentBrain)
+                  : null;
 
                 return (
                   <div
@@ -250,16 +257,26 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
 
                     {/* Content Details */}
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
                         <span
-                          className="mono text-[10.5px] font-semibold uppercase tracking-wider"
+                          className="mono text-[10px] font-semibold uppercase tracking-wider"
                           style={{ color: palette.color }}
                         >
                           {palette.name}
                         </span>
-                        <span className="mono text-[10.5px] text-white/40">
+                        <span className="mono text-[10px] text-white/45">
                           #{fact.id}
                         </span>
+                        {fact.fixtureId && (
+                          <span className="mono rounded bg-indigo-500/20 border border-indigo-400/30 px-1.5 py-0.2 text-[9px] text-indigo-200">
+                            {fact.fixtureId}
+                          </span>
+                        )}
+                        {fact.filePath && (
+                          <span className="mono truncate max-w-[180px] rounded bg-white/5 px-1.5 py-0.2 text-[9px] text-white/50">
+                            {fact.filePath}
+                          </span>
+                        )}
                         {scope === 'all' && fact.brain !== currentBrain && (
                           <span className="mono rounded bg-white/10 px-1 py-0.2 text-[9.5px] text-white/60">
                             brain: {fact.brain}
@@ -273,9 +290,27 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
                         </span>
                       </div>
 
-                      <p className="mt-1 line-clamp-2 text-[11.5px] text-white/90 leading-relaxed font-sans">
+                      <div className="mt-0.5 text-[11.5px] font-semibold text-white truncate">
+                        {title}
+                      </div>
+
+                      <p className="mt-0.5 line-clamp-2 text-[11px] text-white/75 leading-relaxed font-sans">
                         {fact.content}
                       </p>
+
+                      {relevance && relevance.matchedFields.length > 0 && (
+                        <div className="mt-1 flex flex-wrap items-center gap-1">
+                          <span className="mono text-[9px] text-white/35">Matched in:</span>
+                          {relevance.matchedFields.map((field) => (
+                            <span
+                              key={field}
+                              className="mono rounded bg-emerald-500/15 border border-emerald-500/30 px-1 py-0.2 text-[8.5px] text-emerald-300"
+                            >
+                              {field}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </div>
                 );
@@ -285,9 +320,9 @@ export const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({
 
           {/* Footer Shortcuts Navigation */}
           <div className="flex items-center justify-between border-t border-white/10 px-3 py-1.5 text-[10px] text-white/40 font-mono">
-            <span>↑↓ to navigate</span>
-            <span>↵ to select & focus</span>
-            <span>ESC to close</span>
+            <span>↑↓ navigate all {results.length} results</span>
+            <span>↵ select & inspect</span>
+            <span>ESC close</span>
           </div>
         </div>
       )}

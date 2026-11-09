@@ -11,6 +11,12 @@ import {
   DEFAULT_BRAINS,
   RecentActivityItem,
   ActivityAction,
+  StructuredDocumentPayload,
+  GraphRelationshipEdge,
+  GraphRelationshipType,
+  ActivityLogEntry,
+  ActivityLogCategory,
+  ActivityLogStatus,
   inferFileTypeFromExtension,
   getFactFileType,
 } from '../types/brain';
@@ -20,6 +26,11 @@ import {
   areDocumentsExactDuplicates,
   normalizeContentForDuplicateCheck,
 } from './semanticChunker';
+import {
+  resolveSourceFromProvenance,
+  extractMetadataFromDocumentText,
+  computeContentChecksum,
+} from './fileExtractor';
 
 export interface CompanionDeviceRecord {
   id: string;
@@ -502,50 +513,113 @@ class BrainStorageService {
     return this.facts.find((f) => f.id === id);
   }
 
-  public globalSearch(query: string, preferredBrain?: string): Fact[] {
+  public computeRelevanceScore(fact: Fact, query: string, preferredBrain?: string): { score: number; matchedFields: string[] } {
     const q = query.trim().toLowerCase();
-    if (!q) return [];
+    if (!q) return { score: 1, matchedFields: [] };
 
-    const isIdSearch = /^#?\d+$/.test(q);
-    if (isIdSearch) {
-      const numId = parseInt(q.replace('#', ''), 10);
-      return this.facts.filter((f) => f.id === numId);
+    const matchedFields: string[] = [];
+    let score = 0;
+
+    const idStr = `#${fact.id}`;
+    if (q === idStr || q === String(fact.id)) {
+      return { score: 1000, matchedFields: ['id'] };
     }
+
+    const title = (fact.documentTitle || '').toLowerCase();
+    const fileName = (fact.fileName || '').toLowerCase();
+    const filePath = (fact.filePath || '').toLowerCase();
+    const sourceFolder = (fact.sourceFolder || '').toLowerCase();
+    const fixtureId = (fact.fixtureId || '').toLowerCase();
+    const topicKey = (fact.topicKey || '').toLowerCase();
+    const source = fact.source.toLowerCase();
+    const brain = fact.brain.toLowerCase();
+    const fileType = (fact.fileType || getFactFileType(fact)).toLowerCase();
+    const tags = (fact.tags || []).map((t) => t.toLowerCase());
+    const tagsText = tags.join(' ');
+    const relatedSourcesText = (fact.relatedSources || []).join(' ').toLowerCase();
+    const content = fact.content.toLowerCase();
+
+    const fullHaystack = `${idStr} ${fixtureId} ${title} ${fileName} ${filePath} ${sourceFolder} ${topicKey} ${source} ${brain} ${fileType} ${tagsText} ${relatedSourcesText} ${content}`;
 
     const terms = q.split(/\s+/).filter(Boolean);
-    const scored: { fact: Fact; score: number }[] = [];
+    const allTermsMatch = terms.every((term) => fullHaystack.includes(term));
+    if (!allTermsMatch) {
+      return { score: 0, matchedFields: [] };
+    }
 
+    if (fixtureId && (fixtureId === q || fixtureId.includes(q))) {
+      score += fixtureId === q ? 250 : 140;
+      matchedFields.push('fixtureId');
+    }
+    if (title && (title === q || title.includes(q))) {
+      score += title === q ? 180 : 95;
+      matchedFields.push('title');
+    }
+    if (fileName && (fileName === q || fileName.includes(q))) {
+      score += fileName === q ? 170 : 90;
+      matchedFields.push('fileName');
+    }
+    if (filePath && filePath.includes(q)) {
+      score += 75;
+      matchedFields.push('filePath');
+    }
+    if (topicKey && topicKey.includes(q)) {
+      score += 70;
+      matchedFields.push('topicKey');
+    }
+    if (tags.some((t) => t === q || t.includes(q))) {
+      score += tags.some((t) => t === q) ? 85 : 55;
+      matchedFields.push('tags');
+    }
+    if (source === q || source.includes(q)) {
+      score += source === q ? 65 : 35;
+      matchedFields.push('source');
+    }
+    if (fileType === q || fileType.includes(q)) {
+      score += 30;
+      matchedFields.push('fileType');
+    }
+    if (content.includes(q)) {
+      score += 45;
+      matchedFields.push('content');
+    }
+
+    // Per-term granularity bonus
+    for (const term of terms) {
+      if (fixtureId.includes(term)) score += 35;
+      if (title.includes(term)) score += 25;
+      if (fileName.includes(term)) score += 22;
+      if (filePath.includes(term)) score += 16;
+      if (topicKey.includes(term)) score += 18;
+      if (tagsText.includes(term)) score += 15;
+      if (content.includes(term)) score += 8;
+    }
+
+    if (preferredBrain && fact.brain === preferredBrain) {
+      score += 10;
+    }
+
+    return { score: Math.max(1, score), matchedFields: Array.from(new Set(matchedFields)) };
+  }
+
+  public globalSearch(query: string, preferredBrain?: string): Fact[] {
+    const q = query.trim();
+    if (!q) return [];
+
+    const scored: { fact: Fact; score: number }[] = [];
     for (let i = 0; i < this.facts.length; i++) {
       const fact = this.facts[i];
-      let score = 0;
-      const content = fact.content.toLowerCase();
-      const source = fact.source.toLowerCase();
-      const brain = fact.brain.toLowerCase();
-      const fileName = (fact.fileName || '').toLowerCase();
-      const fileType = (fact.fileType || getFactFileType(fact)).toLowerCase();
-      const tagsText = (fact.tags || []).join(' ').toLowerCase();
-      const fullText = `${content} ${source} ${brain} ${fileName} ${fileType} ${tagsText} #${fact.id}`;
-
-      const allMatch = terms.every((t) => fullText.includes(t));
-      if (!allMatch) continue;
-
-      if (content.includes(q)) score += 10;
-      if (fileName.includes(q)) score += 9;
-      if (tagsText.includes(q)) score += 8;
-      if (source.includes(q)) score += 6;
-      if (fileType.includes(q)) score += 5;
-      if (preferredBrain && fact.brain === preferredBrain) score += 3;
-
-      score += 1;
-      scored.push({ fact, score });
+      const { score } = this.computeRelevanceScore(fact, q, preferredBrain);
+      if (score > 0) {
+        scored.push({ fact, score });
+      }
     }
 
-    scored.sort((a, b) => b.score - a.score);
-    const results = new Array(scored.length);
-    for (let i = 0; i < scored.length; i++) {
-      results[i] = scored[i].fact;
-    }
-    return results;
+    scored.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return new Date(b.fact.updated_at).getTime() - new Date(a.fact.updated_at).getTime();
+    });
+    return scored.map((s) => s.fact);
   }
 
   public updateFactTags(id: number, tags: string[]): boolean {
@@ -686,14 +760,20 @@ class BrainStorageService {
     }
 
     if (query.trim()) {
-      const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-      list = list.filter((fact) => {
-        const tags = (fact.tags || []).join(' ');
-        const fileName = fact.fileName || '';
-        const fileType = fact.fileType || getFactFileType(fact);
-        const text = (fact.content + ' ' + fact.source + ' ' + fileName + ' ' + fileType + ' ' + tags + ' #' + fact.id).toLowerCase();
-        return terms.every((term) => text.includes(term));
-      });
+      const q = query.trim();
+      const scored: { fact: Fact; score: number }[] = [];
+      for (const fact of list) {
+        const { score } = this.computeRelevanceScore(fact, q, brain);
+        if (score > 0) {
+          scored.push({ fact, score });
+        }
+      }
+      return scored
+        .sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          return new Date(b.fact.updated_at).getTime() - new Date(a.fact.updated_at).getTime();
+        })
+        .map((s) => s.fact);
     }
 
     return list.sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
@@ -705,20 +785,37 @@ class BrainStorageService {
     source: AISource,
     fileName?: string,
     fileType?: FactFileType,
-    tags?: string[]
+    tags?: string[],
+    extraProvenance?: Partial<Fact>
   ): Fact {
     const now = new Date().toISOString();
     const tempId = this.facts.length > 0 ? Math.max(...this.facts.map((f) => f.id)) + 1 : 1;
     const resolvedFileType = fileType || (fileName ? inferFileTypeFromExtension(fileName) : undefined);
+    const effectivePath = extraProvenance?.filePath || fileName;
+    const provenance = resolveSourceFromProvenance(effectivePath, fileName, content, source);
+    const docMeta = extractMetadataFromDocumentText(content, fileName);
 
     const fact: Fact = {
       id: tempId,
       brain: brain.trim().toLowerCase(),
       content: content.trim(),
-      source,
+      source: provenance.confidence === 'folder' || provenance.confidence === 'header' ? provenance.source : source,
       fileName,
+      filePath: effectivePath,
       fileType: resolvedFileType,
-      tags: tags || [],
+      tags: Array.from(new Set([...(tags || []), ...docMeta.tags])),
+      sourceFolder: extraProvenance?.sourceFolder ?? provenance.sourceFolder,
+      originalCreatedAt: extraProvenance?.originalCreatedAt !== undefined ? extraProvenance.originalCreatedAt : docMeta.originalCreatedAt,
+      importedAt: extraProvenance?.importedAt || now,
+      importBatchId: extraProvenance?.importBatchId,
+      checksum: extraProvenance?.checksum || computeContentChecksum(content),
+      extractionStatus: extraProvenance?.extractionStatus || 'ok',
+      extractionWarnings: extraProvenance?.extractionWarnings,
+      relatedSources: extraProvenance?.relatedSources || docMeta.relatedSources,
+      fixtureId: extraProvenance?.fixtureId || docMeta.fixtureId,
+      topicKey: extraProvenance?.topicKey || docMeta.topicKey,
+      fileSizeBytes: extraProvenance?.fileSizeBytes ?? new TextEncoder().encode(content).length,
+      structuredData: extraProvenance?.structuredData,
       created_at: now,
       updated_at: now,
     };
@@ -738,15 +835,28 @@ class BrainStorageService {
         content: fact.content,
         source: fact.source,
         fileName: fact.fileName,
+        filePath: fact.filePath,
         fileType: fact.fileType,
         tags: fact.tags,
+        sourceFolder: fact.sourceFolder,
+        originalCreatedAt: fact.originalCreatedAt,
+        importedAt: fact.importedAt,
+        importBatchId: fact.importBatchId,
+        checksum: fact.checksum,
+        extractionStatus: fact.extractionStatus,
+        extractionWarnings: fact.extractionWarnings,
+        relatedSources: fact.relatedSources,
+        fixtureId: fact.fixtureId,
+        topicKey: fact.topicKey,
+        fileSizeBytes: fact.fileSizeBytes,
+        structuredData: fact.structuredData,
       }),
     })
       .then((r) => r.json())
       .then((saved: Fact) => {
         const idx = this.facts.findIndex((f) => f === fact);
         if (idx !== -1 && saved?.id) {
-          this.facts[idx] = { ...this.facts[idx], id: saved.id };
+          this.facts[idx] = { ...this.facts[idx], ...saved, id: saved.id };
           this.saveLocalFacts();
           this.notify();
         }
@@ -777,6 +887,18 @@ class BrainStorageService {
       semanticSectionCount?: number;
       mergeHistory?: Fact['mergeHistory'];
       parentId?: number;
+      sourceFolder?: string;
+      originalCreatedAt?: string | null;
+      importedAt?: string;
+      importBatchId?: string;
+      checksum?: string;
+      extractionStatus?: Fact['extractionStatus'];
+      extractionWarnings?: string[];
+      relatedSources?: AISource[];
+      fixtureId?: string;
+      topicKey?: string;
+      fileSizeBytes?: number;
+      structuredData?: StructuredDocumentPayload;
       headers?: Record<string, string>;
       simulateFailure?: boolean;
     }
@@ -788,26 +910,50 @@ class BrainStorageService {
     const resolvedBrain = brain.trim().toLowerCase();
     const resolvedContent = content.trim();
     const reqHeaders = extraMeta?.headers || { 'Content-Type': 'application/json' };
+    const provenance = resolveSourceFromProvenance(filePath || fileName, fileName, resolvedContent, source);
+    const docMeta = extractMetadataFromDocumentText(resolvedContent, fileName);
+    const effectiveSource =
+      provenance.confidence === 'folder' || provenance.confidence === 'header'
+        ? provenance.source
+        : source;
+    const nowIso = new Date().toISOString();
+
+    const payloadBody = {
+      brain: resolvedBrain,
+      content: resolvedContent,
+      source: effectiveSource,
+      fileName,
+      filePath,
+      fileType,
+      tags: Array.from(new Set([...(tags || []), ...docMeta.tags])),
+      isDocumentRoot: extraMeta?.isDocumentRoot,
+      isUnifiedContextNode: extraMeta?.isUnifiedContextNode,
+      documentTitle: extraMeta?.documentTitle || docMeta.title,
+      semanticSectionCount: extraMeta?.semanticSectionCount,
+      mergeHistory: extraMeta?.mergeHistory,
+      parentId: extraMeta?.parentId,
+      sourceFolder: extraMeta?.sourceFolder ?? provenance.sourceFolder,
+      originalCreatedAt:
+        extraMeta?.originalCreatedAt !== undefined
+          ? extraMeta.originalCreatedAt
+          : docMeta.originalCreatedAt,
+      importedAt: extraMeta?.importedAt || nowIso,
+      importBatchId: extraMeta?.importBatchId,
+      checksum: extraMeta?.checksum || computeContentChecksum(resolvedContent),
+      extractionStatus: extraMeta?.extractionStatus || 'ok',
+      extractionWarnings: extraMeta?.extractionWarnings,
+      relatedSources: extraMeta?.relatedSources || docMeta.relatedSources,
+      fixtureId: extraMeta?.fixtureId || docMeta.fixtureId,
+      topicKey: extraMeta?.topicKey || docMeta.topicKey,
+      fileSizeBytes: extraMeta?.fileSizeBytes ?? new TextEncoder().encode(resolvedContent).length,
+      structuredData: extraMeta?.structuredData,
+    };
 
     try {
       const response = await fetch(`${API_BASE}/api/remember`, {
         method: 'POST',
         headers: reqHeaders,
-        body: JSON.stringify({
-          brain: resolvedBrain,
-          content: resolvedContent,
-          source,
-          fileName,
-          filePath,
-          fileType,
-          tags: tags || [],
-          isDocumentRoot: extraMeta?.isDocumentRoot,
-          isUnifiedContextNode: extraMeta?.isUnifiedContextNode,
-          documentTitle: extraMeta?.documentTitle,
-          semanticSectionCount: extraMeta?.semanticSectionCount,
-          mergeHistory: extraMeta?.mergeHistory,
-          parentId: extraMeta?.parentId,
-        }),
+        body: JSON.stringify(payloadBody),
       });
 
       if (!response.ok) {
@@ -825,20 +971,15 @@ class BrainStorageService {
       }
 
       const fact: Fact = {
+        ...payloadBody,
         ...saved,
         brain: saved.brain || resolvedBrain,
         content: saved.content || resolvedContent,
-        source: saved.source || source,
+        source: saved.source || effectiveSource,
         fileName: saved.fileName || fileName,
         filePath: saved.filePath || filePath,
         fileType: saved.fileType || fileType,
-        tags: saved.tags || tags || [],
-        isDocumentRoot: saved.isDocumentRoot ?? extraMeta?.isDocumentRoot,
-        isUnifiedContextNode: saved.isUnifiedContextNode ?? extraMeta?.isUnifiedContextNode,
-        documentTitle: saved.documentTitle || extraMeta?.documentTitle,
-        semanticSectionCount: saved.semanticSectionCount ?? extraMeta?.semanticSectionCount,
-        mergeHistory: saved.mergeHistory || extraMeta?.mergeHistory,
-        parentId: saved.parentId ?? extraMeta?.parentId,
+        tags: saved.tags || payloadBody.tags,
       };
 
       this.facts = [fact, ...this.facts.filter((f) => f.id !== fact.id)];
@@ -858,26 +999,14 @@ class BrainStorageService {
         throw err;
       }
 
-      const now = new Date().toISOString();
       const nextId =
         this.facts.length > 0 ? Math.max(...this.facts.map((f) => f.id)) + 1 : 1;
       const offlineFact: Fact = {
         id: nextId,
-        brain: resolvedBrain,
-        content: resolvedContent,
-        source,
-        fileName,
+        ...payloadBody,
         filePath: filePath || fileName,
-        fileType,
-        tags: tags || [],
-        isDocumentRoot: extraMeta?.isDocumentRoot,
-        isUnifiedContextNode: extraMeta?.isUnifiedContextNode,
-        documentTitle: extraMeta?.documentTitle,
-        semanticSectionCount: extraMeta?.semanticSectionCount,
-        mergeHistory: extraMeta?.mergeHistory,
-        parentId: extraMeta?.parentId,
-        created_at: now,
-        updated_at: now,
+        created_at: nowIso,
+        updated_at: nowIso,
       };
 
       this.facts = [offlineFact, ...this.facts];
@@ -1370,6 +1499,18 @@ class BrainStorageService {
     strategy?: IngestStrategy;
     chunkSize?: number;
     simulateFailure?: boolean;
+    sourceFolder?: string;
+    originalCreatedAt?: string | null;
+    importedAt?: string;
+    importBatchId?: string;
+    checksum?: string;
+    extractionStatus?: Fact['extractionStatus'];
+    extractionWarnings?: string[];
+    relatedSources?: AISource[];
+    fixtureId?: string;
+    topicKey?: string;
+    fileSizeBytes?: number;
+    structuredData?: StructuredDocumentPayload;
     onProgress?: (progress: {
       mode: 'determinate' | 'indeterminate';
       current?: number;
@@ -1926,6 +2067,18 @@ class BrainStorageService {
         documentTitle: cleanTitle,
         semanticSectionCount: parsed.sections.length,
         mergeHistory: initialHistory,
+        sourceFolder: params.sourceFolder,
+        originalCreatedAt: params.originalCreatedAt,
+        importedAt: params.importedAt,
+        importBatchId: params.importBatchId,
+        checksum: params.checksum,
+        extractionStatus: params.extractionStatus,
+        extractionWarnings: params.extractionWarnings,
+        relatedSources: params.relatedSources,
+        fixtureId: params.fixtureId,
+        topicKey: params.topicKey,
+        fileSizeBytes: params.fileSizeBytes,
+        structuredData: params.structuredData,
         headers,
         simulateFailure: params.simulateFailure,
       }
@@ -3048,6 +3201,440 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
   public getBackupDownloadUrl(fileName: string): string {
     return `${API_BASE}/api/database/backups/${encodeURIComponent(fileName)}/download`;
   }
+
+  /**
+   * Section 9.A: Client-Verified Binary Backup Export.
+   * Fetches the backup binary, verifies the 16-byte SQLite format 3\0 magic header
+   * and byte size in browser memory, rejects HTML/proxy responses, and returns a verified Blob.
+   */
+  public async exportVerifiedBackupBlob(fileName: string): Promise<{
+    blob: Blob;
+    fileName: string;
+    sizeBytes: number;
+    headerVerified: boolean;
+  }> {
+    const url = this.getBackupDownloadUrl(fileName);
+    const res = await fetch(url, {
+      headers: {
+        Accept: 'application/x-sqlite3, application/octet-stream',
+      },
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData?.error || `Backup download failed (HTTP ${res.status})`);
+    }
+    const arrayBuffer = await res.arrayBuffer();
+    const bytes = new Uint8Array(arrayBuffer);
+
+    // Check if proxy/cookie check returned HTML instead of binary SQLite
+    const firstChars = new TextDecoder('utf-8', { fatal: false }).decode(bytes.slice(0, 64));
+    if (
+      firstChars.trim().toLowerCase().startsWith('<!doctype html') ||
+      firstChars.trim().toLowerCase().startsWith('<html') ||
+      firstChars.includes('Cookie check')
+    ) {
+      throw new Error(
+        'Export rejected: Server or proxy returned an HTML/cookie-check page instead of a binary SQLite database.'
+      );
+    }
+
+    if (bytes.byteLength < 100) {
+      throw new Error(`Export rejected: File is too small (${bytes.byteLength} bytes) to be a valid SQLite database.`);
+    }
+
+    const expectedMagic = 'SQLite format 3\0';
+    let magicMatches = true;
+    for (let i = 0; i < expectedMagic.length; i++) {
+      if (bytes[i] !== expectedMagic.charCodeAt(i)) {
+        magicMatches = false;
+        break;
+      }
+    }
+    if (!magicMatches) {
+      throw new Error(
+        'Export rejected: Downloaded payload does not begin with the 16-byte "SQLite format 3\\0" header.'
+      );
+    }
+
+    const blob = new Blob([arrayBuffer], { type: 'application/x-sqlite3' });
+    return {
+      blob,
+      fileName,
+      sizeBytes: bytes.byteLength,
+      headerVerified: true,
+    };
+  }
+
+  public async deleteDatabaseBackup(fileName: string): Promise<{
+    success: boolean;
+    deletedFile: string;
+    backups: DatabaseBackupItem[];
+    status: DatabaseStatusPayload;
+  }> {
+    const res = await fetch(`${API_BASE}/api/database/backups/${encodeURIComponent(fileName)}`, {
+      method: 'DELETE',
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Failed to delete backup (HTTP ${res.status})`);
+    }
+    return data;
+  }
+
+  public async cleanupInvalidBackups(): Promise<{
+    success: boolean;
+    deletedCount: number;
+    deletedFiles: string[];
+    backups: DatabaseBackupItem[];
+    status: DatabaseStatusPayload;
+  }> {
+    const res = await fetch(`${API_BASE}/api/database/backups/cleanup-invalid`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `Failed to clean up invalid backups (HTTP ${res.status})`);
+    }
+    return data;
+  }
+
+  private async fileToBase64(file: File): Promise<string> {
+    const buffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  public async inspectExternalBackupFile(file: File): Promise<ExternalBackupInspectionResult> {
+    const buffer = await file.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    const previewText = new TextDecoder('utf-8', { fatal: false }).decode(bytes.slice(0, 80));
+    if (
+      previewText.trim().toLowerCase().startsWith('<!doctype html') ||
+      previewText.trim().toLowerCase().startsWith('<html') ||
+      previewText.includes('Cookie check')
+    ) {
+      return {
+        valid: false,
+        fileName: file.name,
+        sizeBytes: bytes.byteLength,
+        headerValid: false,
+        integrityStatus: 'invalid_html_payload',
+        schemaVersion: 0,
+        factsCount: 0,
+        brainsBreakdown: {},
+        sourcesBreakdown: {},
+        error: 'Rejected: Selected file is an HTML/cookie-check page, not a binary SQLite database.',
+      };
+    }
+
+    const base64Data = await this.fileToBase64(file);
+    const res = await fetch(`${API_BASE}/api/database/backups/inspect-external`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fileName: file.name, base64Data }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok && !data?.integrityStatus) {
+      throw new Error(data?.error || `Failed to inspect external backup file (HTTP ${res.status})`);
+    }
+    return data as ExternalBackupInspectionResult;
+  }
+
+  public async restoreFromExternalBackupFile(file: File): Promise<{
+    success: boolean;
+    message: string;
+    restoredFrom: DatabaseBackupItem;
+    safetyBackup: DatabaseBackupItem;
+    status: DatabaseStatusPayload;
+  }> {
+    const base64Data = await this.fileToBase64(file);
+    const res = await fetch(`${API_BASE}/api/database/restore-external`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileName: file.name,
+        base64Data,
+        confirm: true,
+      }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.error || `External database restore failed (HTTP ${res.status})`);
+    }
+    await this.loadFromBackend();
+    return data;
+  }
+
+  // --- Section 2: Deterministic Graph Relationship Engine (shared by Radial, Force, and Inspector) ---
+  public computeWorkspaceRelationships(facts: Fact[]): GraphRelationshipEdge[] {
+    const edges: GraphRelationshipEdge[] = [];
+    const seenEdgeIds = new Set<string>();
+    const genericTags = new Set([
+      'imported',
+      'document',
+      'markdown',
+      'code',
+      'chat',
+      'file',
+      'notes',
+      'stress-corpus',
+      'the-brain',
+      'companion-capture',
+    ]);
+
+    const addEdge = (edge: GraphRelationshipEdge) => {
+      if (seenEdgeIds.has(edge.id)) return;
+      seenEdgeIds.add(edge.id);
+      edges.push(edge);
+    };
+
+    // 1. Source relationships (Fact -> Source Hub) & Explicit Cross-Source relationships
+    for (const fact of facts) {
+      addEdge({
+        id: `src-${fact.id}-${fact.source}`,
+        fromId: `fact-${fact.id}`,
+        toId: `source-${fact.source}`,
+        type: 'source',
+        score: 1.0,
+        label: `Primary Source: ${fact.source}`,
+        explanation: `Node #${fact.id} belongs to primary AI source "${fact.source}"${
+          fact.sourceFolder ? ` (provenance folder: ${fact.sourceFolder})` : ''
+        }.`,
+      });
+
+      if (fact.parentId) {
+        addEdge({
+          id: `exp-parent-${Math.min(fact.id, fact.parentId)}-${Math.max(fact.id, fact.parentId)}`,
+          fromId: `fact-${fact.parentId}`,
+          toId: `fact-${fact.id}`,
+          type: 'explicit',
+          score: 0.98,
+          label: 'Document Hierarchy',
+          explanation: `Explicit parent/child document branch between Node #${fact.parentId} and Node #${fact.id}.`,
+        });
+      }
+
+      if (Array.isArray(fact.relatedSources)) {
+        for (const relSrc of fact.relatedSources) {
+          if (relSrc && relSrc !== fact.source) {
+            addEdge({
+              id: `exp-relsrc-${fact.id}-${relSrc}`,
+              fromId: `fact-${fact.id}`,
+              toId: `source-${relSrc}`,
+              type: 'explicit',
+              score: 0.9,
+              label: `Cross-Source Reference (${fact.source} → ${relSrc})`,
+              explanation: `Node #${fact.id} explicitly references related AI source "${relSrc}" in its provenance metadata.`,
+            });
+          }
+        }
+      }
+    }
+
+    // 2. Pairwise Explicit & Semantic Fact-to-Fact Relationships
+    // Use deterministic scoring across topicKey, fixture references, and specific domain tags
+    const perNodeSemanticCount = new Map<number, number>();
+    const MAX_SEMANTIC_EDGES_PER_NODE = 4;
+
+    for (let i = 0; i < facts.length; i++) {
+      const a = facts[i];
+      const aTags = (a.tags || [])
+        .map((t) => t.toLowerCase().trim())
+        .filter((t) => t && !genericTags.has(t));
+      const aTagSet = new Set(aTags);
+
+      for (let j = i + 1; j < facts.length; j++) {
+        const b = facts[j];
+        const minId = Math.min(a.id, b.id);
+        const maxId = Math.max(a.id, b.id);
+
+        // Explicit: shared or referenced fixtureId
+        if (
+          (a.fixtureId && b.fixtureId && a.fixtureId === b.fixtureId) ||
+          (a.fixtureId && b.content.includes(a.fixtureId)) ||
+          (b.fixtureId && a.content.includes(b.fixtureId))
+        ) {
+          const refId = a.fixtureId || b.fixtureId;
+          addEdge({
+            id: `exp-fixture-${minId}-${maxId}`,
+            fromId: `fact-${a.id}`,
+            toId: `fact-${b.id}`,
+            type: 'explicit',
+            score: 0.95,
+            label: `Fixture Link: ${refId}`,
+            explanation: `Explicit fixture cross-reference (${refId}) between Node #${a.id} and Node #${b.id}.`,
+            sharedTerms: refId ? [refId] : undefined,
+          });
+          continue;
+        }
+
+        // Semantic: shared topicKey or specific domain tags
+        const sharedTopic =
+          a.topicKey && b.topicKey && a.topicKey.toLowerCase() === b.topicKey.toLowerCase()
+            ? a.topicKey
+            : null;
+
+        const bTags = (b.tags || [])
+          .map((t) => t.toLowerCase().trim())
+          .filter((t) => t && !genericTags.has(t));
+        const sharedTags = bTags.filter((t) => aTagSet.has(t));
+
+        if (!sharedTopic && sharedTags.length < 2) continue;
+
+        const countA = perNodeSemanticCount.get(a.id) || 0;
+        const countB = perNodeSemanticCount.get(b.id) || 0;
+        if (countA >= MAX_SEMANTIC_EDGES_PER_NODE || countB >= MAX_SEMANTIC_EDGES_PER_NODE) {
+          continue;
+        }
+
+        const unionSize = new Set([...aTags, ...bTags]).size || 1;
+        const tagJaccard = sharedTags.length / unionSize;
+        const score = Math.min(
+          0.96,
+          Number(((sharedTopic ? 0.55 : 0.25) + tagJaccard * 0.45 + sharedTags.length * 0.08).toFixed(2))
+        );
+
+        const sharedTerms = [
+          ...(sharedTopic ? [`topic:${sharedTopic}`] : []),
+          ...sharedTags.map((t) => `#${t}`),
+        ];
+
+        const explanationParts: string[] = [];
+        if (sharedTopic) explanationParts.push(`shared topic "${sharedTopic}"`);
+        if (sharedTags.length > 0) {
+          explanationParts.push(`shared tags (${sharedTags.slice(0, 4).map((t) => `#${t}`).join(', ')})`);
+        }
+
+        addEdge({
+          id: `sem-${minId}-${maxId}`,
+          fromId: `fact-${a.id}`,
+          toId: `fact-${b.id}`,
+          type: 'semantic',
+          score,
+          label: sharedTopic ? `Topic: ${sharedTopic}` : `Shared: ${sharedTags.slice(0, 2).join(', ')}`,
+          explanation: `Semantic similarity (${Math.round(score * 100)}%) via ${explanationParts.join(' and ')}.`,
+          sharedTerms,
+        });
+
+        perNodeSemanticCount.set(a.id, countA + 1);
+        perNodeSemanticCount.set(b.id, countB + 1);
+      }
+    }
+
+    return edges;
+  }
+
+  // --- Section 8: Activity Log & Diagnostics Client API ---
+  public async fetchActivityLogs(filters?: {
+    category?: string;
+    status?: string;
+    brain?: string;
+    source?: string;
+    search?: string;
+    fromDate?: string;
+    toDate?: string;
+    sort?: 'newest' | 'oldest';
+    limit?: number;
+  }): Promise<{ total: number; logs: ActivityLogEntry[] }> {
+    try {
+      const params = new URLSearchParams();
+      if (filters?.category) params.set('category', filters.category);
+      if (filters?.status) params.set('status', filters.status);
+      if (filters?.brain) params.set('brain', filters.brain);
+      if (filters?.source) params.set('source', filters.source);
+      if (filters?.search) params.set('search', filters.search);
+      if (filters?.fromDate) params.set('fromDate', filters.fromDate);
+      if (filters?.toDate) params.set('toDate', filters.toDate);
+      if (filters?.sort) params.set('sort', filters.sort);
+      if (filters?.limit) params.set('limit', String(filters.limit));
+
+      const res = await fetch(`${API_BASE}/api/activity-logs?${params.toString()}`);
+      if (res.ok) {
+        const data = await res.json();
+        return {
+          total: data.total ?? (Array.isArray(data.logs) ? data.logs.length : 0),
+          logs: Array.isArray(data.logs) ? data.logs : [],
+        };
+      }
+    } catch {}
+
+    // Offline fallback mapped from local recent activities
+    const fallbackLogs: ActivityLogEntry[] = this.activities.map((a) => ({
+      id: a.id,
+      timestamp: a.timestamp,
+      category:
+        a.action === 'created'
+          ? 'memory_create'
+          : a.action === 'modified'
+          ? 'memory_edit'
+          : 'search_execution',
+      action: a.action,
+      status: 'success',
+      brain: a.brain,
+      source: a.source,
+      factId: a.factId,
+      summary: a.snippet,
+    }));
+    return { total: fallbackLogs.length, logs: fallbackLogs };
+  }
+
+  public async recordAuditLog(entry: {
+    category: ActivityLogCategory;
+    action: string;
+    status?: ActivityLogStatus;
+    brain?: string;
+    source?: string;
+    factId?: number;
+    summary: string;
+    details?: Record<string, unknown>;
+    durationMs?: number;
+  }): Promise<void> {
+    try {
+      await fetch(`${API_BASE}/api/activity-logs`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(entry),
+      });
+    } catch {}
+  }
+
+  public getActivityLogExportUrl(
+    format: 'json' | 'csv',
+    filters?: {
+      category?: string;
+      status?: string;
+      brain?: string;
+      source?: string;
+      search?: string;
+    }
+  ): string {
+    const params = new URLSearchParams({ format });
+    if (filters?.category) params.set('category', filters.category);
+    if (filters?.status) params.set('status', filters.status);
+    if (filters?.brain) params.set('brain', filters.brain);
+    if (filters?.source) params.set('source', filters.source);
+    if (filters?.search) params.set('search', filters.search);
+    return `${API_BASE}/api/activity-logs/export?${params.toString()}`;
+  }
+}
+
+export interface ExternalBackupInspectionResult {
+  valid: boolean;
+  fileName: string;
+  sizeBytes: number;
+  headerValid: boolean;
+  integrityStatus: string;
+  schemaVersion: number;
+  factsCount: number;
+  brainsBreakdown: Record<string, number>;
+  sourcesBreakdown: Record<string, number>;
+  error?: string;
 }
 
 export interface DatabaseBackupItem {
@@ -3059,7 +3646,7 @@ export interface DatabaseBackupItem {
   integrityStatus: string;
   schemaVersion: number;
   factsCount: number;
-  kind: 'manual' | 'pre-migration' | 'pre-restore-safety';
+  kind: 'manual' | 'pre-migration' | 'pre-restore-safety' | 'external-import';
 }
 
 export interface DatabaseStatusPayload {
@@ -3083,6 +3670,7 @@ export interface DatabaseStatusPayload {
   backupsSummary: {
     totalBackups: number;
     verifiedBackups: number;
+    invalidBackups?: number;
     latestBackupAt: string | null;
     latestBackupFileName: string | null;
   };

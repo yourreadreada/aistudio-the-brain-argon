@@ -984,9 +984,14 @@ export function applyBackupRetention(
   };
 }
 
+const OPTIONAL_EXTENDED_TABLES = [
+  'activity_logs',
+  'wormhole_transfers',
+] as const;
+
 /**
  * Copies all Argon schema tables and auto-increment sequences from an attached source
- * database schema (`sourceSchema`) into `main` inside a single atomic transaction.
+ * database schema (`restore_source`) into `main` inside a single atomic transaction.
  */
 function copyDatabaseStateFromAttached(
   targetDb: DatabaseSync,
@@ -998,7 +1003,26 @@ function copyDatabaseStateFromAttached(
   try {
     targetDb.exec('BEGIN IMMEDIATE');
     try {
-      for (const table of REQUIRED_CORE_TABLES) {
+      const sourceTables = (
+        targetDb
+          .prepare(`SELECT name FROM restore_source.sqlite_master WHERE type = 'table'`)
+          .all() as Array<{ name: string }>
+      ).map((t) => t.name);
+      const mainTables = (
+        targetDb
+          .prepare(`SELECT name FROM main.sqlite_master WHERE type = 'table'`)
+          .all() as Array<{ name: string }>
+      ).map((t) => t.name);
+
+      const tablesToSync = [
+        ...REQUIRED_CORE_TABLES,
+        ...OPTIONAL_EXTENDED_TABLES.filter(
+          (t) => sourceTables.includes(t) && mainTables.includes(t)
+        ),
+      ];
+
+      for (const table of tablesToSync) {
+        if (!mainTables.includes(table) || !sourceTables.includes(table)) continue;
         targetDb.exec(`DELETE FROM main.${table}`);
         const cols = (
           targetDb.prepare(`PRAGMA main.table_info(${table})`).all() as Array<{
@@ -1429,7 +1453,507 @@ export const SCHEMA_MIGRATIONS: MigrationDefinition[] = [
       }
     },
   },
+  {
+    version: 5,
+    name: '005_provenance_audit_and_entities',
+    up: (db: DatabaseSync) => {
+      const existingFactCols = (
+        db.prepare('PRAGMA table_info(facts)').all() as { name: string }[]
+      ).map((c) => c.name);
+
+      const newFactColumns: [string, string][] = [
+        ['source_folder', 'TEXT'],
+        ['original_created_at', 'TEXT'],
+        ['imported_at', 'TEXT'],
+        ['import_batch_id', 'TEXT'],
+        ['checksum', 'TEXT'],
+        ['extraction_status', "TEXT DEFAULT 'success'"],
+        ['extraction_warnings_json', 'TEXT'],
+        ['related_sources_json', 'TEXT'],
+        ['fixture_id', 'TEXT'],
+        ['topic_key', 'TEXT'],
+        ['file_size_bytes', 'INTEGER'],
+        ['structured_data_json', 'TEXT'],
+      ];
+
+      for (const [col, type] of newFactColumns) {
+        if (!existingFactCols.includes(col)) {
+          db.exec(`ALTER TABLE facts ADD COLUMN ${col} ${type}`);
+        }
+      }
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS activity_logs (
+          id TEXT PRIMARY KEY,
+          operation_id TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          category TEXT NOT NULL,
+          status TEXT NOT NULL,
+          duration_ms INTEGER,
+          brain TEXT,
+          source TEXT,
+          record_id INTEGER,
+          file_name TEXT,
+          batch_or_backup_id TEXT,
+          summary TEXT NOT NULL,
+          details_json TEXT,
+          error_category TEXT,
+          recovery_action TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_activity_logs_timestamp ON activity_logs(timestamp DESC);
+        CREATE INDEX IF NOT EXISTS idx_activity_logs_category ON activity_logs(category);
+        CREATE INDEX IF NOT EXISTS idx_activity_logs_brain ON activity_logs(brain);
+
+        CREATE TABLE IF NOT EXISTS wormhole_transfers (
+          id TEXT PRIMARY KEY,
+          origin_entity TEXT NOT NULL,
+          destination_entity TEXT NOT NULL,
+          destination_brain TEXT NOT NULL,
+          transferred_fact_ids_json TEXT,
+          direction TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          transformation_summary TEXT NOT NULL,
+          validation_status TEXT NOT NULL,
+          audit_operation_id TEXT NOT NULL
+        );
+      `);
+
+      // Non-destructively repair and enrich provenance on existing facts rows
+      repairAndEnrichFactsProvenance(db);
+    },
+  },
 ];
+
+/**
+ * Maps a raw folder segment or provider label to a canonical AISource.
+ */
+export function resolveServerSourceToken(token: string): ValidAISource | null {
+  const clean = (token || '').trim().toLowerCase();
+  if (!clean) return null;
+  if (
+    clean === '01_claude' ||
+    clean === 'claude' ||
+    clean === 'anthropic' ||
+    clean.startsWith('01_claude') ||
+    clean.includes('claude')
+  ) {
+    return 'claude';
+  }
+  if (
+    clean === '02_chatgpt' ||
+    clean === 'chatgpt' ||
+    clean === 'gpt' ||
+    clean === 'openai' ||
+    clean.startsWith('02_chatgpt') ||
+    clean.includes('chatgpt') ||
+    clean.includes('openai')
+  ) {
+    return 'gpt';
+  }
+  if (
+    clean === '03_gemini' ||
+    clean === 'gemini' ||
+    clean.startsWith('03_gemini') ||
+    clean.includes('gemini')
+  ) {
+    return 'gemini';
+  }
+  if (
+    clean === '04_github' ||
+    clean === 'github' ||
+    clean.startsWith('04_github') ||
+    clean.includes('github')
+  ) {
+    return 'github';
+  }
+  if (
+    clean === '05_moodle' ||
+    clean === 'moodle' ||
+    clean.startsWith('05_moodle') ||
+    clean.includes('moodle')
+  ) {
+    return 'moodle';
+  }
+  if (
+    clean === '06_cursor_antigravity' ||
+    clean === '06_cursor' ||
+    clean === 'cursor' ||
+    clean === 'antigravity' ||
+    clean.startsWith('06_cursor') ||
+    clean.includes('cursor') ||
+    clean.includes('antigravity')
+  ) {
+    return 'cursor';
+  }
+  if (
+    clean === '07_local_ai_ollama' ||
+    clean === '07_local_ai' ||
+    clean === 'local-ai' ||
+    clean === 'local_ai' ||
+    clean === 'ollama' ||
+    clean.startsWith('07_local_ai') ||
+    clean.includes('local_ai') ||
+    clean.includes('local-ai') ||
+    clean.includes('ollama')
+  ) {
+    return 'local-ai';
+  }
+  return null;
+}
+
+/**
+ * Resolves authoritative source and metadata from a fact's file_path and content.
+ * Folder path (`01_claude`, `02_chatgpt`, etc.) and explicit `Primary Source:` headers
+ * strictly take precedence over incidental keywords in body text.
+ */
+export function deriveAuthoritativeFactProvenance(
+  filePath: string | null | undefined,
+  fileName: string | null | undefined,
+  content: string | null | undefined,
+  currentSource: string
+): {
+  source: ValidAISource;
+  sourceFolder: string | null;
+  fixtureId: string | null;
+  relatedSources: ValidAISource[];
+  topicKey: string | null;
+  originalCreatedAt: string | null;
+  checksum: string;
+  fileSizeBytes: number;
+  wasSourceRepaired: boolean;
+} {
+  const rawContent = String(content || '');
+  const checksum = crypto
+    .createHash('sha256')
+    .update(rawContent, 'utf8')
+    .digest('hex');
+  const fileSizeBytes = Buffer.byteLength(rawContent, 'utf8');
+
+  const normPath = String(filePath || fileName || '')
+    .replace(/\\/g, '/')
+    .trim();
+  const segments = normPath
+    .split('/')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const dirSegments = segments.length > 1 ? segments.slice(0, -1) : [];
+
+  let resolvedSource: ValidAISource | null = null;
+  let sourceFolder: string | null = null;
+
+  // 1. Folder path segment precedence
+  for (const seg of dirSegments) {
+    const matched = resolveServerSourceToken(seg);
+    if (matched) {
+      resolvedSource = matched;
+      sourceFolder = seg;
+      break;
+    }
+  }
+
+  // 2. Explicit `Primary Source:` header in content
+  const headerSlice = rawContent.slice(0, 3000);
+  if (!resolvedSource) {
+    const headerMatch =
+      headerSlice.match(
+        /(?:\*\*Primary Source:\*\*|Primary Source:)\s*([^\n\r]+)/i
+      ) || headerSlice.match(/"primary_source"\s*:\s*"([^"]+)"/i);
+    if (headerMatch && headerMatch[1]) {
+      const token = headerMatch[1].replace(/[*`]/g, '').trim();
+      const matched = resolveServerSourceToken(token);
+      if (matched) {
+        resolvedSource = matched;
+        if (!sourceFolder) {
+          sourceFolder = dirSegments[dirSegments.length - 1] || token;
+        }
+      }
+    }
+  }
+
+  const fallbackSource: ValidAISource = (
+    ALLOWED_AI_SOURCES as readonly string[]
+  ).includes(currentSource)
+    ? (currentSource as ValidAISource)
+    : 'claude';
+  const finalSource: ValidAISource = resolvedSource || fallbackSource;
+  const wasSourceRepaired = Boolean(
+    resolvedSource && resolvedSource !== currentSource
+  );
+
+  if (!sourceFolder && dirSegments.length > 0) {
+    sourceFolder = dirSegments[dirSegments.length - 1];
+  }
+
+  // 3. Extract Fixture ID
+  let fixtureId: string | null = null;
+  const fixtureMatch =
+    headerSlice.match(/(?:\*\*Fixture ID:\*\*|Fixture ID:)\s*([A-Z0-9_-]+)/i) ||
+    headerSlice.match(/"fixture_id"\s*:\s*"([^"]+)"/i) ||
+    headerSlice.match(
+      /\b(BRAIN-(?:GRAPH|CORPUS|STRESS|FIXTURE|TEST)-[A-Z0-9_-]+)\b/
+    );
+  if (fixtureMatch && fixtureMatch[1]) {
+    fixtureId = fixtureMatch[1].trim();
+  }
+
+  // 4. Extract Related Sources
+  const relatedSet = new Set<ValidAISource>();
+  const relatedMatch =
+    headerSlice.match(
+      /(?:\*\*Related Sources?:\*\*|Related Sources?:)\s*([^\n\r]+)/i
+    ) || headerSlice.match(/"related_sources"\s*:\s*\[([^\]]+)\]/i);
+  if (relatedMatch && relatedMatch[1]) {
+    const tokens = relatedMatch[1].replace(/["'`*]/g, '').split(/[,;|]+/);
+    for (const tok of tokens) {
+      const m = resolveServerSourceToken(tok);
+      if (m && m !== finalSource) {
+        relatedSet.add(m);
+      }
+    }
+  }
+
+  // 5. Extract Topic Key
+  let topicKey: string | null = null;
+  const topicMatch =
+    headerSlice.match(/(?:\*\*Topic Key:\*\*|Topic Key:)\s*([^\n\r]+)/i) ||
+    headerSlice.match(/"topic_key"\s*:\s*"([^"]+)"/i);
+  if (topicMatch && topicMatch[1]) {
+    topicKey = topicMatch[1].replace(/[*`]/g, '').trim().toLowerCase();
+  }
+
+  // 6. Extract Original Created At (only when explicitly in document metadata; never invented)
+  let originalCreatedAt: string | null = null;
+  const origDateMatch =
+    headerSlice.match(
+      /(?:\*\*Original Created(?: At)?:\*\*|\*\*Document Date:\*\*|\*\*Created Date:\*\*|Original Created At:|Document Date:)\s*(\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?)?)/i
+    ) ||
+    headerSlice.match(
+      /"(?:original_created_at|document_date|created_date)"\s*:\s*"(\d{4}-\d{2}-\d{2}[^"]*)"/i
+    );
+  if (origDateMatch && origDateMatch[1]) {
+    originalCreatedAt = origDateMatch[1].trim();
+  }
+
+  return {
+    source: finalSource,
+    sourceFolder,
+    fixtureId,
+    relatedSources: Array.from(relatedSet),
+    topicKey,
+    originalCreatedAt,
+    checksum,
+    fileSizeBytes,
+    wasSourceRepaired,
+  };
+}
+
+/**
+ * Non-destructively scans all rows in `facts` and repairs misattributed `source` fields
+ * where folder provenance (`01_claude/...`, `02_chatgpt/...`, etc.) or explicit `Primary Source:`
+ * headers were previously overridden by body keyword heuristics. Also populates `source_folder`,
+ * `fixture_id`, `related_sources_json`, `topic_key`, `checksum`, and `file_size_bytes`.
+ */
+export function repairAndEnrichFactsProvenance(db: DatabaseSync): {
+  totalInspected: number;
+  repairedCount: number;
+  repairedIds: number[];
+} {
+  let rows: any[] = [];
+  try {
+    rows = db.prepare('SELECT * FROM facts ORDER BY id ASC').all() as any[];
+  } catch {
+    return { totalInspected: 0, repairedCount: 0, repairedIds: [] };
+  }
+
+  const updateStmt = db.prepare(`
+    UPDATE facts
+    SET source = ?,
+        source_folder = COALESCE(?, source_folder),
+        fixture_id = COALESCE(?, fixture_id),
+        related_sources_json = COALESCE(?, related_sources_json),
+        topic_key = COALESCE(?, topic_key),
+        original_created_at = COALESCE(?, original_created_at),
+        imported_at = COALESCE(imported_at, created_at),
+        checksum = COALESCE(checksum, ?),
+        file_size_bytes = COALESCE(file_size_bytes, ?),
+        extraction_status = COALESCE(extraction_status, 'success')
+    WHERE id = ?
+  `);
+
+  const repairedIds: number[] = [];
+  const sourceTransitionCounts: Record<string, number> = {};
+
+  for (const row of rows) {
+    const derived = deriveAuthoritativeFactProvenance(
+      row.file_path,
+      row.file_name,
+      row.content,
+      row.source
+    );
+
+    const relatedJson =
+      derived.relatedSources.length > 0
+        ? JSON.stringify(derived.relatedSources)
+        : row.related_sources_json || null;
+
+    updateStmt.run(
+      derived.source,
+      derived.sourceFolder,
+      derived.fixtureId,
+      relatedJson,
+      derived.topicKey,
+      derived.originalCreatedAt,
+      derived.checksum,
+      derived.fileSizeBytes,
+      row.id
+    );
+
+    if (derived.wasSourceRepaired) {
+      repairedIds.push(row.id);
+      const key = `${row.source} -> ${derived.source}`;
+      sourceTransitionCounts[key] = (sourceTransitionCounts[key] || 0) + 1;
+    }
+  }
+
+  if (repairedIds.length > 0) {
+    try {
+      recordSystemAuditLog(db, {
+        category: 'migration_executed',
+        status: 'success',
+        summary: `Repaired source provenance on ${repairedIds.length} corpus record(s) using authoritative folder/header provenance`,
+        details: {
+          totalInspected: rows.length,
+          repairedCount: repairedIds.length,
+          transitions: sourceTransitionCounts,
+          sampleRepairedIds: repairedIds.slice(0, 25),
+        },
+      });
+    } catch {}
+  }
+
+  return {
+    totalInspected: rows.length,
+    repairedCount: repairedIds.length,
+    repairedIds,
+  };
+}
+
+/**
+ * Redacts sensitive tokens, Bearer strings, or API keys from any diagnostic details object before storage or export.
+ */
+export function redactSecrets(input: any): any {
+  if (input === null || input === undefined) return input;
+  if (typeof input === 'string') {
+    return input
+      .replace(/brn_live_[a-zA-Z0-9_-]+/g, 'brn_live_[REDACTED]')
+      .replace(/Bearer\s+[a-zA-Z0-9._-]+/gi, 'Bearer [REDACTED]')
+      .replace(/AIza[a-zA-Z0-9_-]{20,}/g, 'AIza[REDACTED]');
+  }
+  if (Array.isArray(input)) {
+    return input.map((item) => redactSecrets(item));
+  }
+  if (typeof input === 'object') {
+    const out: Record<string, any> = {};
+    for (const [k, v] of Object.entries(input)) {
+      if (/^(token|token_value|token_hash|secret|password|authorization|api_?key)$/i.test(k)) {
+        out[k] = '[REDACTED]';
+      } else {
+        out[k] = redactSecrets(v);
+      }
+    }
+    return out;
+  }
+  return input;
+}
+
+export interface SystemAuditLogInput {
+  id?: string;
+  operationId?: string;
+  timestamp?: string;
+  category: string;
+  status?: 'success' | 'warning' | 'error' | 'info';
+  durationMs?: number | null;
+  brain?: string | null;
+  source?: string | null;
+  recordId?: number | null;
+  fileName?: string | null;
+  batchOrBackupId?: string | null;
+  summary: string;
+  details?: Record<string, any> | null;
+  errorCategory?: string | null;
+  recoveryAction?: string | null;
+}
+
+export function recordSystemAuditLog(
+  db: DatabaseSync,
+  entry: SystemAuditLogInput
+): any {
+  try {
+    const hasTable = db
+      .prepare(
+        `SELECT name FROM sqlite_master WHERE type='table' AND name='activity_logs'`
+      )
+      .get();
+    if (!hasTable) return null;
+
+    const id =
+      entry.id ||
+      `act_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+    const operationId =
+      entry.operationId || `op_${crypto.randomBytes(6).toString('hex')}`;
+    const timestamp = entry.timestamp || new Date().toISOString();
+    const status = entry.status || 'success';
+    const sanitizedDetails = entry.details ? redactSecrets(entry.details) : null;
+    const detailsJson = sanitizedDetails
+      ? JSON.stringify(sanitizedDetails)
+      : null;
+
+    db.prepare(`
+      INSERT INTO activity_logs (
+        id, operation_id, timestamp, category, status, duration_ms,
+        brain, source, record_id, file_name, batch_or_backup_id,
+        summary, details_json, error_category, recovery_action
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      operationId,
+      timestamp,
+      entry.category,
+      status,
+      entry.durationMs ?? null,
+      entry.brain ?? null,
+      entry.source ?? null,
+      entry.recordId ?? null,
+      entry.fileName ?? null,
+      entry.batchOrBackupId ?? null,
+      redactSecrets(entry.summary),
+      detailsJson,
+      entry.errorCategory ?? null,
+      entry.recoveryAction ?? null
+    );
+
+    return {
+      id,
+      operationId,
+      timestamp,
+      category: entry.category,
+      status,
+      durationMs: entry.durationMs ?? undefined,
+      brain: entry.brain ?? undefined,
+      source: entry.source ?? undefined,
+      recordId: entry.recordId ?? undefined,
+      fileName: entry.fileName ?? undefined,
+      batchOrBackupId: entry.batchOrBackupId ?? undefined,
+      summary: redactSecrets(entry.summary),
+      details: sanitizedDetails ?? undefined,
+      errorCategory: entry.errorCategory ?? undefined,
+      recoveryAction: entry.recoveryAction ?? undefined,
+    };
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Runs repeatable, versioned, ordered schema migrations and creates a verified
@@ -1890,11 +2414,30 @@ export function serializeFactRow(row: any) {
   if (!row) return null;
   let tags: string[] = [];
   let mergeHistory: any[] | undefined = undefined;
+  let extractionWarnings: string[] | undefined = undefined;
+  let relatedSources: string[] | undefined = undefined;
+  let structuredData: any | undefined = undefined;
+
   try {
     if (row.tags_json) tags = JSON.parse(row.tags_json);
   } catch {}
   try {
     if (row.merge_history_json) mergeHistory = JSON.parse(row.merge_history_json);
+  } catch {}
+  try {
+    if (row.extraction_warnings_json) {
+      extractionWarnings = JSON.parse(row.extraction_warnings_json);
+    }
+  } catch {}
+  try {
+    if (row.related_sources_json) {
+      relatedSources = JSON.parse(row.related_sources_json);
+    }
+  } catch {}
+  try {
+    if (row.structured_data_json) {
+      structuredData = JSON.parse(row.structured_data_json);
+    }
   } catch {}
 
   return {
@@ -1904,6 +2447,7 @@ export function serializeFactRow(row: any) {
     source: row.source,
     fileName: row.file_name || undefined,
     filePath: row.file_path || undefined,
+    sourceFolder: row.source_folder || undefined,
     fileType: row.file_type || undefined,
     tags,
     parentId: row.parent_id || undefined,
@@ -1912,6 +2456,21 @@ export function serializeFactRow(row: any) {
     documentTitle: row.document_title || undefined,
     semanticSectionCount: row.semantic_section_count || undefined,
     mergeHistory,
+    originalCreatedAt:
+      row.original_created_at !== undefined ? row.original_created_at : null,
+    importedAt: row.imported_at || row.created_at,
+    importBatchId: row.import_batch_id || undefined,
+    checksum: row.checksum || undefined,
+    extractionStatus: row.extraction_status || 'success',
+    extractionWarnings,
+    relatedSources,
+    fixtureId: row.fixture_id || undefined,
+    topicKey: row.topic_key || undefined,
+    fileSizeBytes:
+      typeof row.file_size_bytes === 'number'
+        ? row.file_size_bytes
+        : Buffer.byteLength(String(row.content || ''), 'utf8'),
+    structuredData,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
@@ -1978,8 +2537,8 @@ export function createBrainApp(
       ? path.join(path.dirname(resolvedDbPath), 'backups')
       : path.join(process.cwd(), 'data', 'backups'));
 
-  app.use(express.json({ limit: '20mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
   // Narrowly scoped local-development CORS policy
   app.use((req: Request, res: Response, next: NextFunction) => {
@@ -2183,6 +2742,15 @@ export function createBrainApp(
       backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${b.fileName}`,
     }));
     const verifiedBackups = backups.filter((b) => b.verified);
+    const invalidBackups = backups.filter((b) => !b.verified);
+
+    const brainCountsRows = db
+      .prepare('SELECT brain, count(*) as count FROM facts GROUP BY brain')
+      .all() as Array<{ brain: string; count: number }>;
+    const brainCounts: Record<string, number> = {};
+    for (const r of brainCountsRows) {
+      brainCounts[r.brain] = Number(r.count || 0);
+    }
 
     return {
       status: integrityStatus === 'ok' ? 'healthy' : 'degraded',
@@ -2197,6 +2765,7 @@ export function createBrainApp(
       factsCount,
       brainsCount: getBrainList().length,
       brains: getBrainList(),
+      brainCounts,
       devicesCount: activeDevicesCount,
       capturesCount,
       retention: {
@@ -2205,6 +2774,7 @@ export function createBrainApp(
       backupsSummary: {
         totalBackups: backups.length,
         verifiedBackups: verifiedBackups.length,
+        invalidBackups: invalidBackups.length,
         latestBackupAt: verifiedBackups[0]?.createdAt || null,
         latestBackupFileName: verifiedBackups[0]?.fileName || null,
       },
@@ -2268,8 +2838,17 @@ export function createBrainApp(
   });
 
   app.post('/api/database/backups', (req: Request, res: Response) => {
+    const startedAt = Date.now();
     try {
       if (req.headers['x-simulate-failure'] === 'true') {
+        recordSystemAuditLog(db, {
+          category: 'error',
+          status: 'error',
+          durationMs: Date.now() - startedAt,
+          summary: 'Simulated backup creation failure',
+          errorCategory: 'BACKUP_FAILED',
+          recoveryAction: 'Retry backup creation when disk is writable',
+        });
         return res.status(500).json({
           error: 'Simulated backup creation failure',
           code: 'BACKUP_FAILED',
@@ -2288,6 +2867,24 @@ export function createBrainApp(
         ...b,
         backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${b.fileName}`,
       }));
+
+      recordSystemAuditLog(db, {
+        category: 'backup_created',
+        status: 'success',
+        durationMs: Date.now() - startedAt,
+        fileName: created.fileName,
+        batchOrBackupId: created.fileName,
+        summary: `Created verified SQLite backup ${created.fileName} (${created.factsCount} memories, schema v${created.schemaVersion})`,
+        details: {
+          fileName: created.fileName,
+          sizeBytes: created.sizeBytes,
+          factsCount: created.factsCount,
+          schemaVersion: created.schemaVersion,
+          integrityStatus: created.integrityStatus,
+          retentionDeleted: retentionResult.deletedFiles,
+        },
+      });
+
       res.status(201).json({
         success: true,
         backup: {
@@ -2298,6 +2895,14 @@ export function createBrainApp(
         backups,
       });
     } catch (err: any) {
+      recordSystemAuditLog(db, {
+        category: 'error',
+        status: 'error',
+        durationMs: Date.now() - startedAt,
+        summary: `Backup creation failed: ${err?.message || 'Unknown error'}`,
+        errorCategory: 'BACKUP_FAILED',
+        recoveryAction: 'Verify disk space and database integrity',
+      });
       res.status(500).json({
         error: err?.message || 'Failed to create consistent SQLite backup',
         code: 'BACKUP_FAILED',
@@ -2341,12 +2946,28 @@ export function createBrainApp(
         });
       }
 
+      recordSystemAuditLog(db, {
+        category: 'backup_exported',
+        status: 'success',
+        fileName: rawName,
+        batchOrBackupId: rawName,
+        summary: `Exported verified SQLite backup ${rawName} (${verification.sizeBytes} bytes, ${verification.factsCount} memories)`,
+        details: {
+          fileName: rawName,
+          sizeBytes: verification.sizeBytes,
+          factsCount: verification.factsCount,
+          schemaVersion: verification.schemaVersion,
+        },
+      });
+
       res.setHeader('Content-Type', 'application/x-sqlite3');
       res.setHeader(
         'Content-Disposition',
         `attachment; filename="${rawName}"`
       );
       res.setHeader('Content-Length', String(verification.sizeBytes));
+      res.setHeader('X-Sqlite-Verified', 'true');
+      res.setHeader('X-Sqlite-Facts-Count', String(verification.factsCount));
       const stream = fs.createReadStream(targetPath);
       stream.on('error', () => {
         if (!res.headersSent) {
@@ -2357,7 +2978,528 @@ export function createBrainApp(
     }
   );
 
+  // Delete an individual backup (protects the last known-good verified backup)
+  app.delete(
+    '/api/database/backups/:fileName',
+    (req: Request, res: Response) => {
+      const rawName = String(req.params.fileName || '').trim();
+      if (
+        !rawName ||
+        !/^[a-zA-Z0-9_.-]+\.db$/.test(rawName) ||
+        rawName.includes('..') ||
+        rawName.endsWith('.tmp')
+      ) {
+        return res.status(400).json({
+          error: 'Invalid backup file name',
+          code: 'INVALID_BACKUP_FILENAME',
+        });
+      }
+
+      const targetPath = path.join(resolvedBackupDir, rawName);
+      if (!fs.existsSync(targetPath)) {
+        return res.status(404).json({
+          error: `Backup "${rawName}" not found`,
+          code: 'BACKUP_NOT_FOUND',
+        });
+      }
+
+      const allBackups = listBackups(resolvedBackupDir);
+      const targetMeta = allBackups.find((b) => b.fileName === rawName);
+      const verifiedBackups = allBackups.filter((b) => b.verified);
+
+      // Protect the last known-good verified backup from accidental deletion
+      if (
+        targetMeta?.verified &&
+        verifiedBackups.length <= 1 &&
+        verifiedBackups[0]?.fileName === rawName
+      ) {
+        return res.status(400).json({
+          error:
+            'Cannot delete the only remaining verified backup (last known-good backup is protected). Create another verified backup first.',
+          code: 'LAST_KNOWN_GOOD_PROTECTED',
+        });
+      }
+
+      try {
+        if (fs.existsSync(targetPath)) {
+          fs.unlinkSync(targetPath);
+        }
+        for (const suffix of ['.meta.json', '-wal', '-shm']) {
+          const sidePath = `${targetPath}${suffix}`;
+          if (fs.existsSync(sidePath)) {
+            fs.unlinkSync(sidePath);
+          }
+        }
+
+        recordSystemAuditLog(db, {
+          category: 'backup_deleted',
+          status: 'success',
+          fileName: rawName,
+          batchOrBackupId: rawName,
+          summary: `Deleted ${
+            targetMeta?.verified ? 'verified' : 'invalid/unverified'
+          } backup ${rawName}`,
+          details: {
+            fileName: rawName,
+            wasVerified: Boolean(targetMeta?.verified),
+            sizeBytes: targetMeta?.sizeBytes || 0,
+          },
+        });
+
+        res.json({
+          success: true,
+          deletedFileName: rawName,
+          status: buildDatabaseStatusPayload(),
+        });
+      } catch (err: any) {
+        res.status(500).json({
+          error: err?.message || 'Failed to delete backup file',
+          code: 'BACKUP_DELETE_FAILED',
+        });
+      }
+    }
+  );
+
+  // Delete all invalid / unverified backups in one action
+  app.post(
+    '/api/database/backups/cleanup-invalid',
+    (_req: Request, res: Response) => {
+      try {
+        const tempRemoved = cleanupIncompleteBackups(resolvedBackupDir);
+        const allBackups = listBackups(resolvedBackupDir);
+        const invalidBackups = allBackups.filter((b) => !b.verified);
+        const deletedFiles: string[] = [...tempRemoved];
+
+        for (const inv of invalidBackups) {
+          try {
+            if (fs.existsSync(inv.backupPath)) {
+              fs.unlinkSync(inv.backupPath);
+            }
+            for (const suffix of ['.meta.json', '-wal', '-shm']) {
+              const sidePath = `${inv.backupPath}${suffix}`;
+              if (fs.existsSync(sidePath)) {
+                fs.unlinkSync(sidePath);
+              }
+            }
+            deletedFiles.push(inv.fileName);
+          } catch {}
+        }
+
+        recordSystemAuditLog(db, {
+          category: 'backup_deleted',
+          status: 'success',
+          summary: `Cleaned up ${deletedFiles.length} invalid or incomplete backup file(s)`,
+          details: {
+            deletedCount: deletedFiles.length,
+            deletedFiles,
+          },
+        });
+
+        res.json({
+          success: true,
+          deletedCount: deletedFiles.length,
+          deletedFiles,
+          status: buildDatabaseStatusPayload(),
+        });
+      } catch (err: any) {
+        res.status(500).json({
+          error: err?.message || 'Failed to clean up invalid backups',
+          code: 'CLEANUP_INVALID_FAILED',
+        });
+      }
+    }
+  );
+
+  // Inspect an external .db file selected by the user before restoring or verifying
+  app.post(
+    '/api/database/backups/inspect-external',
+    (req: Request, res: Response) => {
+      const rawFileName =
+        typeof req.body?.fileName === 'string'
+          ? req.body.fileName.trim()
+          : 'external_backup.db';
+      const base64Data =
+        typeof req.body?.base64Data === 'string'
+          ? req.body.base64Data.trim()
+          : '';
+
+      if (!base64Data) {
+        return res.status(400).json({
+          valid: false,
+          error: 'No file content provided (base64Data is empty).',
+          code: 'EMPTY_EXTERNAL_FILE',
+        });
+      }
+
+      let buf: Buffer;
+      try {
+        const cleanB64 = base64Data.replace(/^data:[^;]+;base64,/, '');
+        buf = Buffer.from(cleanB64, 'base64');
+      } catch {
+        return res.status(400).json({
+          valid: false,
+          error: 'Malformed base64 payload.',
+          code: 'MALFORMED_BASE64',
+        });
+      }
+
+      if (buf.length === 0) {
+        return res.status(400).json({
+          valid: false,
+          error: 'Selected file is empty (0 bytes).',
+          code: 'EMPTY_EXTERNAL_FILE',
+        });
+      }
+
+      const asciiPreview = buf
+        .subarray(0, Math.min(buf.length, 256))
+        .toString('utf8')
+        .trim();
+      if (
+        /^<!doctype\s+html/i.test(asciiPreview) ||
+        /^<html/i.test(asciiPreview) ||
+        asciiPreview.includes('<script') ||
+        asciiPreview.includes('Cookie check')
+      ) {
+        return res.status(400).json({
+          valid: false,
+          isHtmlResponse: true,
+          sizeBytes: buf.length,
+          error:
+            'Rejected: Selected file is an HTML document (e.g. a browser proxy or cookie-check page), NOT a valid SQLite 3 binary database.',
+          code: 'HTML_NOT_SQLITE',
+        });
+      }
+
+      if (
+        buf.length < 16 ||
+        buf.subarray(0, 16).toString('utf8') !== SQLITE_MAGIC_HEADER
+      ) {
+        return res.status(400).json({
+          valid: false,
+          sizeBytes: buf.length,
+          error:
+            'Rejected: File does not start with the 16-byte "SQLite format 3\\0" header.',
+          code: 'INVALID_SQLITE_HEADER',
+        });
+      }
+
+      if (!fs.existsSync(resolvedBackupDir)) {
+        fs.mkdirSync(resolvedBackupDir, { recursive: true });
+      }
+      const tempInspectPath = path.join(
+        resolvedBackupDir,
+        `.staging_inspect_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.db.tmp`
+      );
+
+      try {
+        fs.writeFileSync(tempInspectPath, buf);
+        const verification = verifyDatabaseFileIntegrity(tempInspectPath, {
+          requireCoreTables: false,
+        });
+
+        if (!verification.valid) {
+          return res.status(400).json({
+            valid: false,
+            sizeBytes: buf.length,
+            integrityStatus: verification.integrityStatus,
+            error:
+              verification.error ||
+              `SQLite PRAGMA integrity_check failed: ${verification.integrityStatus}`,
+            code: 'INTEGRITY_CHECK_FAILED',
+          });
+        }
+
+        if (!verification.tables.includes('facts')) {
+          return res.status(400).json({
+            valid: false,
+            sizeBytes: buf.length,
+            integrityStatus: 'missing_facts_table',
+            tables: verification.tables,
+            error:
+              'Rejected: Valid SQLite file, but it does not contain an Argon "facts" table.',
+            code: 'MISSING_FACTS_TABLE',
+          });
+        }
+
+        // Read workspace breakdown from the external backup
+        let brainBreakdown: Record<string, number> = {};
+        let sourceBreakdown: Record<string, number> = {};
+        let inspectDb: DatabaseSync | null = null;
+        try {
+          inspectDb = new DatabaseSync(tempInspectPath);
+          const brainRows = inspectDb
+            .prepare('SELECT brain, count(*) as count FROM facts GROUP BY brain')
+            .all() as Array<{ brain: string; count: number }>;
+          for (const r of brainRows) {
+            brainBreakdown[r.brain] = Number(r.count || 0);
+          }
+          const srcRows = inspectDb
+            .prepare('SELECT source, count(*) as count FROM facts GROUP BY source')
+            .all() as Array<{ source: string; count: number }>;
+          for (const r of srcRows) {
+            sourceBreakdown[r.source] = Number(r.count || 0);
+          }
+        } finally {
+          if (inspectDb) {
+            try {
+              inspectDb.close();
+            } catch {}
+          }
+        }
+
+        const liveFactsCount = (
+          db.prepare('SELECT count(*) as count FROM facts').get() as {
+            count: number;
+          }
+        ).count;
+
+        recordSystemAuditLog(db, {
+          category: 'integrity_check',
+          status: 'success',
+          fileName: rawFileName,
+          summary: `Verified external SQLite backup "${rawFileName}" (${verification.factsCount} memories, schema v${verification.schemaVersion}, integrity: ok)`,
+          details: {
+            fileName: rawFileName,
+            sizeBytes: buf.length,
+            factsCount: verification.factsCount,
+            schemaVersion: verification.schemaVersion,
+            brainBreakdown,
+          },
+        });
+
+        return res.json({
+          valid: true,
+          fileName: rawFileName,
+          sizeBytes: buf.length,
+          sqliteHeaderValid: true,
+          integrityStatus: verification.integrityStatus,
+          schemaVersion: verification.schemaVersion,
+          factsCount: verification.factsCount,
+          tables: verification.tables,
+          brainBreakdown,
+          sourceBreakdown,
+          liveFactsCount,
+          willOverwriteLiveData: liveFactsCount > 0,
+        });
+      } finally {
+        for (const suffix of ['', '-wal', '-shm']) {
+          const p = `${tempInspectPath}${suffix}`;
+          if (fs.existsSync(p)) {
+            try {
+              fs.unlinkSync(p);
+            } catch {}
+          }
+        }
+      }
+    }
+  );
+
+  // Restore from an external .db file uploaded by the user (supports both existing and fresh installations)
+  app.post(
+    '/api/database/restore-external',
+    (req: Request, res: Response) => {
+      const startedAt = Date.now();
+      const rawFileName =
+        typeof req.body?.fileName === 'string' && req.body.fileName.trim()
+          ? path.basename(req.body.fileName.trim())
+          : 'external_backup.db';
+      const base64Data =
+        typeof req.body?.base64Data === 'string'
+          ? req.body.base64Data.trim()
+          : '';
+      const confirm = req.body?.confirm === true;
+
+      if (!confirm) {
+        return res.status(400).json({
+          error:
+            'Explicit confirmation (confirm: true) is required before restoring an external database backup.',
+          code: 'RESTORE_CONFIRMATION_REQUIRED',
+        });
+      }
+
+      if (!base64Data) {
+        return res.status(400).json({
+          error: 'No external backup file payload provided.',
+          code: 'EMPTY_EXTERNAL_FILE',
+        });
+      }
+
+      let buf: Buffer;
+      try {
+        const cleanB64 = base64Data.replace(/^data:[^;]+;base64,/, '');
+        buf = Buffer.from(cleanB64, 'base64');
+      } catch {
+        return res.status(400).json({
+          error: 'Malformed base64 backup payload.',
+          code: 'MALFORMED_BASE64',
+        });
+      }
+
+      const asciiPreview = buf
+        .subarray(0, Math.min(buf.length, 256))
+        .toString('utf8')
+        .trim();
+      if (
+        /^<!doctype\s+html/i.test(asciiPreview) ||
+        /^<html/i.test(asciiPreview) ||
+        asciiPreview.includes('Cookie check')
+      ) {
+        recordSystemAuditLog(db, {
+          category: 'restore_failed',
+          status: 'error',
+          fileName: rawFileName,
+          summary: `Rejected external restore of "${rawFileName}": file is an HTML document, not a SQLite database`,
+          errorCategory: 'HTML_NOT_SQLITE',
+          recoveryAction: 'Select a valid .db SQLite backup file',
+        });
+        return res.status(400).json({
+          error:
+            'Cannot restore: Selected file is an HTML document, not a SQLite 3 database.',
+          code: 'HTML_NOT_SQLITE',
+        });
+      }
+
+      if (
+        buf.length < 16 ||
+        buf.subarray(0, 16).toString('utf8') !== SQLITE_MAGIC_HEADER
+      ) {
+        recordSystemAuditLog(db, {
+          category: 'restore_failed',
+          status: 'error',
+          fileName: rawFileName,
+          summary: `Rejected external restore of "${rawFileName}": invalid SQLite 16-byte header`,
+          errorCategory: 'INVALID_SQLITE_HEADER',
+          recoveryAction: 'Select a valid .db SQLite backup file',
+        });
+        return res.status(400).json({
+          error:
+            'Cannot restore: File does not have a valid 16-byte SQLite 3 header.',
+          code: 'INVALID_SQLITE_HEADER',
+        });
+      }
+
+      if (!fs.existsSync(resolvedBackupDir)) {
+        fs.mkdirSync(resolvedBackupDir, { recursive: true });
+      }
+
+      const { fileName: importedBackupFileName, backupPath: importedBackupPath } =
+        allocateUniqueBackupFilePath(resolvedBackupDir);
+
+      try {
+        recordSystemAuditLog(db, {
+          category: 'restore_started',
+          status: 'info',
+          fileName: rawFileName,
+          batchOrBackupId: importedBackupFileName,
+          summary: `Started staged restore from external backup "${rawFileName}"`,
+        });
+
+        fs.writeFileSync(importedBackupPath, buf);
+
+        const simulateApplyFailure =
+          req.headers['x-simulate-failure'] === 'true' ||
+          req.body?.simulateApplyFailure === true;
+
+        const result = restoreDatabaseFromBackup({
+          db,
+          dbPath: resolvedDbPath,
+          backupPath: importedBackupPath,
+          backupDir: resolvedBackupDir,
+          simulateApplyFailure,
+        });
+
+        // Write metadata sidecar for the imported external backup so it is retained as a verified backup
+        const metaPath = `${importedBackupPath}.meta.json`;
+        fs.writeFileSync(
+          metaPath,
+          JSON.stringify(
+            {
+              fileName: importedBackupFileName,
+              originalExternalFileName: rawFileName,
+              createdAt: new Date().toISOString(),
+              sizeBytes: buf.length,
+              verified: true,
+              integrityStatus: 'ok',
+              schemaVersion: result.schemaVersionAfterRestore,
+              factsCount: result.factsCountAfterRestore,
+              kind: 'manual',
+            },
+            null,
+            2
+          ),
+          'utf8'
+        );
+
+        recordSystemAuditLog(db, {
+          category: 'restore_completed',
+          status: 'success',
+          durationMs: Date.now() - startedAt,
+          fileName: rawFileName,
+          batchOrBackupId: importedBackupFileName,
+          summary: `Completed external restore from "${rawFileName}" (${result.factsCountAfterRestore} memories active; safety backup: ${result.safetyBackup.fileName})`,
+          details: {
+            externalFileName: rawFileName,
+            storedBackupFileName: importedBackupFileName,
+            safetyBackupFileName: result.safetyBackup.fileName,
+            factsCountAfterRestore: result.factsCountAfterRestore,
+            schemaVersionAfterRestore: result.schemaVersionAfterRestore,
+          },
+        });
+
+        return res.json({
+          success: true,
+          message: `Successfully restored ${result.factsCountAfterRestore} memories from external backup "${rawFileName}". Pre-restore safety snapshot saved as ${result.safetyBackup.fileName}.`,
+          restoredFrom: {
+            ...result.restoredFrom,
+            fileName: importedBackupFileName,
+            backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${importedBackupFileName}`,
+          },
+          safetyBackup: {
+            ...result.safetyBackup,
+            backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${
+              result.safetyBackup.fileName
+            }`,
+          },
+          status: buildDatabaseStatusPayload(),
+        });
+      } catch (err: any) {
+        // Remove the uploaded candidate file if it was invalid and prevented restore
+        if (fs.existsSync(importedBackupPath)) {
+          try {
+            fs.unlinkSync(importedBackupPath);
+          } catch {}
+        }
+        const isRolledBack = Boolean(err?.rolledBack);
+        recordSystemAuditLog(db, {
+          category: 'restore_failed',
+          status: 'error',
+          durationMs: Date.now() - startedAt,
+          fileName: rawFileName,
+          summary: `External restore failed for "${rawFileName}": ${
+            err?.message || 'Unknown error'
+          }`,
+          errorCategory: isRolledBack
+            ? 'RESTORE_ROLLED_BACK'
+            : 'RESTORE_REJECTED',
+          recoveryAction: isRolledBack
+            ? `Database was automatically rolled back to safety backup ${err?.safetyBackup?.fileName}`
+            : 'Existing database was not modified',
+        });
+
+        const statusCode = isRolledBack ? 500 : 400;
+        return res.status(statusCode).json({
+          error: err?.message || 'External database restore failed',
+          code: isRolledBack ? 'RESTORE_ROLLED_BACK' : 'RESTORE_REJECTED',
+          rolledBack: isRolledBack,
+          safetyBackupFileName: err?.safetyBackup?.fileName || null,
+        });
+      }
+    }
+  );
+
   app.post('/api/database/restore', (req: Request, res: Response) => {
+    const startedAt = Date.now();
     const rawName =
       typeof req.body?.fileName === 'string' ? req.body.fileName.trim() : '';
     const confirm = req.body?.confirm === true;
@@ -2393,6 +3535,14 @@ export function createBrainApp(
     }
 
     try {
+      recordSystemAuditLog(db, {
+        category: 'restore_started',
+        status: 'info',
+        fileName: rawName,
+        batchOrBackupId: rawName,
+        summary: `Started staged restore from backup ${rawName}`,
+      });
+
       const simulateApplyFailure =
         req.headers['x-simulate-failure'] === 'true' ||
         req.body?.simulateApplyFailure === true;
@@ -2402,6 +3552,21 @@ export function createBrainApp(
         backupPath: candidatePath,
         backupDir: resolvedBackupDir,
         simulateApplyFailure,
+      });
+
+      recordSystemAuditLog(db, {
+        category: 'restore_completed',
+        status: 'success',
+        durationMs: Date.now() - startedAt,
+        fileName: rawName,
+        batchOrBackupId: rawName,
+        summary: `Restored database from ${result.restoredFrom.fileName} (${result.factsCountAfterRestore} memories; safety backup: ${result.safetyBackup.fileName})`,
+        details: {
+          restoredFrom: result.restoredFrom.fileName,
+          safetyBackup: result.safetyBackup.fileName,
+          factsCountAfterRestore: result.factsCountAfterRestore,
+          schemaVersionAfterRestore: result.schemaVersionAfterRestore,
+        },
       });
 
       res.json({
@@ -2423,6 +3588,18 @@ export function createBrainApp(
       });
     } catch (err: any) {
       const isRolledBack = Boolean(err?.rolledBack);
+      recordSystemAuditLog(db, {
+        category: 'restore_failed',
+        status: 'error',
+        durationMs: Date.now() - startedAt,
+        fileName: rawName,
+        batchOrBackupId: rawName,
+        summary: `Restore from ${rawName} failed: ${err?.message || 'Unknown error'}`,
+        errorCategory: isRolledBack ? 'RESTORE_ROLLED_BACK' : 'RESTORE_REJECTED',
+        recoveryAction: isRolledBack
+          ? `Rolled back automatically to ${err?.safetyBackup?.fileName}`
+          : 'Live database was not modified',
+      });
       const statusCode = isRolledBack ? 500 : 400;
       res.status(statusCode).json({
         error: err?.message || 'Database restore failed',
@@ -2460,6 +3637,200 @@ export function createBrainApp(
       res.status(500).json({
         error: err?.message || 'Failed to apply backup retention policy',
         code: 'RETENTION_FAILED',
+      });
+    }
+  });
+
+  // 1d. Activity Log & Diagnostics APIs (Section 8)
+  function queryActivityLogs(query: Record<string, any>) {
+    const brain = typeof query.brain === 'string' && query.brain !== 'all' ? query.brain.trim() : '';
+    const category = typeof query.category === 'string' && query.category !== 'all' ? query.category.trim() : '';
+    const source = typeof query.source === 'string' && query.source !== 'all' ? query.source.trim() : '';
+    const status = typeof query.status === 'string' && query.status !== 'all' ? query.status.trim() : '';
+    const search = typeof query.search === 'string' ? query.search.trim().toLowerCase() : '';
+    const startDate = typeof query.startDate === 'string' ? query.startDate.trim() : '';
+    const endDate = typeof query.endDate === 'string' ? query.endDate.trim() : '';
+    const sort = typeof query.sort === 'string' ? query.sort.trim() : 'newest';
+    const rawLimit = parseInt(String(query.limit || '500'), 10);
+    const limit = Math.min(2000, Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 500));
+
+    const clauses: string[] = [];
+    const params: any[] = [];
+
+    if (brain) {
+      clauses.push('(brain = ? OR brain IS NULL)');
+      params.push(brain);
+    }
+    if (category) {
+      clauses.push('category = ?');
+      params.push(category);
+    }
+    if (source) {
+      clauses.push('source = ?');
+      params.push(source);
+    }
+    if (status) {
+      clauses.push('status = ?');
+      params.push(status);
+    }
+    if (startDate) {
+      clauses.push('timestamp >= ?');
+      params.push(startDate);
+    }
+    if (endDate) {
+      clauses.push('timestamp <= ?');
+      params.push(endDate.includes('T') ? endDate : `${endDate}T23:59:59.999Z`);
+    }
+    if (search) {
+      clauses.push(
+        '(LOWER(summary) LIKE ? OR LOWER(COALESCE(file_name, \'\')) LIKE ? OR LOWER(COALESCE(category, \'\')) LIKE ? OR LOWER(COALESCE(batch_or_backup_id, \'\')) LIKE ? OR CAST(COALESCE(record_id, \'\') AS TEXT) LIKE ?)'
+      );
+      const pat = `%${search}%`;
+      params.push(pat, pat, pat, pat, pat);
+    }
+
+    const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    const orderSql =
+      sort === 'oldest'
+        ? 'ORDER BY timestamp ASC'
+        : sort === 'category'
+        ? 'ORDER BY category ASC, timestamp DESC'
+        : sort === 'status'
+        ? 'ORDER BY status ASC, timestamp DESC'
+        : 'ORDER BY timestamp DESC';
+
+    const rows = db
+      .prepare(`SELECT * FROM activity_logs ${whereSql} ${orderSql} LIMIT ?`)
+      .all(...params, limit) as any[];
+
+    return rows.map((r) => {
+      let details: any = undefined;
+      try {
+        if (r.details_json) details = redactSecrets(JSON.parse(r.details_json));
+      } catch {}
+      return {
+        id: r.id,
+        operationId: r.operation_id,
+        timestamp: r.timestamp,
+        category: r.category,
+        status: r.status,
+        durationMs: r.duration_ms ?? undefined,
+        brain: r.brain || undefined,
+        source: r.source || undefined,
+        recordId: r.record_id ?? undefined,
+        fileName: r.file_name || undefined,
+        batchOrBackupId: r.batch_or_backup_id || undefined,
+        summary: redactSecrets(r.summary),
+        details,
+        errorCategory: r.error_category || undefined,
+        recoveryAction: r.recovery_action || undefined,
+      };
+    });
+  }
+
+  app.get('/api/activity-logs', (req: Request, res: Response) => {
+    try {
+      const logs = queryActivityLogs(req.query);
+      res.json({ logs, total: logs.length });
+    } catch (err: any) {
+      res.status(500).json({
+        error: err?.message || 'Failed to query activity logs',
+      });
+    }
+  });
+
+  app.post('/api/activity-logs', (req: Request, res: Response) => {
+    try {
+      const body = req.body || {};
+      if (!body.category || !body.summary) {
+        return res.status(400).json({
+          error: 'category and summary are required',
+        });
+      }
+      const created = recordSystemAuditLog(db, {
+        category: String(body.category),
+        status: body.status || 'success',
+        durationMs: typeof body.durationMs === 'number' ? body.durationMs : null,
+        brain: body.brain || null,
+        source: body.source || null,
+        recordId: typeof body.recordId === 'number' ? body.recordId : null,
+        fileName: body.fileName || null,
+        batchOrBackupId: body.batchOrBackupId || null,
+        summary: String(body.summary),
+        details: body.details || null,
+        errorCategory: body.errorCategory || null,
+        recoveryAction: body.recoveryAction || null,
+      });
+      res.status(201).json({ ok: true, entry: created });
+    } catch (err: any) {
+      res.status(500).json({
+        error: err?.message || 'Failed to record activity log entry',
+      });
+    }
+  });
+
+  app.get('/api/activity-logs/export', (req: Request, res: Response) => {
+    try {
+      const format = String(req.query.format || 'json').toLowerCase();
+      const logs = queryActivityLogs({ ...req.query, limit: '2000' });
+      const stamp = new Date().toISOString().slice(0, 10);
+
+      if (format === 'csv') {
+        const headers = [
+          'id',
+          'operationId',
+          'timestamp',
+          'category',
+          'status',
+          'durationMs',
+          'brain',
+          'source',
+          'recordId',
+          'fileName',
+          'batchOrBackupId',
+          'summary',
+          'errorCategory',
+          'recoveryAction',
+        ];
+        const escapeCsv = (val: any) => {
+          if (val === null || val === undefined) return '';
+          const str = String(val).replace(/"/g, '""');
+          return /[",\n\r]/.test(str) ? `"${str}"` : str;
+        };
+        const lines = [
+          headers.join(','),
+          ...logs.map((row: any) =>
+            headers.map((h) => escapeCsv(row[h])).join(',')
+          ),
+        ];
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="the-brain-activity-log-${stamp}.csv"`
+        );
+        return res.send(lines.join('\n'));
+      }
+
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="the-brain-activity-log-${stamp}.json"`
+      );
+      res.send(
+        JSON.stringify(
+          {
+            exportedAt: new Date().toISOString(),
+            count: logs.length,
+            redactionApplied: true,
+            logs,
+          },
+          null,
+          2
+        )
+      );
+    } catch (err: any) {
+      res.status(500).json({
+        error: err?.message || 'Failed to export activity logs',
       });
     }
   });
@@ -2985,7 +4356,7 @@ export function createBrainApp(
     const brain = typeof req.query.brain === 'string' ? req.query.brain.trim() : '';
     if (!brain) {
       const allRows = db
-        .prepare('SELECT * FROM facts ORDER BY updated_at DESC LIMIT 1000')
+        .prepare('SELECT * FROM facts ORDER BY updated_at DESC LIMIT 5000')
         .all();
       return res.json(allRows.map(serializeFactRow));
     }
@@ -2994,17 +4365,17 @@ export function createBrainApp(
       return res.status(400).json({ error: brainCheck.error });
     }
     const rows = db
-      .prepare('SELECT * FROM facts WHERE brain = ? ORDER BY updated_at DESC LIMIT 1000')
+      .prepare('SELECT * FROM facts WHERE brain = ? ORDER BY updated_at DESC LIMIT 5000')
       .all(brainCheck.value);
     res.json(rows.map(serializeFactRow));
   });
 
-  // 4. Recall Search API
+  // 4. Recall Search API (Full Workspace Search across all metadata fields)
   app.get('/api/recall', (req: Request, res: Response) => {
     const brain = typeof req.query.brain === 'string' ? req.query.brain.trim() : '';
     const query = typeof req.query.query === 'string' ? req.query.query : '';
-    const rawLimit = parseInt((req.query.limit as string) || '10', 10);
-    const limit = Math.min(100, Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 10));
+    const rawLimit = parseInt((req.query.limit as string) || '250', 10);
+    const limit = Math.min(2000, Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 250));
 
     if (!brain) {
       return res.status(400).json({ error: 'missing ?brain=' });
@@ -3015,35 +4386,28 @@ export function createBrainApp(
     }
 
     if (query.trim()) {
-      const terms = query
-        .replace(/[^\w\s]/g, ' ')
-        .toLowerCase()
+      const cleanQuery = query.trim().toLowerCase();
+      const terms = cleanQuery
+        .replace(/[^\w\s._/-]/g, ' ')
         .split(/\s+/)
-        .filter(
-          (t) =>
-            t.length > 2 &&
-            ![
-              'what',
-              'about',
-              'this',
-              'that',
-              'with',
-              'from',
-              'have',
-              'your',
-              'please',
-            ].includes(t)
-        )
+        .filter((t) => t.length >= 2)
         .slice(0, 12);
 
       if (terms.length > 0) {
-        const clauses = terms.map(() => 'LOWER(content) LIKE ?').join(' OR ');
-        const params = [brainCheck.value, ...terms.map((t) => `%${t}%`), limit];
-        const sql = `SELECT * FROM facts WHERE brain = ? AND (${clauses}) ORDER BY updated_at DESC LIMIT ?`;
-        const rows = db.prepare(sql).all(...params);
-        if (rows.length > 0) {
-          return res.json(rows.map(serializeFactRow));
+        const termClauses = terms.map(
+          () =>
+            `(LOWER(content) LIKE ? OR LOWER(COALESCE(document_title, '')) LIKE ? OR LOWER(COALESCE(file_name, '')) LIKE ? OR LOWER(COALESCE(file_path, '')) LIKE ? OR LOWER(COALESCE(source, '')) LIKE ? OR LOWER(COALESCE(tags_json, '')) LIKE ? OR LOWER(COALESCE(fixture_id, '')) LIKE ? OR LOWER(COALESCE(topic_key, '')) LIKE ?)`
+        );
+        const whereTerms = termClauses.join(' OR ');
+        const params: any[] = [brainCheck.value];
+        for (const t of terms) {
+          const pat = `%${t}%`;
+          params.push(pat, pat, pat, pat, pat, pat, pat, pat);
         }
+        params.push(limit);
+        const sql = `SELECT * FROM facts WHERE brain = ? AND (${whereTerms}) ORDER BY updated_at DESC LIMIT ?`;
+        const rows = db.prepare(sql).all(...params);
+        return res.json(rows.map(serializeFactRow));
       }
     }
 
@@ -3055,8 +4419,20 @@ export function createBrainApp(
 
   // 5. Store / Remember Fact API
   app.post('/api/remember', (req: Request, res: Response) => {
+    const startedAt = Date.now();
     try {
       if (req.headers['x-simulate-failure'] === 'true') {
+        recordSystemAuditLog(db, {
+          category: 'error',
+          status: 'error',
+          durationMs: Date.now() - startedAt,
+          brain: req.body?.brain || null,
+          source: req.body?.source || null,
+          fileName: req.body?.fileName || req.body?.file_name || null,
+          summary: 'Simulated persistence failure during fact creation',
+          errorCategory: 'SIMULATED_FAILURE',
+          recoveryAction: 'Retry item persistence from Review Queue',
+        });
         return res.status(503).json({
           error: 'Simulated persistence failure — destination Brain was not modified',
         });
@@ -3070,6 +4446,7 @@ export function createBrainApp(
         fileName,
         file_path,
         filePath,
+        sourceFolder,
         file_type,
         fileType,
         tags,
@@ -3079,6 +4456,17 @@ export function createBrainApp(
         semanticSectionCount,
         mergeHistory,
         parentId,
+        originalCreatedAt,
+        importedAt,
+        importBatchId,
+        checksum,
+        extractionStatus,
+        extractionWarnings,
+        relatedSources,
+        fixtureId,
+        topicKey,
+        fileSizeBytes,
+        structuredData,
       } = req.body || {};
 
       if (!brain || !content || !source) {
@@ -3131,28 +4519,71 @@ export function createBrainApp(
         }
       }
 
+      // Derive provenance metadata from path/content while honoring explicit folder/header provenance
+      const derivedProv = deriveAuthoritativeFactProvenance(
+        resolvedFilePath,
+        resolvedFileName,
+        content,
+        sourceCheck.value
+      );
+      const effectiveSource = derivedProv.source;
+      const effectiveSourceFolder =
+        sourceFolder || derivedProv.sourceFolder || null;
+      const effectiveFixtureId = fixtureId || derivedProv.fixtureId || null;
+      const effectiveTopicKey = topicKey || derivedProv.topicKey || null;
+      const effectiveOriginalCreatedAt =
+        originalCreatedAt !== undefined
+          ? originalCreatedAt
+          : derivedProv.originalCreatedAt;
+      const effectiveChecksum = checksum || derivedProv.checksum;
+      const effectiveSizeBytes =
+        typeof fileSizeBytes === 'number'
+          ? fileSizeBytes
+          : derivedProv.fileSizeBytes;
+      const effectiveRelatedSources =
+        Array.isArray(relatedSources) && relatedSources.length > 0
+          ? relatedSources
+          : derivedProv.relatedSources;
+
       const resolvedFileType = fileType || file_type || null;
       const tagsJson = Array.isArray(tags)
-        ? JSON.stringify(tags.slice(0, MAX_TAGS_COUNT).map((t) => String(t).slice(0, MAX_TAG_LENGTH)))
+        ? JSON.stringify(
+            tags.slice(0, MAX_TAGS_COUNT).map((t) => String(t).slice(0, MAX_TAG_LENGTH))
+          )
         : '[]';
       const mergeHistoryJson = Array.isArray(mergeHistory)
         ? JSON.stringify(mergeHistory)
         : null;
+      const warningsJson = Array.isArray(extractionWarnings)
+        ? JSON.stringify(extractionWarnings)
+        : null;
+      const relatedSourcesJson =
+        effectiveRelatedSources.length > 0
+          ? JSON.stringify(effectiveRelatedSources)
+          : null;
+      const structuredDataJson = structuredData
+        ? JSON.stringify(structuredData)
+        : null;
 
       const insert = db.prepare(`
         INSERT INTO facts (
-          brain, content, source, file_name, file_path, file_type, tags_json,
+          brain, content, source, file_name, file_path, source_folder, file_type, tags_json,
           parent_id, is_document_root, is_unified_context_node, document_title,
-          semantic_section_count, merge_history_json, created_at, updated_at
+          semantic_section_count, merge_history_json,
+          original_created_at, imported_at, import_batch_id, checksum,
+          extraction_status, extraction_warnings_json, related_sources_json,
+          fixture_id, topic_key, file_size_bytes, structured_data_json,
+          created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const result = insert.run(
         brainCheck.value,
         content.trim(),
-        sourceCheck.value,
+        effectiveSource,
         resolvedFileName,
         resolvedFilePath,
+        effectiveSourceFolder,
         resolvedFileType,
         tagsJson,
         parentId ?? null,
@@ -3161,6 +4592,17 @@ export function createBrainApp(
         documentTitle ? String(documentTitle).slice(0, MAX_TITLE_LENGTH) : null,
         semanticSectionCount ?? null,
         mergeHistoryJson,
+        effectiveOriginalCreatedAt ?? null,
+        importedAt || now,
+        importBatchId || null,
+        effectiveChecksum,
+        extractionStatus || 'success',
+        warningsJson,
+        relatedSourcesJson,
+        effectiveFixtureId,
+        effectiveTopicKey,
+        effectiveSizeBytes,
+        structuredDataJson,
         now,
         now
       );
@@ -3168,7 +4610,30 @@ export function createBrainApp(
       const newFact = db
         .prepare('SELECT * FROM facts WHERE id = ?')
         .get(result.lastInsertRowid);
-      res.json(serializeFactRow(newFact));
+      const serialized = serializeFactRow(newFact);
+
+      recordSystemAuditLog(db, {
+        category: resolvedFileName ? 'imported' : 'created',
+        status: 'success',
+        durationMs: Date.now() - startedAt,
+        brain: brainCheck.value,
+        source: effectiveSource,
+        recordId: Number(result.lastInsertRowid),
+        fileName: resolvedFileName,
+        batchOrBackupId: importBatchId || null,
+        summary: `Stored memory #${result.lastInsertRowid} in "${brainCheck.value}" (${effectiveSource}${
+          resolvedFileName ? ` · ${resolvedFileName}` : ''
+        })`,
+        details: {
+          filePath: resolvedFilePath,
+          sourceFolder: effectiveSourceFolder,
+          fileType: resolvedFileType,
+          fixtureId: effectiveFixtureId,
+          checksum: effectiveChecksum,
+        },
+      });
+
+      res.json(serialized);
     } catch {
       res.status(500).json({ error: 'Failed to persist fact' });
     }
@@ -3176,6 +4641,7 @@ export function createBrainApp(
 
   // 6. Correct / Update Fact API
   app.post('/api/correct', (req: Request, res: Response) => {
+    const startedAt = Date.now();
     try {
       if (req.headers['x-simulate-failure'] === 'true') {
         return res.status(503).json({
@@ -3196,6 +4662,7 @@ export function createBrainApp(
         mergeHistory,
         isDocumentRoot,
         isUnifiedContextNode,
+        actionType,
       } = req.body || {};
 
       if (id === undefined || (!content && !Array.isArray(tags))) {
@@ -3236,6 +4703,10 @@ export function createBrainApp(
       const now = new Date().toISOString();
       const nextContent =
         typeof content === 'string' ? content.trim() : existing.content;
+      const nextChecksum = crypto
+        .createHash('sha256')
+        .update(nextContent, 'utf8')
+        .digest('hex');
       const nextTagsJson = Array.isArray(tags)
         ? JSON.stringify(
             tags.slice(0, MAX_TAGS_COUNT).map((t) => String(t).slice(0, MAX_TAG_LENGTH))
@@ -3282,6 +4753,8 @@ export function createBrainApp(
             merge_history_json = ?,
             is_document_root = ?,
             is_unified_context_node = ?,
+            checksum = ?,
+            file_size_bytes = ?,
             updated_at = ?
         WHERE id = ?
       `).run(
@@ -3296,6 +4769,8 @@ export function createBrainApp(
         nextMergeHistoryJson,
         nextIsDocRoot,
         nextIsUnified,
+        nextChecksum,
+        Buffer.byteLength(nextContent, 'utf8'),
         now,
         numericId
       );
@@ -3303,6 +4778,30 @@ export function createBrainApp(
       const updatedRow = db
         .prepare('SELECT * FROM facts WHERE id = ?')
         .get(numericId);
+
+      const auditCat =
+        actionType === 'merge'
+          ? 'merged'
+          : actionType === 'replace'
+          ? 'replaced'
+          : 'modified';
+      recordSystemAuditLog(db, {
+        category: auditCat,
+        status: 'success',
+        durationMs: Date.now() - startedAt,
+        brain: existing.brain,
+        source: nextSource,
+        recordId: numericId,
+        fileName: nextFileName,
+        summary: `${
+          auditCat === 'merged'
+            ? 'Merged content into'
+            : auditCat === 'replaced'
+            ? 'Replaced content of'
+            : 'Updated'
+        } memory #${numericId} in "${existing.brain}"`,
+      });
+
       res.json({
         ok: true,
         id: numericId,
@@ -3321,7 +4820,21 @@ export function createBrainApp(
     if (id === undefined || !Number.isInteger(numericId) || numericId <= 0) {
       return res.status(400).json({ error: 'Valid numeric id is required' });
     }
+    const existing = db
+      .prepare('SELECT id, brain, source, file_name FROM facts WHERE id = ?')
+      .get(numericId) as any;
     db.prepare('DELETE FROM facts WHERE id = ?').run(numericId);
+    if (existing) {
+      recordSystemAuditLog(db, {
+        category: 'deleted',
+        status: 'success',
+        brain: existing.brain,
+        source: existing.source,
+        recordId: numericId,
+        fileName: existing.file_name,
+        summary: `Deleted memory #${numericId} from "${existing.brain}"`,
+      });
+    }
     res.json({ ok: true, id: numericId });
   });
 
@@ -3337,6 +4850,12 @@ export function createBrainApp(
         .get(brainCheck.value) as { c: number }
     ).c;
     db.prepare('DELETE FROM facts WHERE brain = ?').run(brainCheck.value);
+    recordSystemAuditLog(db, {
+      category: 'deleted',
+      status: 'warning',
+      brain: brainCheck.value,
+      summary: `Deleted workspace brain "${brainCheck.value}" (${countBefore} memories removed)`,
+    });
     res.json({ ok: true, brain: brainCheck.value, deleted_facts: countBefore });
   });
 
@@ -3406,6 +4925,12 @@ export function createBrainApp(
     const cleanContent = content.trim();
     const effectivePath = String(file_path || file_name).trim();
     const resolvedBrain = brainCheck.value;
+    const derivedProv = deriveAuthoritativeFactProvenance(
+      effectivePath,
+      file_name,
+      cleanContent,
+      sourceCheck.value
+    );
 
     const existing = db
       .prepare(
@@ -3429,14 +4954,21 @@ export function createBrainApp(
       if (!cleanContent.startsWith(existing.content)) {
         merged = `${existing.content}\n\n${cleanContent}`;
       }
-      db.prepare('UPDATE facts SET content = ?, updated_at = ? WHERE id = ?').run(
-        merged,
-        now,
-        existing.id
-      );
+      db.prepare(
+        'UPDATE facts SET content = ?, source = ?, checksum = ?, updated_at = ? WHERE id = ?'
+      ).run(merged, derivedProv.source, derivedProv.checksum, now, existing.id);
       const updated = db
         .prepare('SELECT * FROM facts WHERE id = ?')
         .get(existing.id);
+      recordSystemAuditLog(db, {
+        category: 'merged',
+        status: 'success',
+        brain: resolvedBrain,
+        source: derivedProv.source,
+        recordId: existing.id,
+        fileName: String(file_name).trim(),
+        summary: `Merged content into memory #${existing.id} (${file_name})`,
+      });
       return res.json({
         fact: serializeFactRow(updated),
         action: 'merged',
@@ -3446,21 +4978,43 @@ export function createBrainApp(
 
     const insert = db.prepare(`
       INSERT INTO facts (
-        brain, content, source, file_name, file_path, is_document_root, is_unified_context_node, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
+        brain, content, source, file_name, file_path, source_folder,
+        fixture_id, related_sources_json, topic_key, original_created_at,
+        imported_at, checksum, file_size_bytes,
+        is_document_root, is_unified_context_node, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)
     `);
     const r = insert.run(
       resolvedBrain,
       cleanContent,
-      sourceCheck.value,
+      derivedProv.source,
       String(file_name).trim(),
       effectivePath,
+      derivedProv.sourceFolder,
+      derivedProv.fixtureId,
+      derivedProv.relatedSources.length > 0
+        ? JSON.stringify(derivedProv.relatedSources)
+        : null,
+      derivedProv.topicKey,
+      derivedProv.originalCreatedAt,
+      now,
+      derivedProv.checksum,
+      derivedProv.fileSizeBytes,
       now,
       now
     );
     const created = db
       .prepare('SELECT * FROM facts WHERE id = ?')
       .get(r.lastInsertRowid);
+    recordSystemAuditLog(db, {
+      category: 'imported',
+      status: 'success',
+      brain: resolvedBrain,
+      source: derivedProv.source,
+      recordId: Number(r.lastInsertRowid),
+      fileName: String(file_name).trim(),
+      summary: `Ingested document memory #${r.lastInsertRowid} (${file_name}) into "${resolvedBrain}"`,
+    });
     res.json({
       fact: serializeFactRow(created),
       action: 'created',

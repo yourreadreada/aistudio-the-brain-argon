@@ -78,7 +78,7 @@ describe('Argon — Database, Backup, Restore & Settings Completion Suite', () =
         const integrity = verifyDatabaseFileIntegrity(dbPath);
         assert.equal(integrity.valid, true);
         assert.equal(integrity.integrityStatus, 'ok');
-        assert.equal(integrity.schemaVersion, 4);
+        assert.equal(integrity.schemaVersion, SCHEMA_MIGRATIONS.length);
         assert.equal(integrity.factsCount, 0);
       } finally {
         result.db.close();
@@ -150,12 +150,13 @@ describe('Argon — Database, Backup, Restore & Settings Completion Suite', () =
         )
         .run(now, now);
 
-      // Define a custom v5 migration that partially mutates state and then throws an error
+      // Define a custom migration that partially mutates state and then throws an error
+      const nextMigrationVersion = SCHEMA_MIGRATIONS.length + 1;
       const failingMigrations = [
         ...SCHEMA_MIGRATIONS,
         {
-          version: 5,
-          name: '005_failing_migration',
+          version: nextMigrationVersion,
+          name: '006_failing_migration',
           up: (db: DatabaseSync) => {
             db.exec(`INSERT INTO app_metadata (key, value, updated_at) VALUES ('partial_v5_key', 'should_rollback', '${now}')`);
             throw new Error('Simulated v5 migration syntax/constraint error');
@@ -174,7 +175,7 @@ describe('Argon — Database, Backup, Restore & Settings Completion Suite', () =
         /Simulated v5 migration syntax\/constraint error/
       );
 
-      // Verify v5 was rolled back completely and database remains usable at v4
+      // Verify failing migration was rolled back completely and database remains usable at latest valid version
       const partialRow = init.db
         .prepare(`SELECT value FROM app_metadata WHERE key = 'partial_v5_key'`)
         .get();
@@ -185,7 +186,7 @@ describe('Argon — Database, Backup, Restore & Settings Completion Suite', () =
           .prepare('SELECT MAX(version) as ver FROM schema_migrations')
           .get() as { ver: number }
       ).ver;
-      assert.equal(maxVer, 4);
+      assert.equal(maxVer, SCHEMA_MIGRATIONS.length);
 
       const userFact = init.db
         .prepare('SELECT content FROM facts')
@@ -281,7 +282,7 @@ describe('Argon — Database, Backup, Restore & Settings Completion Suite', () =
         assert.equal(backupMeta.verified, true);
         assert.equal(backupMeta.integrityStatus, 'ok');
         assert.equal(backupMeta.factsCount, 5);
-        assert.equal(backupMeta.schemaVersion, 4);
+        assert.equal(backupMeta.schemaVersion, SCHEMA_MIGRATIONS.length);
         assert.equal(backupMeta.kind, 'manual');
         assert.ok(fs.existsSync(backupMeta.backupPath));
         assert.ok(fs.existsSync(`${backupMeta.backupPath}.meta.json`));
@@ -554,7 +555,7 @@ describe('Argon — Database, Backup, Restore & Settings Completion Suite', () =
           const status1 = await statusRes1.json();
           assert.equal(status1.status, 'healthy');
           assert.equal(status1.integrityStatus, 'ok');
-          assert.equal(status1.schemaVersion, 4);
+          assert.equal(status1.schemaVersion, SCHEMA_MIGRATIONS.length);
           assert.equal(status1.factsCount, 1);
           assert.equal(status1.backups.length, 0);
 
@@ -729,7 +730,7 @@ describe('Argon — Database, Backup, Restore & Settings Completion Suite', () =
         });
         assert.equal(res.success, true);
         assert.equal(res.factsCountAfterRestore, 1);
-        assert.equal(res.schemaVersionAfterRestore, 4);
+        assert.equal(res.schemaVersionAfterRestore, SCHEMA_MIGRATIONS.length);
 
         // Insert a new fact after restore and verify its AUTOINCREMENT id is 2
         const now = new Date().toISOString();

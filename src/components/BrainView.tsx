@@ -8,6 +8,15 @@ import {
   Plus,
   Upload,
   ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  Download,
+  Search,
+  ChevronDown,
+  ChevronRight,
+  ShieldCheck,
+  Filter,
+  X,
 } from 'lucide-react';
 import {
   Fact,
@@ -17,6 +26,10 @@ import {
   SOURCE_PALETTE,
   FILE_TYPE_CONFIG,
   RecentActivityItem,
+  ActivityLogEntry,
+  AIEntity,
+  AI_ENTITIES_REGISTRY,
+  SPINAL_CORD_BOUNDARY,
   getFactFileType,
 } from '../types/brain';
 import { brainStore } from '../services/brainStorage';
@@ -33,6 +46,17 @@ import { BrainManagerModal } from './BrainManagerModal';
 import { RecentActivityPanel } from './RecentActivityPanel';
 import { DatabaseSettingsView } from './DatabaseSettingsView';
 
+export type TableSortField =
+  | 'id'
+  | 'created'
+  | 'updated'
+  | 'oldest'
+  | 'title'
+  | 'source'
+  | 'type'
+  | 'size'
+  | 'length'
+  | 'relevance';
 
 interface BrainViewProps {
   userEmail: string;
@@ -55,7 +79,6 @@ export const BrainView: React.FC<BrainViewProps> = ({
     }
   }, [initialBrainName]);
 
-  // Keyboard shortcut '[' to toggle sidebar collapse
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (
@@ -85,7 +108,13 @@ export const BrainView: React.FC<BrainViewProps> = ({
   const [activeSourceFilter, setActiveSourceFilter] = useState<AISource | null>(null);
   const [activeFileTypeFilter, setActiveFileTypeFilter] = useState<FactFileType | null>(null);
   const [viewMode, setViewMode] = useState<WorkspaceViewMode>('graph');
-  const [sortOrder, setSortOrder] = useState<'newest' | 'id'>('newest');
+
+  // Section 4: Memory Table Sorting & Pagination State
+  const [sortField, setSortField] = useState<TableSortField>('updated');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [pageSize, setPageSize] = useState<number>(50);
+  const [currentPage, setCurrentPage] = useState<number>(1);
+
   const [exportToast, setExportToast] = useState<string | null>(null);
 
   // Live AI Simulator State
@@ -103,19 +132,42 @@ export const BrainView: React.FC<BrainViewProps> = ({
   >([]);
   const [copiedPrimerKey, setCopiedPrimerKey] = useState<string | null>(null);
 
-  // Recent Activity State
+  // Recent Activity State & Full Audit Log State (Section 8)
   const [isRecentActivityOpen, setIsRecentActivityOpen] = useState(false);
   const [activities, setActivities] = useState<RecentActivityItem[]>([]);
+  const [auditLogs, setAuditLogs] = useState<ActivityLogEntry[]>([]);
+  const [auditSearch, setAuditSearch] = useState('');
+  const [auditCategory, setAuditCategory] = useState('all');
+  const [auditStatus, setAuditStatus] = useState('all');
+  const [auditSource, setAuditSource] = useState('all');
+  const [auditSortDir, setAuditSortDir] = useState<'desc' | 'asc'>('desc');
+  const [expandedAuditId, setExpandedAuditId] = useState<string | null>(null);
 
   const refreshActivities = () => {
     setActivities(brainStore.getRecentActivities());
+  };
+
+  const refreshAuditLogs = async () => {
+    const res = await brainStore.fetchActivityLogs({
+      category: auditCategory === 'all' ? undefined : auditCategory,
+      status: auditStatus === 'all' ? undefined : auditStatus,
+      source: auditSource === 'all' ? undefined : auditSource,
+      search: auditSearch.trim() || undefined,
+      limit: 500,
+    });
+    setAuditLogs(res.logs);
   };
 
   useEffect(() => {
     refreshActivities();
   }, []);
 
-  // Compute dynamic scale and intensity for background atmospheric glow container
+  useEffect(() => {
+    if (viewMode === 'activity') {
+      refreshAuditLogs();
+    }
+  }, [viewMode, auditCategory, auditStatus, auditSource, auditSearch]);
+
   const glowMetrics = useMemo(() => {
     const nodeCount = facts.length;
     const scale = Math.min(1.75, Math.max(0.85, 0.85 + Math.sqrt(Math.max(0, nodeCount)) * 0.11));
@@ -159,7 +211,6 @@ export const BrainView: React.FC<BrainViewProps> = ({
     setConnectionStatus(brainStore.getConnectionStatus());
   };
 
-  // Load brains and facts
   const refreshData = () => {
     const brainList = brainStore.getBrains();
     setBrains(brainList);
@@ -183,15 +234,23 @@ export const BrainView: React.FC<BrainViewProps> = ({
 
   useEffect(() => {
     refreshData();
+    setCurrentPage(1);
+    if (searchQuery.trim() && sortField !== 'relevance') {
+      setSortField('relevance');
+      setSortDir('desc');
+    }
   }, [currentBrain, searchQuery, activeSourceFilter, activeFileTypeFilter]);
 
   useEffect(() => {
     const unsubscribe = brainStore.subscribe(() => {
       refreshData();
       refreshActivities();
+      if (viewMode === 'activity') {
+        refreshAuditLogs();
+      }
     });
     return unsubscribe;
-  }, [currentBrain, searchQuery, activeSourceFilter, activeFileTypeFilter]);
+  }, [currentBrain, searchQuery, activeSourceFilter, activeFileTypeFilter, viewMode]);
 
   const handleCreateBrain = (name: string) => {
     brainStore.createBrain(name);
@@ -313,7 +372,9 @@ export const BrainView: React.FC<BrainViewProps> = ({
   const handleClearActivities = () => {
     try {
       localStorage.removeItem('brain_recent_activity_v1');
-    } catch {}
+    } catch {
+      // ignore
+    }
     setActivities([]);
   };
 
@@ -329,6 +390,13 @@ export const BrainView: React.FC<BrainViewProps> = ({
   const handleExportSnapshot = () => {
     const snapshot = brainStore.exportContextSnapshot(currentBrain);
     navigator.clipboard.writeText(snapshot);
+    brainStore.recordAuditLog({
+      category: 'export',
+      action: 'export_markdown_snapshot',
+      summary: `Exported Markdown snapshot for workspace "${currentBrain}"`,
+      status: 'success',
+      brain: currentBrain,
+    });
     setExportToast(`Copied "${currentBrain}" Markdown snapshot to clipboard`);
     setTimeout(() => setExportToast(null), 2600);
   };
@@ -364,7 +432,6 @@ export const BrainView: React.FC<BrainViewProps> = ({
       if (!res.ok) throw new Error('API fallback');
       const data = await res.json();
 
-      // Reload backend facts if a new durable fact was saved
       if (data.savedFact) {
         await brainStore.loadFromBackend();
         refreshData();
@@ -404,17 +471,99 @@ export const BrainView: React.FC<BrainViewProps> = ({
     }
   };
 
+  // Section 4: Comprehensive 10-Mode Sorting with Ascending/Descending & Column Header Sync
+  const handleToggleColumnSort = (field: TableSortField) => {
+    if (sortField === field) {
+      setSortDir((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortField(field);
+      setSortDir(field === 'id' || field === 'title' || field === 'source' || field === 'oldest' ? 'asc' : 'desc');
+    }
+    setCurrentPage(1);
+  };
+
   const sortedFacts = useMemo(() => {
     const list = [...facts];
-    if (sortOrder === 'id') {
-      return list.sort((a, b) => a.id - b.id);
-    }
-    return list.sort(
-      (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
-    );
-  }, [facts, sortOrder]);
+    const dirMultiplier = sortDir === 'asc' ? 1 : -1;
 
-  const totalFactsInCurrentBrain = brainCounts[currentBrain] || facts.length;
+    list.sort((a, b) => {
+      switch (sortField) {
+        case 'id':
+          return (a.id - b.id) * dirMultiplier;
+        case 'created': {
+          const ta = new Date(a.created_at || a.updated_at).getTime();
+          const tb = new Date(b.created_at || b.updated_at).getTime();
+          return ((ta - tb) || (a.id - b.id)) * dirMultiplier;
+        }
+        case 'updated': {
+          const ta = new Date(a.updated_at).getTime();
+          const tb = new Date(b.updated_at).getTime();
+          return ((ta - tb) || (a.id - b.id)) * dirMultiplier;
+        }
+        case 'oldest': {
+          const ta = new Date(a.created_at || a.updated_at).getTime();
+          const tb = new Date(b.created_at || b.updated_at).getTime();
+          return ((ta - tb) || (a.id - b.id)) * (sortDir === 'asc' ? 1 : -1);
+        }
+        case 'title': {
+          const titleA = (a.documentTitle || a.fileName || a.content.slice(0, 60)).toLowerCase();
+          const titleB = (b.documentTitle || b.fileName || b.content.slice(0, 60)).toLowerCase();
+          return titleA.localeCompare(titleB) * dirMultiplier;
+        }
+        case 'source': {
+          const srcA = (SOURCE_PALETTE[a.source]?.name || a.source).toLowerCase();
+          const srcB = (SOURCE_PALETTE[b.source]?.name || b.source).toLowerCase();
+          return (srcA.localeCompare(srcB) || a.id - b.id) * dirMultiplier;
+        }
+        case 'type': {
+          const ftA = getFactFileType(a);
+          const ftB = getFactFileType(b);
+          return (ftA.localeCompare(ftB) || a.id - b.id) * dirMultiplier;
+        }
+        case 'size': {
+          const szA = a.fileSizeBytes ?? a.content.length;
+          const szB = b.fileSizeBytes ?? b.content.length;
+          return ((szA - szB) || (a.id - b.id)) * dirMultiplier;
+        }
+        case 'length': {
+          return ((a.content.length - b.content.length) || (a.id - b.id)) * dirMultiplier;
+        }
+        case 'relevance': {
+          if (!searchQuery.trim()) {
+            return (b.id - a.id) * dirMultiplier;
+          }
+          const scoreA = brainStore.computeRelevanceScore(a, searchQuery).score;
+          const scoreB = brainStore.computeRelevanceScore(b, searchQuery).score;
+          return ((scoreA - scoreB) || (a.id - b.id)) * dirMultiplier;
+        }
+        default:
+          return (a.id - b.id) * dirMultiplier;
+      }
+    });
+
+    return list;
+  }, [facts, sortField, sortDir, searchQuery]);
+
+  const totalPages = pageSize <= 0 ? 1 : Math.max(1, Math.ceil(sortedFacts.length / pageSize));
+  const paginatedFacts = useMemo(() => {
+    if (pageSize <= 0) return sortedFacts;
+    const start = (currentPage - 1) * pageSize;
+    return sortedFacts.slice(start, start + pageSize);
+  }, [sortedFacts, currentPage, pageSize]);
+
+  const totalFactsInCurrentBrain = brainCounts[currentBrain] || allBrainFacts.length;
+  const hasActiveFilters = Boolean(searchQuery.trim() || activeSourceFilter || activeFileTypeFilter);
+
+  // Filtered and Sorted Audit Logs (Section 8)
+  const sortedAuditLogs = useMemo(() => {
+    const list = [...auditLogs];
+    list.sort((a, b) => {
+      const ta = new Date(a.timestamp).getTime();
+      const tb = new Date(b.timestamp).getTime();
+      return auditSortDir === 'desc' ? tb - ta : ta - tb;
+    });
+    return list;
+  }, [auditLogs, auditSortDir]);
 
   return (
     <div className="relative flex h-screen w-screen overflow-hidden bg-[#03040a] text-white">
@@ -537,7 +686,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
         </div>
       )}
 
-      {/* Right Workspace Column (Top Header + Main Viewport) */}
+      {/* Right Workspace Column */}
       <div className="relative flex flex-1 flex-col min-w-0 overflow-hidden">
         {/* Top Application Header */}
         <BrainAppHeader
@@ -571,6 +720,69 @@ export const BrainView: React.FC<BrainViewProps> = ({
           totalFactsCount={facts.length}
         />
 
+        {/* Section 7: Active View Context & Filter Banner */}
+        {hasActiveFilters && (
+          <div className="z-20 flex flex-wrap items-center justify-between gap-2 border-b border-indigo-500/20 bg-indigo-500/[0.06] px-4 py-1.5 text-[11px]">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="flex items-center gap-1 font-medium text-indigo-300">
+                <Filter className="h-3 w-3" />
+                <span>
+                  Showing <strong className="mono text-white">{facts.length}</strong> of{' '}
+                  <strong className="mono text-white">{totalFactsInCurrentBrain}</strong> memories in{' '}
+                  <span className="capitalize text-white">{currentBrain}</span>
+                </span>
+              </span>
+              {activeSourceFilter && (
+                <span className="inline-flex items-center gap-1 rounded-md border border-white/15 bg-white/[0.06] px-2 py-0.5 text-[10.5px] text-white">
+                  <span>Source: {SOURCE_PALETTE[activeSourceFilter]?.name || activeSourceFilter}</span>
+                  <button
+                    type="button"
+                    onClick={() => setActiveSourceFilter(null)}
+                    className="text-white/50 hover:text-white"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </span>
+              )}
+              {activeFileTypeFilter && (
+                <span className="inline-flex items-center gap-1 rounded-md border border-white/15 bg-white/[0.06] px-2 py-0.5 text-[10.5px] text-white">
+                  <span>Format: {FILE_TYPE_CONFIG[activeFileTypeFilter]?.label || activeFileTypeFilter}</span>
+                  <button
+                    type="button"
+                    onClick={() => setActiveFileTypeFilter(null)}
+                    className="text-white/50 hover:text-white"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </span>
+              )}
+              {searchQuery.trim() && (
+                <span className="inline-flex items-center gap-1 rounded-md border border-white/15 bg-white/[0.06] px-2 py-0.5 text-[10.5px] text-white">
+                  <span>Query: "{searchQuery}"</span>
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery('')}
+                    className="text-white/50 hover:text-white"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </span>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setSearchQuery('');
+                setActiveSourceFilter(null);
+                setActiveFileTypeFilter(null);
+              }}
+              className="mono text-[10.5px] text-indigo-300 underline hover:text-white"
+            >
+              Reset all filters
+            </button>
+          </div>
+        )}
+
         {/* Export Toast Notification */}
         {exportToast && (
           <div className="fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-white/20 bg-[#0b0f1d] px-4 py-2 text-xs font-medium text-white shadow-xl">
@@ -580,7 +792,6 @@ export const BrainView: React.FC<BrainViewProps> = ({
 
         {/* Main Content Viewport */}
         <div className="relative flex-1 overflow-hidden">
-          {/* Atmospheric Background Layers */}
           <div
             aria-hidden="true"
             className="pointer-events-none absolute inset-0 transition-opacity ease-out [background-image:linear-gradient(rgba(255,255,255,.025)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,.025)_1px,transparent_1px)] [background-size:56px_56px] [mask-image:radial-gradient(circle_at_center,black,transparent_80%)] opacity-20"
@@ -613,7 +824,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
               <BrainViewerCanvas
                 brainName={currentBrain}
                 facts={
-                  searchQuery.trim() || activeFileTypeFilter
+                  searchQuery.trim() || activeFileTypeFilter || activeSourceFilter
                     ? facts
                     : allBrainFacts
                 }
@@ -633,7 +844,6 @@ export const BrainView: React.FC<BrainViewProps> = ({
                 isInspectorOpen={Boolean(selectedFact || selectedSource)}
               />
 
-              {/* Empty state overlay on canvas if zero facts */}
               {facts.length === 0 && (
                 <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-4">
                   <div className="pointer-events-auto rounded-xl border border-white/12 bg-[#070913]/95 p-6 text-center max-w-sm backdrop-blur-xl">
@@ -683,7 +893,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
             </>
           )}
 
-          {/* VIEW 2: HIGH-DENSITY MEMORY LEDGER TABLE */}
+          {/* VIEW 2: HIGH-DENSITY MEMORY LEDGER TABLE (Section 4) */}
           {viewMode === 'list' && (
             <div className="relative z-10 h-full overflow-y-auto p-6 md:p-8 scrollbar-thin">
               <div className="mx-auto max-w-6xl space-y-4">
@@ -694,21 +904,61 @@ export const BrainView: React.FC<BrainViewProps> = ({
                       {currentBrain} Memory Ledger
                     </h2>
                     <p className="mt-0.5 text-xs text-white/50">
-                      Showing <span className="mono tabular-nums text-white/85">{sortedFacts.length}</span> durable memory nodes · Click any row to inspect or edit
+                      Showing <span className="mono tabular-nums text-white/85">{paginatedFacts.length}</span> of{' '}
+                      <span className="mono tabular-nums text-white/85">{sortedFacts.length}</span> matching memory nodes (Workspace total: {totalFactsInCurrentBrain})
                     </p>
                   </div>
 
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setSortOrder((prev) => (prev === 'newest' ? 'id' : 'newest'))
-                      }
-                      className="flex items-center gap-1.5 rounded-lg border border-white/12 bg-white/[0.03] px-3 py-1.5 text-xs text-white/75 transition hover:border-white/25 hover:text-white"
+                  <div className="flex flex-wrap items-center gap-2">
+                    {/* 10-Mode Sort Dropdown */}
+                    <div className="flex items-center gap-1 rounded-lg border border-white/12 bg-white/[0.03] px-2.5 py-1 text-xs">
+                      <ArrowUpDown className="h-3.5 w-3.5 text-white/50" />
+                      <span className="text-white/45 text-[11px]">Sort:</span>
+                      <select
+                        value={sortField}
+                        onChange={(e) => {
+                          setSortField(e.target.value as TableSortField);
+                          setCurrentPage(1);
+                        }}
+                        className="bg-transparent text-xs font-medium text-white outline-none cursor-pointer"
+                      >
+                        <option value="id" className="bg-[#070913]">Node ID</option>
+                        <option value="created" className="bg-[#070913]">Recently Created</option>
+                        <option value="updated" className="bg-[#070913]">Recently Updated</option>
+                        <option value="oldest" className="bg-[#070913]">Oldest First</option>
+                        <option value="title" className="bg-[#070913]">Title / Filename</option>
+                        <option value="source" className="bg-[#070913]">AI Source</option>
+                        <option value="type" className="bg-[#070913]">Document Type</option>
+                        <option value="size" className="bg-[#070913]">File Size</option>
+                        <option value="length" className="bg-[#070913]">Content Length</option>
+                        <option value="relevance" className="bg-[#070913]">Search Relevance</option>
+                      </select>
+
+                      <button
+                        type="button"
+                        onClick={() => setSortDir((prev) => (prev === 'asc' ? 'desc' : 'asc'))}
+                        className="ml-1 rounded border border-white/15 bg-white/[0.06] px-1.5 py-0.5 mono text-[10px] text-white/85 hover:bg-white/15"
+                        title="Toggle Ascending / Descending order"
+                      >
+                        {sortDir === 'asc' ? 'ASC ↑' : 'DESC ↓'}
+                      </button>
+                    </div>
+
+                    {/* Page Size Selector */}
+                    <select
+                      value={pageSize}
+                      onChange={(e) => {
+                        setPageSize(Number(e.target.value));
+                        setCurrentPage(1);
+                      }}
+                      className="mono rounded-lg border border-white/12 bg-white/[0.03] px-2.5 py-1.5 text-xs text-white/80 outline-none"
+                      title="Rows per page"
                     >
-                      <ArrowUpDown className="h-3.5 w-3.5" />
-                      <span>Sort: {sortOrder === 'newest' ? 'Recently Updated' : 'Node ID'}</span>
-                    </button>
+                      <option value={25} className="bg-[#070913]">25 / page</option>
+                      <option value={50} className="bg-[#070913]">50 / page</option>
+                      <option value={100} className="bg-[#070913]">100 / page</option>
+                      <option value={0} className="bg-[#070913]">Show All ({sortedFacts.length})</option>
+                    </select>
 
                     <button
                       type="button"
@@ -744,17 +994,95 @@ export const BrainView: React.FC<BrainViewProps> = ({
                   <div className="overflow-hidden rounded-xl border border-white/10 bg-[#060812]/90">
                     <table className="w-full text-left border-collapse">
                       <thead>
-                        <tr className="border-b border-white/10 bg-white/[0.02] text-[11px] font-medium text-white/45">
-                          <th className="py-2.5 pl-4 pr-2 w-16">ID</th>
-                          <th className="py-2.5 px-3 w-36">Source</th>
-                          <th className="py-2.5 px-3">Memory Content & Context</th>
-                          <th className="py-2.5 px-3 w-36 hidden lg:table-cell">Document / Type</th>
-                          <th className="py-2.5 px-3 w-44 hidden md:table-cell">Tags</th>
-                          <th className="py-2.5 pl-3 pr-4 w-28 text-right">Updated</th>
+                        <tr className="border-b border-white/10 bg-white/[0.02] text-[11px] font-medium text-white/55 select-none">
+                          <th
+                            onClick={() => handleToggleColumnSort('id')}
+                            className="py-2.5 pl-4 pr-2 w-20 cursor-pointer hover:text-white"
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              <span>ID</span>
+                              {sortField === 'id' &&
+                                (sortDir === 'asc' ? (
+                                  <ArrowUp className="h-3 w-3 text-indigo-400" />
+                                ) : (
+                                  <ArrowDown className="h-3 w-3 text-indigo-400" />
+                                ))}
+                            </span>
+                          </th>
+                          <th
+                            onClick={() => handleToggleColumnSort('source')}
+                            className="py-2.5 px-3 w-36 cursor-pointer hover:text-white"
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              <span>Source</span>
+                              {sortField === 'source' &&
+                                (sortDir === 'asc' ? (
+                                  <ArrowUp className="h-3 w-3 text-indigo-400" />
+                                ) : (
+                                  <ArrowDown className="h-3 w-3 text-indigo-400" />
+                                ))}
+                            </span>
+                          </th>
+                          <th
+                            onClick={() => handleToggleColumnSort('title')}
+                            className="py-2.5 px-3 cursor-pointer hover:text-white"
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              <span>Memory Content & Provenance</span>
+                              {(sortField === 'title' || sortField === 'length' || sortField === 'relevance') &&
+                                (sortDir === 'asc' ? (
+                                  <ArrowUp className="h-3 w-3 text-indigo-400" />
+                                ) : (
+                                  <ArrowDown className="h-3 w-3 text-indigo-400" />
+                                ))}
+                            </span>
+                          </th>
+                          <th
+                            onClick={() => handleToggleColumnSort('type')}
+                            className="py-2.5 px-3 w-44 hidden lg:table-cell cursor-pointer hover:text-white"
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              <span>Document / Type</span>
+                              {sortField === 'type' &&
+                                (sortDir === 'asc' ? (
+                                  <ArrowUp className="h-3 w-3 text-indigo-400" />
+                                ) : (
+                                  <ArrowDown className="h-3 w-3 text-indigo-400" />
+                                ))}
+                            </span>
+                          </th>
+                          <th
+                            onClick={() => handleToggleColumnSort('size')}
+                            className="py-2.5 px-3 w-28 hidden md:table-cell cursor-pointer hover:text-white"
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              <span>Size / Chars</span>
+                              {sortField === 'size' &&
+                                (sortDir === 'asc' ? (
+                                  <ArrowUp className="h-3 w-3 text-indigo-400" />
+                                ) : (
+                                  <ArrowDown className="h-3 w-3 text-indigo-400" />
+                                ))}
+                            </span>
+                          </th>
+                          <th
+                            onClick={() => handleToggleColumnSort('updated')}
+                            className="py-2.5 pl-3 pr-4 w-32 text-right cursor-pointer hover:text-white"
+                          >
+                            <span className="inline-flex items-center justify-end gap-1">
+                              <span>Updated</span>
+                              {(sortField === 'updated' || sortField === 'created' || sortField === 'oldest') &&
+                                (sortDir === 'asc' ? (
+                                  <ArrowUp className="h-3 w-3 text-indigo-400" />
+                                ) : (
+                                  <ArrowDown className="h-3 w-3 text-indigo-400" />
+                                ))}
+                            </span>
+                          </th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-white/8 text-xs">
-                        {sortedFacts.map((fact) => {
+                        {paginatedFacts.map((fact) => {
                           const s = SOURCE_PALETTE[fact.source];
                           const ft = getFactFileType(fact);
                           const ftMeta = FILE_TYPE_CONFIG[ft];
@@ -765,9 +1093,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
                               key={fact.id}
                               onClick={() => handleFactSelected(fact)}
                               className={`cursor-pointer transition-colors ${
-                                isSelected
-                                  ? 'bg-white/[0.09]'
-                                  : 'hover:bg-white/[0.04]'
+                                isSelected ? 'bg-white/[0.09]' : 'hover:bg-white/[0.04]'
                               }`}
                             >
                               <td className="py-3 pl-4 pr-2 align-top mono text-[11px] tabular-nums text-white/50">
@@ -780,11 +1106,35 @@ export const BrainView: React.FC<BrainViewProps> = ({
                                 >
                                   {s?.name || fact.source}
                                 </span>
+                                {fact.sourceFolder && (
+                                  <div className="mono text-[9.5px] text-white/35">
+                                    {fact.sourceFolder}
+                                  </div>
+                                )}
                               </td>
                               <td className="py-3 px-3 align-top">
-                                <p className="text-white/90 leading-relaxed line-clamp-2">
+                                <div className="flex flex-wrap items-center gap-1.5 mb-0.5">
+                                  {(fact.documentTitle || fact.fileName) && (
+                                    <span className="font-semibold text-white">
+                                      {fact.documentTitle || fact.fileName}
+                                    </span>
+                                  )}
+                                  {fact.fixtureId && (
+                                    <span className="mono rounded bg-indigo-500/20 px-1.5 py-0.2 text-[9.5px] text-indigo-200 border border-indigo-400/30">
+                                      {fact.fixtureId}
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-white/85 leading-relaxed line-clamp-2">
                                   {fact.content}
                                 </p>
+                                {fact.tags && fact.tags.length > 0 && (
+                                  <div className="mt-1 flex flex-wrap items-center gap-1.5 mono text-[10px] text-[#9db4ff]">
+                                    {fact.tags.slice(0, 4).map((t) => (
+                                      <span key={t}>#{t}</span>
+                                    ))}
+                                  </div>
+                                )}
                               </td>
                               <td className="py-3 px-3 align-top hidden lg:table-cell whitespace-nowrap">
                                 <div className="flex items-center gap-1.5 text-[11px] text-white/60">
@@ -794,26 +1144,20 @@ export const BrainView: React.FC<BrainViewProps> = ({
                                   {fact.fileName && (
                                     <>
                                       <span className="text-white/25">·</span>
-                                      <span className="truncate max-w-[110px]" title={fact.fileName}>
+                                      <span
+                                        className="truncate max-w-[130px]"
+                                        title={fact.filePath || fact.fileName}
+                                      >
                                         {fact.fileName}
                                       </span>
                                     </>
                                   )}
                                 </div>
                               </td>
-                              <td className="py-3 px-3 align-top hidden md:table-cell">
-                                {fact.tags && fact.tags.length > 0 ? (
-                                  <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 mono text-[11px] text-[#9db4ff]">
-                                    {fact.tags.slice(0, 3).map((t, i) => (
-                                      <React.Fragment key={t}>
-                                        {i > 0 && <span className="text-white/25">·</span>}
-                                        <span>#{t}</span>
-                                      </React.Fragment>
-                                    ))}
-                                  </div>
-                                ) : (
-                                  <span className="text-white/25">—</span>
-                                )}
+                              <td className="py-3 px-3 align-top hidden md:table-cell mono text-[10.5px] text-white/50">
+                                {fact.fileSizeBytes
+                                  ? `${(fact.fileSizeBytes / 1024).toFixed(1)} KB`
+                                  : `${fact.content.length} chars`}
                               </td>
                               <td className="py-3 pl-3 pr-4 align-top text-right mono text-[11px] tabular-nums text-white/45 whitespace-nowrap">
                                 {new Date(fact.updated_at).toLocaleDateString(undefined, {
@@ -826,24 +1170,50 @@ export const BrainView: React.FC<BrainViewProps> = ({
                         })}
                       </tbody>
                     </table>
+
+                    {/* Pagination Footer */}
+                    {pageSize > 0 && totalPages > 1 && (
+                      <div className="flex items-center justify-between border-t border-white/10 bg-white/[0.02] px-4 py-2.5 text-xs">
+                        <span className="mono text-[11px] text-white/50">
+                          Page {currentPage} of {totalPages} ({sortedFacts.length} records)
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            disabled={currentPage <= 1}
+                            onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                            className="rounded border border-white/15 bg-white/[0.04] px-2.5 py-1 text-xs text-white/80 hover:bg-white/10 disabled:opacity-35"
+                          >
+                            Previous
+                          </button>
+                          <button
+                            type="button"
+                            disabled={currentPage >= totalPages}
+                            onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                            className="rounded border border-white/15 bg-white/[0.04] px-2.5 py-1 text-xs text-white/80 hover:bg-white/10 disabled:opacity-35"
+                          >
+                            Next
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
             </div>
           )}
 
-          {/* VIEW 3: LIVE AI SYNC STUDIO & 2-WAY MEMORY SIMULATOR */}
+          {/* VIEW 3: LIVE AI SYNC STUDIO, ENTITIES, WORMHOLES & SPINAL CORD ARCHITECTURE (Sections 10 & 11) */}
           {viewMode === 'simulator' && (
             <div className="relative z-10 h-full overflow-y-auto p-6 md:p-8 scrollbar-thin">
               <div className="mx-auto max-w-6xl space-y-6">
-                {/* Top Header */}
                 <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
                   <div>
                     <h2 className="text-lg font-semibold text-white">
                       AI Sync Studio · <span className="capitalize text-[#9db4ff]">{currentBrain}</span>
                     </h2>
                     <p className="mt-0.5 text-xs text-white/55">
-                      Test two-way memory recall and automatic durable fact extraction, or copy 1-click grounding prompts for your AI tools.
+                      Test two-way memory recall, copy 1-click grounding prompts, or inspect the provider-neutral AI Entities, Wormholes & Spinal Cord transport boundary.
                     </p>
                   </div>
 
@@ -884,7 +1254,6 @@ export const BrainView: React.FC<BrainViewProps> = ({
                       </div>
                     </div>
 
-                    {/* Starter Prompt Suggestions */}
                     <div className="border-b border-white/10 bg-white/[0.01] px-5 py-2.5 flex flex-wrap items-center gap-1.5">
                       <span className="text-[11px] text-white/40 mr-1">Try:</span>
                       <button
@@ -913,7 +1282,6 @@ export const BrainView: React.FC<BrainViewProps> = ({
                       </button>
                     </div>
 
-                    {/* Chat Messages Viewport */}
                     <div className="h-[340px] overflow-y-auto p-5 space-y-4 scrollbar-thin">
                       {simHistory.length === 0 ? (
                         <div className="flex h-full flex-col items-center justify-center text-center px-6">
@@ -971,7 +1339,6 @@ export const BrainView: React.FC<BrainViewProps> = ({
                       )}
                     </div>
 
-                    {/* Input Form */}
                     <form
                       onSubmit={(e) => handleSendSimMessage(e)}
                       className="flex items-center gap-2 border-t border-white/10 bg-black/40 p-3.5"
@@ -994,7 +1361,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
                     </form>
                   </div>
 
-                  {/* Right 5 Cols: 1-Click Context Primers for Free Web AI */}
+                  {/* Right 5 Cols: 1-Click Context Primers */}
                   <div className="lg:col-span-5 space-y-4">
                     <div className="rounded-xl border border-white/10 bg-[#060812]/90 p-5 space-y-4">
                       <div>
@@ -1002,12 +1369,12 @@ export const BrainView: React.FC<BrainViewProps> = ({
                           One-Click Context Primers
                         </h3>
                         <p className="mt-1 text-xs text-white/50 leading-relaxed">
-                          Copy pre-formatted grounding instructions containing all <span className="mono tabular-nums text-white/80">{facts.length}</span> facts from "{currentBrain}" for ChatGPT, Claude, or Gemini Web.
+                          Copy pre-formatted grounding instructions containing all{' '}
+                          <span className="mono tabular-nums text-white/80">{facts.length}</span> facts from "{currentBrain}" for ChatGPT, Claude, or Gemini Web.
                         </p>
                       </div>
 
                       <div className="space-y-2.5">
-                        {/* Claude Primer */}
                         <div className="flex items-center justify-between rounded-lg border border-white/10 bg-white/[0.02] p-3">
                           <div>
                             <div className="text-xs font-semibold text-[#D85A30]">
@@ -1041,7 +1408,6 @@ export const BrainView: React.FC<BrainViewProps> = ({
                           </button>
                         </div>
 
-                        {/* ChatGPT Custom Instructions */}
                         <div className="flex items-center justify-between rounded-lg border border-white/10 bg-white/[0.02] p-3">
                           <div>
                             <div className="text-xs font-semibold text-[#378ADD]">
@@ -1075,7 +1441,6 @@ export const BrainView: React.FC<BrainViewProps> = ({
                           </button>
                         </div>
 
-                        {/* Gemini Primer */}
                         <div className="flex items-center justify-between rounded-lg border border-white/10 bg-white/[0.02] p-3">
                           <div>
                             <div className="text-xs font-semibold text-[#1D9E75]">
@@ -1112,6 +1477,59 @@ export const BrainView: React.FC<BrainViewProps> = ({
                     </div>
                   </div>
                 </div>
+
+                {/* Sections 10 & 11: Provider-Neutral AI Entities, Wormholes & Spinal Cord Architecture */}
+                <div className="rounded-xl border border-white/10 bg-[#060812]/90 p-5 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 pb-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-white">
+                        AI Entities, Wormhole Context Channels & Spinal Cord Boundary
+                      </h3>
+                      <p className="text-xs text-white/50">
+                        Provider-neutral entity registry and local-only Spinal Cord transport boundary ({SPINAL_CORD_BOUNDARY.host}:{SPINAL_CORD_BOUNDARY.port}).
+                      </p>
+                    </div>
+                    <span className="mono rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-[10.5px] font-semibold text-emerald-300">
+                      Binding: {SPINAL_CORD_BOUNDARY.host} (LAN Exposure Disabled)
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                    {(Object.values(AI_ENTITIES_REGISTRY) as AIEntity[]).map((ent) => {
+                      const palette = SOURCE_PALETTE[ent.id];
+                      const count = sourceCounts[ent.id] || 0;
+                      return (
+                        <div
+                          key={ent.id}
+                          className="rounded-xl border border-white/10 bg-white/[0.02] p-3.5 space-y-2"
+                        >
+                          <div className="flex items-center justify-between">
+                            <span
+                              className="text-xs font-semibold"
+                              style={{ color: palette?.color || '#fff' }}
+                            >
+                              {ent.displayName}
+                            </span>
+                            <span className="mono text-[10px] text-white/50">{count} facts</span>
+                          </div>
+                          <div className="mono text-[10px] text-white/45">
+                            Provider: {ent.provider || ent.providerFamily} · {ent.transportChannel || ent.syncStatus}
+                          </div>
+                          <div className="flex flex-wrap gap-1">
+                            {ent.capabilities.map((cap: string) => (
+                              <span
+                                key={cap}
+                                className="mono rounded bg-white/[0.06] px-1.5 py-0.5 text-[9.5px] text-white/70"
+                              >
+                                {cap}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -1129,7 +1547,215 @@ export const BrainView: React.FC<BrainViewProps> = ({
             </div>
           )}
 
-          {/* Slide-over Inspection & Correction Panel (Supports both Fact Node & Source Hub inspection) */}
+          {/* VIEW 5: FULL-PAGE ACTIVITY LOG & DIAGNOSTICS (Section 8) */}
+          {viewMode === 'activity' && (
+            <div className="relative z-10 h-full overflow-y-auto p-6 md:p-8 scrollbar-thin">
+              <div className="mx-auto max-w-6xl space-y-5">
+                <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <ShieldCheck className="h-5 w-5 text-emerald-400" />
+                      <h2 className="text-lg font-semibold text-white">
+                        Activity Log & System Audit Ledger
+                      </h2>
+                    </div>
+                    <p className="mt-0.5 text-xs text-white/50">
+                      Durable audit trail across imports, provenance resolution, edits, backups, restores, and searches. Secrets are automatically redacted.
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <a
+                      href={brainStore.getActivityLogExportUrl('json')}
+                      download="brain-activity-logs.json"
+                      className="flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-white hover:bg-white/[0.09]"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      <span>Export JSON</span>
+                    </a>
+                    <a
+                      href={brainStore.getActivityLogExportUrl('csv')}
+                      download="brain-activity-logs.csv"
+                      className="flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-white hover:bg-white/[0.09]"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      <span>Export CSV</span>
+                    </a>
+                  </div>
+                </div>
+
+                {/* Filter Bar */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5">
+                  <div className="relative lg:col-span-2">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-white/40" />
+                    <input
+                      type="text"
+                      value={auditSearch}
+                      onChange={(e) => setAuditSearch(e.target.value)}
+                      placeholder="Search audit events, filenames, batch IDs..."
+                      className="w-full rounded-lg border border-white/12 bg-black/50 pl-8 pr-3 py-1.5 text-xs text-white placeholder-white/35 outline-none focus:border-white/30"
+                    />
+                  </div>
+
+                  <select
+                    value={auditCategory}
+                    onChange={(e) => setAuditCategory(e.target.value)}
+                    className="mono rounded-lg border border-white/12 bg-black/50 px-2.5 py-1.5 text-xs text-white outline-none"
+                  >
+                    <option value="all">All Categories</option>
+                    <option value="import">import</option>
+                    <option value="archive_extract">archive_extract</option>
+                    <option value="provenance">provenance</option>
+                    <option value="create">create</option>
+                    <option value="edit">edit</option>
+                    <option value="delete">delete</option>
+                    <option value="tag_update">tag_update</option>
+                    <option value="search">search</option>
+                    <option value="backup_create">backup_create</option>
+                    <option value="backup_verify">backup_verify</option>
+                    <option value="backup_export">backup_export</option>
+                    <option value="backup_delete">backup_delete</option>
+                    <option value="restore_internal">restore_internal</option>
+                    <option value="restore_external">restore_external</option>
+                    <option value="migration">migration</option>
+                  </select>
+
+                  <select
+                    value={auditStatus}
+                    onChange={(e) => setAuditStatus(e.target.value)}
+                    className="mono rounded-lg border border-white/12 bg-black/50 px-2.5 py-1.5 text-xs text-white outline-none"
+                  >
+                    <option value="all">All Statuses</option>
+                    <option value="success">success</option>
+                    <option value="warning">warning</option>
+                    <option value="error">error</option>
+                    <option value="info">info</option>
+                  </select>
+
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={auditSource}
+                      onChange={(e) => setAuditSource(e.target.value)}
+                      className="mono flex-1 rounded-lg border border-white/12 bg-black/50 px-2.5 py-1.5 text-xs text-white outline-none"
+                    >
+                      <option value="all">All Sources</option>
+                      {(Object.keys(SOURCE_PALETTE) as AISource[]).map((s) => (
+                        <option key={s} value={s}>
+                          {SOURCE_PALETTE[s].name}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => setAuditSortDir((d) => (d === 'desc' ? 'asc' : 'desc'))}
+                      className="mono rounded-lg border border-white/12 bg-white/[0.04] px-2.5 py-1.5 text-xs text-white/80 hover:text-white"
+                    >
+                      {auditSortDir === 'desc' ? 'Newest' : 'Oldest'}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Audit Log Table */}
+                <div className="overflow-hidden rounded-xl border border-white/10 bg-[#060812]/90">
+                  {sortedAuditLogs.length === 0 ? (
+                    <div className="py-16 text-center text-xs text-white/50">
+                      No audit events match your current filters.
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-white/8">
+                      {sortedAuditLogs.map((log) => {
+                        const isExpanded = expandedAuditId === log.id;
+                        const statusColor =
+                          log.status === 'success'
+                            ? 'text-emerald-300 bg-emerald-500/15 border-emerald-500/30'
+                            : log.status === 'warning'
+                            ? 'text-amber-300 bg-amber-500/15 border-amber-500/30'
+                            : log.status === 'error'
+                            ? 'text-rose-300 bg-rose-500/15 border-rose-500/30'
+                            : 'text-indigo-300 bg-indigo-500/15 border-indigo-500/30';
+
+                        return (
+                          <div key={log.id} className="p-3.5 hover:bg-white/[0.02] transition">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setExpandedAuditId(isExpanded ? null : log.id)
+                                  }
+                                  className="text-white/50 hover:text-white"
+                                >
+                                  {isExpanded ? (
+                                    <ChevronDown className="h-4 w-4" />
+                                  ) : (
+                                    <ChevronRight className="h-4 w-4" />
+                                  )}
+                                </button>
+                                <span
+                                  className={`mono rounded border px-1.5 py-0.5 text-[10px] font-semibold uppercase ${statusColor}`}
+                                >
+                                  {log.status}
+                                </span>
+                                <span className="mono rounded bg-white/[0.06] px-2 py-0.5 text-[10.5px] text-white/80">
+                                  {log.category}
+                                </span>
+                                <span className="text-xs font-medium text-white">
+                                  {log.action || log.summary}
+                                </span>
+                                {log.source && (
+                                  <span
+                                    className="mono text-[10.5px] font-semibold"
+                                    style={{
+                                      color:
+                                        SOURCE_PALETTE[log.source as AISource]?.color || '#9db4ff',
+                                    }}
+                                  >
+                                    · {SOURCE_PALETTE[log.source as AISource]?.name || log.source}
+                                  </span>
+                                )}
+                                {log.brain && (
+                                  <span className="mono text-[10.5px] text-white/45">
+                                    [{log.brain}]
+                                  </span>
+                                )}
+                              </div>
+
+                              <span className="mono text-[10.5px] text-white/45">
+                                {new Date(log.timestamp).toLocaleString()}
+                              </span>
+                            </div>
+
+                            {isExpanded && (
+                              <div className="mt-2.5 ml-6 rounded-lg border border-white/10 bg-black/50 p-3 mono text-[11px] text-white/75 overflow-x-auto">
+                                <pre className="whitespace-pre-wrap">
+                                  {JSON.stringify(
+                                    {
+                                      id: log.id,
+                                      timestamp: log.timestamp,
+                                      category: log.category,
+                                      status: log.status,
+                                      brain: log.brain || null,
+                                      source: log.source || null,
+                                      factId: log.factId ?? log.recordId ?? null,
+                                      details: log.details || {},
+                                    },
+                                    null,
+                                    2
+                                  )}
+                                </pre>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Slide-over Inspection & Correction Panel */}
           <FactPanel
             fact={selectedFact}
             selectedSource={selectedSource}

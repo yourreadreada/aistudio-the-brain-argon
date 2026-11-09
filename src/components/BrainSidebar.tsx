@@ -37,7 +37,7 @@ import { BrainLogo } from './BrainLogo';
 import { GuidedService } from './GuidedConnectionModal';
 import { CaptureHubTab } from './CaptureHubModal';
 
-export type WorkspaceViewMode = 'graph' | 'list' | 'simulator' | 'settings';
+export type WorkspaceViewMode = 'graph' | 'list' | 'simulator' | 'activity' | 'settings';
 
 interface BrainSidebarProps {
   isCollapsed: boolean;
@@ -359,12 +359,13 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
 
             <button
               type="button"
-              onClick={onToggleRecentActivity}
-              title="Activity Log"
+              onClick={() => onSelectViewMode('activity')}
+              title="Activity Log & Diagnostics"
+              aria-current={viewMode === 'activity' ? 'page' : undefined}
               className={`flex w-full items-center rounded-lg text-xs font-medium transition-colors ${
                 isCollapsed ? 'justify-center py-2.5' : 'justify-between px-2.5 py-2'
               } ${
-                isRecentActivityOpen
+                viewMode === 'activity' || isRecentActivityOpen
                   ? 'bg-white/[0.1] text-white'
                   : 'text-white/60 hover:bg-white/[0.04] hover:text-white'
               }`}

@@ -725,7 +725,11 @@ describe('3. Activity Log Sidebar & History Behavior', () => {
       'utf8'
     );
 
-    assert.equal(sidebarSource.includes('onClick={onToggleRecentActivity}'), true);
+    assert.equal(
+      sidebarSource.includes("onSelectViewMode('activity')") ||
+        sidebarSource.includes('onClick={onToggleRecentActivity}'),
+      true
+    );
     assert.equal(sidebarSource.includes('<span>Activity Log</span>'), true);
     assert.equal(sidebarSource.includes('{recentActivityCount}'), false);
   });

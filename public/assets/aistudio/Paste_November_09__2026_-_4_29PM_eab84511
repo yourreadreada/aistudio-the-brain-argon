@@ -1,0 +1,1241 @@
+# THE BRAIN — ARGON MASTER STABILIZATION, REPAIR & ARCHITECTURE UPGRADE
+
+## MISSION
+
+Perform a comprehensive engineering and UX stabilization of the current The Brain — Gemini Argon implementation.
+
+This is a consolidated assignment based on extensive real-world testing, a 190-memory workspace, multi-format file imports, graph exploration, backup operations, and manual inspection of the application.
+
+**The objective is to fix the underlying issues, not merely improve their appearance.**
+
+Inspect the existing codebase, understand its architecture, implement the necessary changes, add regression tests, execute the tests, and verify that existing user data remains intact.
+
+Work systematically across all sections below. Do not stop after producing a plan or making superficial UI changes.
+
+---
+
+# 0. NON-NEGOTIABLE PROJECT RULES
+
+Before making changes:
+
+1. Inspect the complete existing project structure and understand the current architecture.
+2. Inspect the latest changes already present in the workspace. Do not assume an older Git commit represents the current state.
+3. Preserve working functionality unless a change is necessary.
+4. Do not delete, overwrite, or reset existing user memories.
+5. Do not use destructive bulk replacement as a shortcut.
+6. Do not replace real data with demo data.
+7. Keep regression fixtures separate from user data and demo seeds.
+8. Do not introduce unnecessary dependencies.
+9. Do not create mock implementations that appear functional but do not perform the advertised operation.
+10. Do not claim that a feature works unless it has been tested.
+
+### Explicitly deferred
+
+- LAN and remote access. Keep the backend bound strictly to `127.0.0.1`.
+- Homescreen neural constellation animation redesign.
+- Production/cloud architecture migration.
+- Actual integrations with external Claude, ChatGPT and Gemini accounts.
+
+Do not modify GPT Build or its repository. Argon remains the current implementation and source of truth.
+
+Do not introduce a new remote-access surface, external network listener, or unauthenticated API.
+
+### Data protection
+
+Before database-affecting changes:
+
+- Inspect the existing database.
+- Create and verify a safety backup.
+- Confirm existing records and relationships are preserved.
+- Perform destructive and recovery tests against disposable databases only.
+- Never test restore, deletion, or corruption scenarios against the user's only live database.
+
+If the current workspace has no initialized Git metadata, do not pretend changes are committed. Report that accurately.
+
+---
+
+# 1. SHARED TEST CORPUS & IMPORT PIPELINE
+
+Use the supplied shared test corpus:
+
+`the-brain-argon-shared-test-corpus-v1.1.0.zip`
+
+Inspect:
+
+- `README_TESTING_GUIDE.md`
+- `MANIFEST.json`
+- All fixture files.
+- SHA-256 checksums.
+
+Verify fixture integrity before using the corpus.
+
+The corpus includes Markdown, TXT, CSV, JSON, PDF, DOCX, XLSX, PPTX, PNG, HTML, TypeScript, YAML, exact duplicates, near duplicates, a long research document, empty and unsupported files, and a nested ZIP.
+
+## Required fixes
+
+### A. Source attribution and provenance
+
+A file's original folder and path must determine its source attribution.
+
+For example:
+
+`01_claude/03_records.csv`
+
+must remain attributed to Claude, regardless of the contents of the CSV.
+
+Never infer the primary source from incidental text inside a document.
+
+Preserve:
+
+- Original filename.
+- Original relative path.
+- Original source folder.
+- File type.
+- Import timestamp.
+- Original document timestamp, when available.
+- Import batch ID.
+- Checksum.
+- Extraction status.
+- Related source references.
+
+A memory can have multiple semantic relationships while retaining one correct primary source.
+
+Example: A memory imported from Local AI / Ollama may be conceptually related to Claude and ChatGPT. It should be eligible for links to both without changing its original provenance.
+
+### B. File extraction
+
+Validate and strengthen extraction for every supported format.
+
+Required behaviour:
+
+- PDF: extract embedded text, retain page references, identify scanned/image-only documents and report OCR requirements.
+- DOCX: preserve headings, paragraphs, tables, lists and document structure.
+- XLSX: preserve sheets, rows, columns, cell values and formulas where available.
+- CSV: preserve headers, rows and meaningful values.
+- PPTX: preserve slide boundaries, slide numbers, titles and text.
+- Images: retain original images and report OCR text and extraction confidence where OCR is available.
+- HTML: extract useful content while excluding irrelevant scripts and navigation noise.
+- JSON/YAML: preserve structured hierarchy.
+- Source code: preserve code content, language and meaningful structure.
+- Markdown/TXT: preserve headings, sections and paragraphs.
+- ZIP: safely process nested archives with recursion, file-count and decompression limits.
+
+Do not claim full OCR support if actual OCR is not implemented.
+
+Unsupported, empty, encrypted, malformed or corrupt files must produce clear actionable errors.
+
+### C. Extraction quality
+
+Implement and test:
+
+- Stable file identification.
+- Appropriate chunking.
+- Meaningful metadata preservation.
+- Document hierarchy.
+- Content boundaries.
+- Extraction warnings.
+- Failure isolation so one bad file does not terminate the entire batch.
+
+### D. Duplicate handling
+
+Support:
+
+- Exact duplicate detection.
+- Near-duplicate detection.
+- Explicit user review.
+- Safe merge/replace/skip decisions.
+- Preservation of source provenance.
+
+Never silently merge unrelated documents.
+
+Test both exact and near duplicates from the corpus.
+
+### E. Import results
+
+Every import batch should provide:
+
+- Total files detected.
+- Imported files.
+- Skipped files.
+- Failed files.
+- Duplicate matches.
+- Unsupported files.
+- Extraction warnings.
+- Per-file results.
+- A downloadable diagnostic report.
+
+The displayed counts must match actual database changes.
+
+---
+
+# 2. NEURAL GRAPH — RELATIONSHIPS AND DATA CORRECTNESS
+
+The current workspace has approximately 190 memories and seven AI sources.
+
+Observed source distribution:
+
+- Claude: 36
+- ChatGPT: 9
+- Gemini: 5
+- GitHub: 41
+- Moodle: 91
+- Cursor / Antigravity: 6
+- Local AI / Ollama: 2
+
+Do not hardcode these values. Use actual data.
+
+## A. Correct relationship model
+
+Distinguish three different concepts:
+
+1. Source relationship: which source originally supplied a memory.
+2. Semantic relationship: which other memories discuss related concepts.
+3. Explicit relationship: direct references, dependencies or references between memories.
+
+Do not confuse source attribution with semantic connectivity.
+
+A memory mentioning Claude does not automatically become a Claude memory.
+
+A memory genuinely related to both Claude and ChatGPT should be able to connect to both while preserving its original source.
+
+## B. Cross-source relationships
+
+Improve relationship generation and rendering.
+
+Test cross-provider relationships using the shared graph stress corpus.
+
+Avoid:
+
+- Arbitrary connections.
+- Spurious links.
+- Missing meaningful links.
+- Duplicate edges.
+- Incorrect source reassignment.
+- Relationships inferred solely from provider names.
+
+Every relationship should have a defined basis, and where feasible, a score or explanation.
+
+Allow users to inspect why two memories are connected.
+
+## C. Edge rendering
+
+Radial view currently makes individual connections difficult to see, while Force view displays them more clearly.
+
+Fix this.
+
+All graph layouts must render the same underlying valid relationship data.
+
+Improve:
+
+- Edge visibility.
+- Opacity.
+- Contrast.
+- Layering.
+- Directionality where applicable.
+- Selected-edge highlighting.
+- Hover and focus states.
+
+Changing layout must not silently remove relationships.
+
+## D. Radial and Force layouts
+
+Radial currently places memories in source-oriented clusters around the central workspace.
+
+Make the layout meaningful and readable.
+
+Radial should:
+
+- Show source hierarchy.
+- Preserve individual memory relationships.
+- Avoid excessive distance from the central workspace.
+- Maintain readable cluster spacing.
+- Prevent unnecessary overlaps.
+
+Force should:
+
+- Use stable and predictable simulation behaviour.
+- Avoid excessive movement.
+- Maintain reasonable separation.
+- Avoid unstable layouts on repeated rendering.
+
+Positions must not be random merely to create visual variety.
+
+## E. Adaptive cluster energy
+
+Implement adaptive visual emphasis based on relevant graph properties:
+
+- Memory count.
+- Relationship count.
+- Cluster density.
+- Recent activity.
+- Importance or relevance.
+
+Large clusters such as Moodle should receive proportionally appropriate visual presence.
+
+Small clusters should remain visible.
+
+Do not let raw node count alone dominate the graph.
+
+## F. Graph scalability
+
+Test with 190 nodes and larger synthetic datasets.
+
+Prevent:
+
+- Label collisions.
+- Edge clutter.
+- Unresponsive interactions.
+- Excessive rendering work.
+- Layout instability.
+
+Consider progressive rendering, edge visibility controls, zoom-dependent labels and appropriate virtualization where useful.
+
+---
+
+# 3. SEARCH — FULL WORKSPACE SEARCH
+
+Current search appears to expose only six nodes, despite 190 memories existing.
+
+Fix the search pipeline.
+
+Search must cover all eligible workspace memories, not an arbitrary six-result subset.
+
+Search across:
+
+- Titles.
+- Memory content.
+- Original filenames.
+- Source.
+- Tags.
+- Metadata.
+- Document identifiers.
+- Fixture IDs.
+
+Implement:
+
+- Relevant ranking.
+- Exact-match prioritization.
+- Partial matching.
+- Case-insensitive matching.
+- Useful empty states.
+- Loading and error states.
+- Pagination or virtualization when necessary.
+
+Do not arbitrarily truncate search results.
+
+Clicking a result must:
+
+1. Open the correct workspace context.
+2. Select the correct memory.
+3. Focus the correct graph node when applicable.
+4. Open its correct inspector.
+5. Preserve the selected source/filter context.
+
+Test using unique corpus identifiers and content located beyond the first six records.
+
+---
+
+# 4. MEMORY TABLE
+
+The current table displays records but sorting options are limited.
+
+The Sort dropdown currently supports Node ID and Recently Updated.
+
+Expand the sorting functionality.
+
+Required sorting:
+
+- Node ID.
+- Recently Created.
+- Recently Updated.
+- Oldest First.
+- Title.
+- Source.
+- Document Type.
+- File Size, where available.
+- Content Length.
+- Relevance, when search is active.
+
+Support ascending and descending order.
+
+Column-heading sorting currently does not work reliably. Implement proper clickable column sorting with:
+
+- Visible active sort indicator.
+- Ascending/descending state.
+- Consistent behaviour with the dropdown.
+- Correct handling of missing values.
+
+Also validate:
+
+- Filtering by source.
+- Filtering by format.
+- Search.
+- Pagination or virtualization.
+- Editing.
+- Opening individual records.
+- Preservation of current workspace context.
+
+Table operations must reflect actual data, not static sample data.
+
+---
+
+# 5. FORMAT-AWARE MEMORY INSPECTOR AND DOCUMENT VIEWERS
+
+The current detail view presents different document types in an almost identical generic text layout.
+
+This is not acceptable for a knowledge-management system.
+
+Create separate, clearly defined inspection experiences for:
+
+A. Source Inspector.
+B. Individual Memory Inspector.
+C. Original Document Viewer.
+
+## A. Source Inspector
+
+For Claude, ChatGPT, Gemini, Moodle, GitHub, etc., display:
+
+- Source identity.
+- Memory count.
+- Relevant statistics.
+- Last activity.
+- Associated files.
+- Connected memories.
+- Related sources.
+- Synchronization status, where applicable.
+
+## B. Individual Memory Inspector
+
+Display:
+
+- Title.
+- Original source.
+- Original filename and path.
+- Created and updated timestamps.
+- Import information.
+- Document type.
+- Tags.
+- Extracted content.
+- Relationships.
+- Relationship explanations.
+- Update history.
+- Provenance.
+- Available actions.
+
+Clearly distinguish source metadata from semantic relationships.
+
+## C. Format-aware viewers
+
+Implement appropriate viewing experiences.
+
+### PDF
+
+- Actual page navigation.
+- Page rendering where supported.
+- Page numbers.
+- Extracted text.
+- Page-level references.
+- OCR status.
+- Original PDF access.
+
+### DOCX
+
+- Headings.
+- Paragraphs.
+- Lists.
+- Tables.
+- Document structure.
+
+### XLSX / CSV
+
+- Sheet navigation.
+- Actual tables.
+- Row and column information.
+- Cell values.
+- Formula preservation where available.
+
+### PPTX
+
+- Slide navigation.
+- Slide numbers.
+- Slide text.
+- Slide previews where supported.
+
+### Images
+
+- Original image preview.
+- Dimensions.
+- OCR output.
+- OCR confidence where available.
+
+### HTML
+
+- Safe readable document rendering.
+- Useful extracted content.
+- No unsafe script execution.
+
+### JSON / YAML
+
+- Structured tree or formatted view.
+- Preserve nested hierarchy.
+
+### Source Code
+
+- Syntax-aware display.
+- Line numbers.
+- Language identification.
+- Original code access.
+
+### Markdown / TXT
+
+- Readable formatting.
+- Heading hierarchy.
+- Section navigation where appropriate.
+
+Do not pretend a generic extracted-text preview is an original-document viewer.
+
+Preserve original files separately from extracted content and normalized memories.
+
+The user should be able to distinguish:
+
+1. Original file.
+2. Extracted content.
+3. Normalized memory.
+4. Generated summary.
+
+---
+
+# 6. TIMELINE VIEW
+
+Current Timeline view is compressed, visually confusing and does not communicate chronology.
+
+Redesign it as an actual chronological exploration interface.
+
+It should show:
+
+- Creation date.
+- Original document date where available.
+- Import date.
+- Update date.
+- Source.
+- Relevant memory title.
+- Related events.
+
+Important: Never confuse import timestamp with original creation timestamp.
+
+Required functionality:
+
+- Date-range filtering.
+- Source filtering.
+- Zoom.
+- Navigation.
+- Grouping by date.
+- Readable labels.
+- Selection and inspection.
+- Useful empty states.
+
+Where timestamps are missing, explicitly show that they are unknown. Do not invent historical dates.
+
+Timeline must remain meaningful when there are hundreds or thousands of memories.
+
+---
+
+# 7. GRAPH NAVIGATION AND FILTERING
+
+Improve:
+
+- Recenter.
+- Zoom in/out.
+- Fit all visible nodes.
+- Focus workspace root.
+- Focus selected memory.
+- Source filters.
+- Format filters.
+- Search-selected nodes.
+- Breadcrumb navigation.
+
+Recenter must respect the current graph context and fit the visible graph without clipping nodes or labels.
+
+Filtering should remain consistent across:
+
+- Graph.
+- Search.
+- Memory Table.
+- Timeline.
+- Inspector.
+
+Clearly communicate whether the user is viewing:
+
+- Entire workspace.
+- A selected source.
+- A filtered subset.
+- A selected memory.
+- A related-memory group.
+
+Do not accidentally change workspace data when merely applying a visual filter.
+
+---
+
+# 8. ACTIVITY LOG — FULL AUDIT AND DIAGNOSTICS
+
+The current Activity Log correctly displays recorded activity such as viewed and modified memories.
+
+Preserve that functionality.
+
+However, the narrow side panel is difficult to inspect, and the current history does not provide enough operational diagnostics.
+
+Create a dedicated full-page Activity Log.
+
+## Required categories
+
+- Viewed.
+- Created.
+- Modified.
+- Deleted.
+- Imported.
+- Exported.
+- Merged.
+- Replaced.
+- Skipped.
+- Backup created.
+- Backup exported.
+- Backup deleted.
+- Restore started.
+- Restore completed.
+- Restore failed.
+- Database initialized.
+- Migration executed.
+- Integrity check.
+- AI synchronization.
+- Errors and warnings.
+
+Only record operations that actually occurred.
+
+## Full-page interface
+
+Include:
+
+- Search.
+- Date-range filter.
+- Operation filter.
+- Source filter.
+- Status filter.
+- Sort order.
+- Pagination or virtualization.
+- Expandable event details.
+- Related record navigation.
+- Error inspection.
+
+## Structured diagnostics
+
+Every relevant operation should produce structured diagnostic information.
+
+Where applicable, capture:
+
+- Unique operation ID.
+- Timestamp.
+- Operation type.
+- Status.
+- Duration.
+- Affected record or file.
+- Source.
+- Error category.
+- Safe technical error details.
+- Recovery action.
+- Related backup/import ID.
+
+Implement JSON and CSV log export.
+
+Make the export genuinely downloadable and valid.
+
+Logs must be useful to a human or AI diagnosing failures.
+
+Never log credentials, API keys, authentication tokens or unnecessary private content.
+
+Provide a safe diagnostic export that can be shared without exposing secrets.
+
+Do not claim that all operations are logged until each operation has been instrumented and tested.
+
+---
+
+# 9. DATABASE, BACKUP AND RECOVERY — CRITICAL
+
+The current database settings include SQLite backup creation, verification and internal Restore buttons.
+
+A major issue has been discovered.
+
+When the user clicked Export on a backup, the browser downloaded a file ending in `.db`, but inspection of the uploaded file showed that it contained an HTML Cookie Check / authentication response rather than an actual SQLite database.
+
+Therefore, the current export flow is NOT VERIFIED as functional.
+
+Do not ignore this finding.
+
+## A. Correct backup export
+
+Inspect the complete backup export path:
+
+- Frontend action.
+- Backend route.
+- Response headers.
+- Authentication or cookie handling.
+- File streaming.
+- Browser download behaviour.
+- Error handling.
+
+Ensure that the browser receives the actual database file.
+
+Validate:
+
+- SQLite file signature.
+- SQLite integrity.
+- Expected metadata.
+- Schema version.
+- Record counts.
+- File size.
+- Correct content type.
+
+Never save an HTML error page with a `.db` extension.
+
+If export fails, show an error instead of presenting a false successful download.
+
+After export, provide a way to validate the downloaded file.
+
+Do not report a backup as successfully exported until the actual file has been verified.
+
+## B. Backup management
+
+The user set retention to 2, but the interface displayed 3 backups:
+
+- Two verified backups.
+- One invalid backup.
+
+Clarify and correct the retention semantics.
+
+Implement:
+
+- Verified backup count.
+- Invalid backup count.
+- Total backup count.
+- Clear retention explanation.
+- Manual deletion.
+- Invalid backup deletion.
+- Confirmation before deletion.
+- Protection against accidental deletion of the last known-good backup.
+- Accurate count refresh after operations.
+
+Define whether retention applies to all snapshots or only verified backups.
+
+Do not silently delete a known-good backup.
+
+## C. Existing internal restore
+
+The current interface already displays Restore buttons for verified backups.
+
+Do not assume these work.
+
+Verify:
+
+- Valid backup restoration.
+- Corrupt backup rejection.
+- Invalid backup rejection.
+- Incompatible schema handling.
+- Pre-restore safety backup.
+- Staged restoration.
+- Integrity verification.
+- Automatic rollback on failure.
+- Record and relationship preservation.
+
+Use disposable databases for these tests.
+
+## D. EXTERNAL BACKUP IMPORT AND RESTORE — MANDATORY MISSING FEATURE
+
+This is a distinct requirement.
+
+The user needs to recover The Brain even if:
+
+- The application crashes.
+- The current database becomes corrupted.
+- The original installation is lost.
+- The internal backup directory is destroyed.
+- All backups stored inside the application disappear.
+
+The user may still possess a previously exported `.db` file on their laptop, external drive or another storage location.
+
+The Brain must provide an external recovery workflow independent of the original installation.
+
+Implement a dedicated action such as:
+
+**Restore from External Backup**
+
+Required flow:
+
+1. Allow selecting an external `.db` file through a file picker.
+2. Validate its actual SQLite format.
+3. Reject HTML, text, renamed files and malformed databases.
+4. Run integrity checks.
+5. Inspect metadata and schema version.
+6. Check compatibility with the installed Argon version.
+7. Display backup creation date and available record counts.
+8. Display what will be restored.
+9. Warn about data that may be overwritten.
+10. Ask for explicit confirmation.
+11. Perform safe staged restoration.
+12. Preserve the existing database through a safety backup where possible.
+13. Verify restored records and relationships.
+14. Provide a recovery report.
+15. Record the result in the Activity Log.
+
+Support two situations:
+
+### Existing installation
+
+Restore an external backup into an existing database safely, with a verified safety backup and rollback capability.
+
+### Fresh installation
+
+Allow recovery when no initialized database exists.
+
+The application must be able to initialize the required environment and restore the selected external backup without relying on the old database's internal backup directory.
+
+Do not assume a safety backup can exist on a completely fresh installation.
+
+Provide a separate safe recovery path for that scenario.
+
+### Recovery compatibility
+
+Handle:
+
+- Older compatible schema versions.
+- Required migrations.
+- Unsupported future schema versions.
+- Missing metadata.
+- Corrupt backups.
+- Interrupted restoration.
+
+Never overwrite the live database before validating the candidate backup.
+
+Never claim successful restoration without post-restore integrity verification.
+
+## E. Backup portability
+
+Ensure that a verified exported backup is actually portable.
+
+A user should be able to:
+
+1. Export a backup.
+2. Move it to another drive.
+3. Lose the original application database.
+4. Reinstall or initialize Argon.
+5. Select the external backup.
+6. Recover the Brain.
+
+Document exactly what is included in the backup and any limitations.
+
+---
+
+# 10. AI ENTITIES, WORMHOLES AND FUTURE MULTI-PROVIDER ARCHITECTURE
+
+This section is architectural preparation, not a request to fake integrations with external AI providers.
+
+The long-term vision is that Claude, ChatGPT, Gemini and future providers can use the same Brain concurrently.
+
+The Brain owns the knowledge.
+
+External AI providers are independent entities that request authorized context and may submit new information.
+
+## A. AI entity model
+
+Prepare a provider-neutral entity abstraction.
+
+Each entity should eventually have:
+
+- Provider identity.
+- Connection status.
+- Permissions.
+- Last communication.
+- Access scope.
+- Transfer history.
+- Read/write capabilities.
+- Error status.
+
+Do not bind the core memory model to a single provider.
+
+## B. Wormhole visualization
+
+Prepare the graph architecture for external AI entities represented as distinct connected entities.
+
+The eventual visualization should distinguish:
+
+- Brain → AI: authorized context being sent.
+- AI → Brain: information being received.
+- Bidirectional communication.
+- Inactive connections.
+- Failed transfers.
+
+The entity inspector should eventually show:
+
+- Memories accessed.
+- Memories sent.
+- Information received.
+- Nodes affected.
+- Transfer timestamps.
+- Permissions.
+- Errors.
+
+Do not fabricate live data flows.
+
+Only visualize actual recorded transfers when the integration exists.
+
+## C. Concurrent provider access
+
+Design for multiple providers accessing the same Brain simultaneously.
+
+Future requirements:
+
+- Concurrent reads.
+- Safe concurrent writes.
+- Versioning.
+- Conflict resolution.
+- Idempotent operations.
+- Duplicate protection.
+- Per-provider permissions.
+- Audit history.
+- Isolation of private conversations.
+- No provider ownership of shared memory.
+
+One provider must never receive another provider's private information without explicit authorization.
+
+Do not implement unsupported provider integrations in this phase.
+
+---
+
+# 11. SPINAL CORD — FUTURE TRANSPORT LAYER
+
+The future architecture will introduce a separate communication and synchronization layer called the Spinal Cord.
+
+Conceptually:
+
+THE BRAIN:
+- Owns memories.
+- Understands relationships.
+- Decides which context should be retrieved.
+- Decides which information should be stored.
+- Controls authorization and memory policies.
+
+SPINAL CORD:
+- Transports information.
+- Handles communication protocols.
+- Manages queues.
+- Handles synchronization.
+- Tracks delivery status.
+- Handles retries and failures.
+- Maintains transfer observability.
+
+External AI entities:
+- Claude.
+- ChatGPT.
+- Gemini.
+- Local AI.
+- Future providers.
+
+Do not create an unnecessary transport subsystem now.
+
+Instead, document clear boundaries and avoid coupling memory logic directly to future provider-specific communication code.
+
+---
+
+# 12. TESTING AND REGRESSION REQUIREMENTS
+
+This assignment is incomplete until automated verification is performed.
+
+Add or strengthen automated tests for all modified modules.
+
+## A. Import corpus
+
+Test:
+
+- All supported formats.
+- Nested ZIP.
+- Long documents.
+- Empty files.
+- Unsupported files.
+- Corrupt files.
+- Exact duplicates.
+- Near duplicates.
+- Source attribution.
+- Manifest checksums.
+- Extraction markers.
+- Failure isolation.
+
+## B. Graph
+
+Test:
+
+- Node counts.
+- Relationship integrity.
+- Cross-source relationships.
+- Source attribution preservation.
+- Duplicate edge prevention.
+- Search-to-node navigation.
+- Filtering.
+- Layout data consistency.
+
+## C. Search and table
+
+Test:
+
+- Results beyond the first six.
+- Unique fixture ID search.
+- Exact and partial matching.
+- Sorting in both directions.
+- Source filtering.
+- Format filtering.
+- Correct record selection.
+
+## D. Timeline and inspector
+
+Test:
+
+- Timestamp handling.
+- Missing timestamps.
+- Original versus import timestamps.
+- Correct file type rendering.
+- Correct source and memory inspector data.
+- Original document availability.
+
+## E. Activity Log
+
+Test:
+
+- Correct event creation.
+- Viewed and modified history.
+- Import and export history.
+- Backup and restore history.
+- Error records.
+- JSON/CSV export validity.
+- Secret redaction.
+
+## F. Database and recovery
+
+Test:
+
+- Database initialization.
+- Existing data preservation.
+- Migrations.
+- Backup creation.
+- Actual SQLite export.
+- Download validation.
+- Backup retention.
+- Manual deletion.
+- Invalid backup rejection.
+- Internal restore.
+- External restore.
+- Fresh-install restore.
+- Corruption rejection.
+- Safety backup.
+- Rollback.
+- Post-restore integrity.
+- Multi-workspace restoration.
+
+## G. Scale testing
+
+Use the current 190-memory workspace and larger synthetic test datasets.
+
+Verify that:
+
+- Graph navigation remains responsive.
+- Search does not truncate results.
+- Timeline remains readable.
+- Table remains usable.
+- No records disappear.
+- No duplicate records are introduced.
+
+All tests must use disposable databases and isolated fixtures where destructive behaviour is involved.
+
+---
+
+# 13. DOCUMENTATION
+
+Update:
+
+- README.
+- Architecture documentation.
+- Import documentation.
+- Graph relationship documentation.
+- Database documentation.
+- Backup and restore guide.
+- External recovery guide.
+- Activity Log and diagnostics guide.
+- Testing instructions.
+- Known limitations.
+
+Document the exact recovery procedure for a user whose original installation and internal backups have been lost.
+
+Include actual commands and steps.
+
+Do not document unimplemented features as available.
+
+---
+
+# 14. IMPLEMENTATION STRATEGY
+
+Execute this assignment in coordinated stages.
+
+### Stage 1 — Inspect and protect
+
+- Audit existing implementation.
+- Verify current database state.
+- Create a verified safety backup.
+- Identify affected files and modules.
+- Identify dependencies between features.
+
+### Stage 2 — Fix data correctness
+
+- Import pipeline.
+- Provenance.
+- Duplicates.
+- Relationships.
+- Search.
+- Database safety.
+
+### Stage 3 — Fix usability
+
+- Memory Table.
+- Inspectors.
+- Format-aware viewers.
+- Timeline.
+- Graph layouts.
+- Navigation and filtering.
+
+### Stage 4 — Fix operational reliability
+
+- Activity Log.
+- Diagnostics.
+- Backup export.
+- Retention.
+- Internal restore.
+- External recovery.
+- Fresh-install recovery.
+
+### Stage 5 — Architectural preparation
+
+- Provider-neutral AI entities.
+- Future Wormhole data model.
+- Brain/Spinal Cord boundaries.
+- Multi-provider concurrency design.
+
+### Stage 6 — Verification
+
+- Run all relevant automated tests.
+- Run the shared corpus regression suite.
+- Run database and recovery tests.
+- Run type checking.
+- Run lint.
+- Run production build.
+- Check for regressions.
+- Inspect the final application.
+
+If the environment cannot execute a particular test, report that limitation explicitly.
+
+Do not fabricate test results.
+
+---
+
+# 15. FINAL ACCEPTANCE CRITERIA
+
+The task is complete only when the following conditions are met or individually documented as blocked.
+
+1. Imported files retain correct original source attribution.
+2. Multi-format extraction is validated.
+3. Exact and near duplicates behave correctly.
+4. Search covers the full workspace.
+5. Table sorting and filtering work.
+6. Individual memories have meaningful detail views.
+7. Original documents have format-appropriate viewers.
+8. Timeline communicates actual chronology.
+9. Radial and Force layouts show consistent valid relationships.
+10. Cross-source relationships work without changing provenance.
+11. Graph navigation and recenter work correctly.
+12. Activity Log provides comprehensive searchable history.
+13. Diagnostic exports are valid and safe.
+14. Backup exports contain real verified SQLite databases.
+15. Retention and deletion behave correctly.
+16. Existing internal Restore is verified.
+17. External backup restoration works.
+18. Fresh-install recovery works.
+19. Corrupt backups are safely rejected.
+20. Failed restores do not destroy existing data.
+21. Multiple workspaces survive backup and recovery.
+22. No existing user data is lost.
+23. All executed tests and build checks have actual recorded results.
+24. Documentation accurately describes the delivered functionality.
+25. Future AI entity and Spinal Cord architecture remains provider-neutral and does not introduce fake integrations.
+
+---
+
+# 16. REQUIRED FINAL REPORT
+
+After implementation, provide a detailed report containing:
+
+### A. Summary
+What was actually fixed and implemented.
+
+### B. Files changed
+List the important files and explain why they changed.
+
+### C. Database safety
+Report before/after record counts, workspace counts and backup verification.
+
+### D. Tests
+For each test suite, provide:
+- Exact command.
+- Actual pass count.
+- Actual failure count.
+- Skipped tests.
+- Reason for any skipped tests.
+
+### E. Build checks
+Report actual typecheck, lint and production build results.
+
+### F. Backup and recovery
+Provide evidence that:
+- Exported files are genuine SQLite databases.
+- External backup import works.
+- Fresh-install recovery works.
+- Integrity checks pass.
+- Rollback works.
+
+### G. UI verification
+Describe and show the relevant changed interfaces where possible.
+
+### H. Known limitations
+List anything not implemented, blocked or not verified.
+
+### I. Remaining work
+Separate genuine future work from unfinished requirements.
+
+### J. Repository status
+Report:
+- Current branch, if available.
+- Current commit hash, if available.
+- Uncommitted changes.
+- Files changed.
+- Whether changes were committed.
+
+Do not claim that all acceptance criteria passed if any remain unverified.
+
+---
+
+## FINAL INSTRUCTION
+
+Treat this as a reliability and product-quality upgrade, not a cosmetic redesign.
+
+Make the implementation coherent. Reuse existing architecture where appropriate. Avoid unnecessary rewrites.
+
+Preserve existing data and working features.
+
+Do not stop at planning. Implement, test, verify and document.
+
+The Brain should become a reliable, understandable, recoverable, provider-neutral knowledge system.
+
+**One Brain. Multiple AI entities. One controlled source of truth.**

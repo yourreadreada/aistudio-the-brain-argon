@@ -753,6 +753,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
             );
           });
 
+        const batchId = `batch_${Date.now().toString(36)}`;
+        const nowIso = new Date().toISOString();
         const mappedItems: ImportReviewItem[] = extractedItems.map(
           (extItem, idx) => {
             const hasErr = extItem.status === 'error' || !extItem.text.trim();
@@ -768,6 +770,10 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               itemTitle,
               hasErr,
               effectiveFilePath
+            );
+            const baseTags = extItem.archiveParent ? ['archive-import'] : [];
+            const mergedTags = Array.from(
+              new Set([...baseTags, ...(extItem.extractedTags || [])])
             );
             return {
               id: `${placeholderId}-${idx}`,
@@ -794,7 +800,18 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               duplicateState: evalRes.duplicateState,
               nodeCheck: evalRes.nodeCheck,
               resolution: evalRes.resolution,
-              tags: extItem.archiveParent ? ['archive-import'] : [],
+              tags: mergedTags,
+              sourceFolder: extItem.sourceFolder,
+              originalCreatedAt: extItem.originalCreatedAt ?? null,
+              importedAt: nowIso,
+              importBatchId: batchId,
+              checksum: extItem.checksum,
+              extractionStatus: extItem.extractionStatus || (hasErr ? 'failed' : 'ok'),
+              extractionWarnings: extItem.extractionWarnings,
+              relatedSources: extItem.relatedSources,
+              fixtureId: extItem.fixtureId,
+              topicKey: extItem.topicKey,
+              structuredData: extItem.structuredData,
               progress: undefined,
             };
           }
@@ -976,6 +993,18 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         strategy: ingestStrategy,
         chunkSize,
         simulateFailure: Boolean(item.simulateFailureOnce),
+        sourceFolder: item.sourceFolder,
+        originalCreatedAt: item.originalCreatedAt,
+        importedAt: item.importedAt,
+        importBatchId: item.importBatchId,
+        checksum: item.checksum,
+        extractionStatus: item.extractionStatus,
+        extractionWarnings: item.extractionWarnings,
+        relatedSources: item.relatedSources,
+        fixtureId: item.fixtureId,
+        topicKey: item.topicKey,
+        fileSizeBytes: item.sizeBytes,
+        structuredData: item.structuredData,
         onProgress: (prog) => {
           setReviewQueue((prev) =>
             prev.map((q) =>
