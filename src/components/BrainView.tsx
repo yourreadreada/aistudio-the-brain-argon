@@ -136,6 +136,10 @@ export const BrainView: React.FC<BrainViewProps> = ({
   const [isRecentActivityOpen, setIsRecentActivityOpen] = useState(false);
   const [activities, setActivities] = useState<RecentActivityItem[]>([]);
   const [auditLogs, setAuditLogs] = useState<ActivityLogEntry[]>([]);
+  const [auditTotalCount, setAuditTotalCount] = useState<number>(0);
+  const [auditPage, setAuditPage] = useState<number>(1);
+  const [auditPageSize, setAuditPageSize] = useState<number>(50);
+  const [auditTotalPages, setAuditTotalPages] = useState<number>(1);
   const [auditSearch, setAuditSearch] = useState('');
   const [auditCategory, setAuditCategory] = useState('all');
   const [auditStatus, setAuditStatus] = useState('all');
@@ -147,15 +151,19 @@ export const BrainView: React.FC<BrainViewProps> = ({
     setActivities(brainStore.getRecentActivities());
   };
 
-  const refreshAuditLogs = async () => {
+  const refreshAuditLogs = async (targetPage = auditPage, targetPageSize = auditPageSize) => {
     const res = await brainStore.fetchActivityLogs({
       category: auditCategory === 'all' ? undefined : auditCategory,
       status: auditStatus === 'all' ? undefined : auditStatus,
       source: auditSource === 'all' ? undefined : auditSource,
       search: auditSearch.trim() || undefined,
-      limit: 500,
+      sort: auditSortDir === 'asc' ? 'oldest' : 'newest',
+      page: targetPage,
+      pageSize: targetPageSize,
     });
     setAuditLogs(res.logs);
+    setAuditTotalCount(res.total);
+    setAuditTotalPages(res.totalPages);
   };
 
   useEffect(() => {
@@ -163,10 +171,23 @@ export const BrainView: React.FC<BrainViewProps> = ({
   }, []);
 
   useEffect(() => {
+    setAuditPage(1);
+  }, [auditCategory, auditStatus, auditSource, auditSearch, auditSortDir]);
+
+  useEffect(() => {
     if (viewMode === 'activity') {
-      refreshAuditLogs();
+      refreshAuditLogs(auditPage, auditPageSize);
     }
-  }, [viewMode, auditCategory, auditStatus, auditSource, auditSearch]);
+  }, [
+    viewMode,
+    auditCategory,
+    auditStatus,
+    auditSource,
+    auditSearch,
+    auditSortDir,
+    auditPage,
+    auditPageSize,
+  ]);
 
   const glowMetrics = useMemo(() => {
     const nodeCount = facts.length;
@@ -246,11 +267,24 @@ export const BrainView: React.FC<BrainViewProps> = ({
       refreshData();
       refreshActivities();
       if (viewMode === 'activity') {
-        refreshAuditLogs();
+        refreshAuditLogs(auditPage, auditPageSize);
       }
     });
     return unsubscribe;
-  }, [currentBrain, searchQuery, activeSourceFilter, activeFileTypeFilter, viewMode]);
+  }, [
+    currentBrain,
+    searchQuery,
+    activeSourceFilter,
+    activeFileTypeFilter,
+    viewMode,
+    auditPage,
+    auditPageSize,
+    auditCategory,
+    auditStatus,
+    auditSource,
+    auditSearch,
+    auditSortDir,
+  ]);
 
   const handleCreateBrain = (name: string) => {
     brainStore.createBrain(name);
@@ -1209,11 +1243,16 @@ export const BrainView: React.FC<BrainViewProps> = ({
               <div className="mx-auto max-w-6xl space-y-6">
                 <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
                   <div>
-                    <h2 className="text-lg font-semibold text-white">
-                      AI Sync Studio · <span className="capitalize text-[#9db4ff]">{currentBrain}</span>
-                    </h2>
-                    <p className="mt-0.5 text-xs text-white/55">
-                      Test two-way memory recall, copy 1-click grounding prompts, or inspect the provider-neutral AI Entities, Wormholes & Spinal Cord transport boundary.
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <h2 className="text-lg font-semibold text-white">
+                        AI Sync Studio · <span className="capitalize text-[#9db4ff]">{currentBrain}</span>
+                      </h2>
+                      <span className="mono rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10.5px] font-medium text-amber-300">
+                        Local Simulator · Offline Grounding
+                      </span>
+                    </div>
+                    <p className="mt-1 text-xs text-white/55">
+                      Simulate memory recall and durable fact extraction locally against SQLite, copy 1-click grounding primers for external web chats, or inspect provider transport modes.
                     </p>
                   </div>
 
@@ -1227,6 +1266,51 @@ export const BrainView: React.FC<BrainViewProps> = ({
                   </button>
                 </div>
 
+                {/* Explicit Connectivity Honesty Banner */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 rounded-xl border border-white/10 bg-[#060812]/80 p-3.5 text-xs">
+                  <div className="rounded-lg border border-white/8 bg-white/[0.02] p-3">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-white">Studio Playground</span>
+                      <span className="mono rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">
+                        Simulated
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[11px] text-white/50 leading-relaxed">
+                      Simulates how AI models ground responses using your local "{currentBrain}" SQLite nodes. Does not send messages to external Claude/ChatGPT web accounts.
+                    </p>
+                  </div>
+
+                  <div className="rounded-lg border border-white/8 bg-white/[0.02] p-3">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-white">Web AI Primers</span>
+                      <span className="mono rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] text-sky-300">
+                        Manual Copy
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[11px] text-white/50 leading-relaxed">
+                      One-click grounding blocks for pasting into Claude Projects, ChatGPT Custom Instructions, or Gemini Web sessions.
+                    </p>
+                  </div>
+
+                  <div className="rounded-lg border border-white/8 bg-white/[0.02] p-3">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-white">Browser Companion & API</span>
+                      <span
+                        className={`mono rounded px-1.5 py-0.5 text-[10px] ${
+                          connectionStatus.backend
+                            ? 'bg-emerald-500/15 text-emerald-300'
+                            : 'bg-white/10 text-white/55'
+                        }`}
+                      >
+                        {connectionStatus.backend ? 'Local REST Active' : 'Offline Fallback'}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[11px] text-white/50 leading-relaxed">
+                      Real capture from browser tabs requires pairing the Browser Companion extension or calling the local <code className="mono text-white/75">127.0.0.1</code> REST/MCP endpoints.
+                    </p>
+                  </div>
+                </div>
+
                 <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
                   {/* Left 7 Cols: Interactive Two-Way AI Memory Playground */}
                   <div className="lg:col-span-7 flex flex-col rounded-xl border border-white/10 bg-[#060812]/90 overflow-hidden">
@@ -1234,12 +1318,12 @@ export const BrainView: React.FC<BrainViewProps> = ({
                       <div className="flex items-center gap-2">
                         <Sparkles className="h-4 w-4 text-amber-400" />
                         <span className="text-xs font-semibold text-white">
-                          Two-Way Memory Grounding Simulator
+                          Simulated Memory Grounding Playground
                         </span>
                       </div>
 
                       <div className="flex items-center gap-1.5">
-                        <span className="text-[11px] text-white/45">Simulate as:</span>
+                        <span className="text-[11px] text-white/45">Simulate persona:</span>
                         <select
                           value={simSource}
                           onChange={(e) => setSimSource(e.target.value as AISource)}
@@ -1657,6 +1741,73 @@ export const BrainView: React.FC<BrainViewProps> = ({
 
                 {/* Audit Log Table */}
                 <div className="overflow-hidden rounded-xl border border-white/10 bg-[#060812]/90">
+                  {/* Pagination & Summary Bar */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/10 bg-white/[0.02] px-4 py-2.5 text-xs">
+                    <div className="text-white/60">
+                      Showing{' '}
+                      <span className="mono font-medium text-white">
+                        {auditTotalCount === 0
+                          ? 0
+                          : (auditPage - 1) * auditPageSize + 1}
+                      </span>
+                      –
+                      <span className="mono font-medium text-white">
+                        {Math.min(
+                          auditTotalCount,
+                          (auditPage - 1) * auditPageSize + sortedAuditLogs.length
+                        )}
+                      </span>{' '}
+                      of{' '}
+                      <span className="mono font-medium text-white">
+                        {auditTotalCount}
+                      </span>{' '}
+                      audit events
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <label className="flex items-center gap-1.5 text-[11px] text-white/50">
+                        <span>Rows:</span>
+                        <select
+                          value={auditPageSize}
+                          onChange={(e) => {
+                            setAuditPageSize(Number(e.target.value));
+                            setAuditPage(1);
+                          }}
+                          className="mono rounded border border-white/15 bg-black/60 px-2 py-1 text-xs text-white outline-none"
+                        >
+                          <option value={25}>25 / page</option>
+                          <option value={50}>50 / page</option>
+                          <option value={100}>100 / page</option>
+                          <option value={250}>250 / page</option>
+                        </select>
+                      </label>
+
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          disabled={auditPage <= 1}
+                          onClick={() => setAuditPage((p) => Math.max(1, p - 1))}
+                          className="rounded border border-white/15 bg-white/[0.04] px-2.5 py-1 text-xs text-white/80 hover:bg-white/[0.1] hover:text-white disabled:opacity-35 disabled:pointer-events-none"
+                        >
+                          Previous
+                        </button>
+                        <span className="mono px-2 text-[11px] text-white/70">
+                          Page {auditPage} of {Math.max(1, auditTotalPages)}
+                        </span>
+                        <button
+                          type="button"
+                          disabled={auditPage >= auditTotalPages}
+                          onClick={() =>
+                            setAuditPage((p) => Math.min(auditTotalPages, p + 1))
+                          }
+                          className="rounded border border-white/15 bg-white/[0.04] px-2.5 py-1 text-xs text-white/80 hover:bg-white/[0.1] hover:text-white disabled:opacity-35 disabled:pointer-events-none"
+                        >
+                          Next
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
                   {sortedAuditLogs.length === 0 ? (
                     <div className="py-16 text-center text-xs text-white/50">
                       No audit events match your current filters.
@@ -1748,6 +1899,51 @@ export const BrainView: React.FC<BrainViewProps> = ({
                           </div>
                         );
                       })}
+                    </div>
+                  )}
+
+                  {/* Bottom Pagination Controls when multi-page */}
+                  {auditTotalPages > 1 && (
+                    <div className="flex items-center justify-between border-t border-white/10 bg-white/[0.02] px-4 py-2.5 text-xs">
+                      <span className="mono text-[11px] text-white/55">
+                        Page {auditPage} of {auditTotalPages} ({auditTotalCount} total events)
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={auditPage <= 1}
+                          onClick={() => setAuditPage(1)}
+                          className="rounded border border-white/15 bg-white/[0.04] px-2 py-1 text-[11px] text-white/80 hover:bg-white/[0.1] disabled:opacity-35"
+                        >
+                          First
+                        </button>
+                        <button
+                          type="button"
+                          disabled={auditPage <= 1}
+                          onClick={() => setAuditPage((p) => Math.max(1, p - 1))}
+                          className="rounded border border-white/15 bg-white/[0.04] px-2.5 py-1 text-[11px] text-white/80 hover:bg-white/[0.1] disabled:opacity-35"
+                        >
+                          Previous
+                        </button>
+                        <button
+                          type="button"
+                          disabled={auditPage >= auditTotalPages}
+                          onClick={() =>
+                            setAuditPage((p) => Math.min(auditTotalPages, p + 1))
+                          }
+                          className="rounded border border-white/15 bg-white/[0.04] px-2.5 py-1 text-[11px] text-white/80 hover:bg-white/[0.1] disabled:opacity-35"
+                        >
+                          Next
+                        </button>
+                        <button
+                          type="button"
+                          disabled={auditPage >= auditTotalPages}
+                          onClick={() => setAuditPage(auditTotalPages)}
+                          className="rounded border border-white/15 bg-white/[0.04] px-2 py-1 text-[11px] text-white/80 hover:bg-white/[0.1] disabled:opacity-35"
+                        >
+                          Last
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>

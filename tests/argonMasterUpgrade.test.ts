@@ -19,6 +19,7 @@ import {
   recordSystemAuditLog,
   redactSecrets,
   repairAndEnrichFactsProvenance,
+  createBrainApp,
 } from '../src/server/brainBackend';
 import { brainStore } from '../src/services/brainStorage';
 import { Fact, AI_ENTITIES_REGISTRY, SPINAL_CORD_BOUNDARY } from '../src/types/brain';
@@ -309,40 +310,247 @@ describe('The Brain — Argon Master Stabilization, Provenance, Backup & Archite
     assert.equal(SPINAL_CORD_BOUNDARY.remoteAccessEnabled, false);
   });
 
-  it('verifies the live data/brain.db contains all 195 records with 100% accurate folder provenance', () => {
-    const liveDbPath = path.resolve(process.cwd(), 'data', 'brain.db');
-    if (!fs.existsSync(liveDbPath)) return;
+  it('repairs and enriches multi-folder synthetic corpus in a disposable temporary SQLite database without touching live data/brain.db', () => {
+    const disposableDbPath = path.join(tmpDir, 'synthetic_corpus_provenance.db');
+    const { db } = initializeDatabase(disposableDbPath, { seedOnBrandNewDb: false });
 
-    const { db } = initializeDatabase(liveDbPath);
-    const repairStats = repairAndEnrichFactsProvenance(db);
-    assert.ok(repairStats.totalInspected >= 195);
+    try {
+      const now = '2026-11-09T12:00:00.000Z';
+      const insertStmt = db.prepare(`
+        INSERT INTO facts (
+          brain, content, source, file_name, file_path, file_type, tags_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
 
-    const totalRow = db.prepare('SELECT COUNT(*) as c FROM facts').get() as { c: number };
-    assert.equal(totalRow.c, 195);
+      const syntheticFixtures: Array<{
+        brain: string;
+        content: string;
+        initialSource: string;
+        fileName: string;
+        filePath: string;
+        fileType: string;
+      }> = [
+        {
+          brain: 'coding',
+          content:
+            'Fixture ID: BRAIN-GRAPH-ADD-011\nSource: Claude\nCreated: 2026-10-01\nTags: architecture, graph\nDiscusses ChatGPT and Gemini comparisons.',
+          initialSource: 'gpt', // Deliberately misassigned initially to verify repair
+          fileName: 'claude_arch_011.md',
+          filePath: 'the_brain_test_data/01_claude/claude_arch_011.md',
+          fileType: 'md',
+        },
+        {
+          brain: 'coding',
+          content:
+            'Fixture ID: BRAIN-GRAPH-ADD-012\nSource: Claude\nCreated: 2026-10-02\nTags: typescript, sqlite\nStrict TypeScript schema migrations.',
+          initialSource: 'claude',
+          fileName: 'claude_schema_012.md',
+          filePath: 'the_brain_test_data/01_claude/claude_schema_012.md',
+          fileType: 'md',
+        },
+        {
+          brain: 'coding',
+          content:
+            'Fixture ID: BRAIN-GRAPH-ADD-021\nSource: ChatGPT\nCreated: 2026-10-03\nTags: api, rest\nMentions Claude and Cursor inside body text.',
+          initialSource: 'claude', // Deliberately misassigned
+          fileName: 'chatgpt_session_021.docx',
+          filePath: 'the_brain_test_data/02_chatgpt/chatgpt_session_021.docx',
+          fileType: 'docx',
+        },
+        {
+          brain: 'coding',
+          content:
+            'Fixture ID: BRAIN-GRAPH-ADD-031\nSource: Gemini\nCreated: 2026-10-04\nTags: multimodal, search\nWorkspace indexing metrics.',
+          initialSource: 'claude', // Deliberately misassigned
+          fileName: 'gemini_metrics_031.xlsx',
+          filePath: 'the_brain_test_data/03_gemini/gemini_metrics_031.xlsx',
+          fileType: 'xlsx',
+        },
+        {
+          brain: 'coding',
+          content:
+            'Fixture ID: BRAIN-GRAPH-ADD-041\nSource: GitHub\nCreated: 2026-10-05\nTags: ci, actions\nPull request review workflow.',
+          initialSource: 'claude', // Deliberately misassigned
+          fileName: 'github_pr_041.py',
+          filePath: 'the_brain_test_data/04_github/github_pr_041.py',
+          fileType: 'code',
+        },
+        {
+          brain: 'coding',
+          content:
+            'Fixture ID: BRAIN-GRAPH-ADD-091\nSource: Moodle\nCreated: 2026-10-06\nTags: algorithms, syllabus\nUniversity lecture slides on graph traversal.',
+          initialSource: 'claude', // Deliberately misassigned
+          fileName: 'moodle_lecture_091.pptx',
+          filePath: 'the_brain_test_data/05_moodle/moodle_lecture_091.pptx',
+          fileType: 'pptx',
+        },
+        {
+          brain: 'coding',
+          content:
+            'Fixture ID: BRAIN-GRAPH-ADD-061\nSource: Cursor / Antigravity\nCreated: 2026-10-07\nTags: refactor, ui\nMulti-file component refactor.',
+          initialSource: 'claude', // Deliberately misassigned
+          fileName: 'cursor_refactor_061.ts',
+          filePath: 'the_brain_test_data/06_cursor_antigravity/cursor_refactor_061.ts',
+          fileType: 'code',
+        },
+        {
+          brain: 'coding',
+          content:
+            'Fixture ID: BRAIN-GRAPH-ADD-071\nSource: Local AI / Ollama\nCreated: 2026-10-08\nTags: ollama, llama3\nLocal inference quantization benchmark.',
+          initialSource: 'claude', // Deliberately misassigned
+          fileName: 'ollama_bench_071.json',
+          filePath: 'the_brain_test_data/07_local_ai_ollama/ollama_bench_071.json',
+          fileType: 'json',
+        },
+        {
+          brain: 'college',
+          content:
+            'Fixture ID: BRAIN-COL-001\nSource: Moodle\nCreated: 2026-10-09\nTags: exam, operating-systems\nKernel scheduling notes.',
+          initialSource: 'moodle',
+          fileName: 'os_notes.pdf',
+          filePath: 'the_brain_test_data/05_moodle/os_notes.pdf',
+          fileType: 'pdf',
+        },
+      ];
 
-    const bySource = db
-      .prepare(
-        "SELECT source, COUNT(*) as c FROM facts WHERE brain = 'coding' GROUP BY source ORDER BY source"
-      )
-      .all() as { source: string; c: number }[];
-    const sourceMap = Object.fromEntries(bySource.map((r) => [r.source, r.c]));
+      for (const item of syntheticFixtures) {
+        insertStmt.run(
+          item.brain,
+          item.content,
+          item.initialSource,
+          item.fileName,
+          item.filePath,
+          item.fileType,
+          '[]',
+          now,
+          now
+        );
+      }
 
-    assert.deepEqual(sourceMap, {
-      claude: 29,
-      cursor: 27,
-      gemini: 27,
-      github: 27,
-      gpt: 25,
-      'local-ai': 28,
-      moodle: 27,
+      const repairStats = repairAndEnrichFactsProvenance(db);
+      assert.equal(repairStats.totalInspected, 9);
+      assert.ok(repairStats.repairedCount >= 7);
+
+      const totalRow = db.prepare('SELECT COUNT(*) as c FROM facts').get() as { c: number };
+      assert.equal(totalRow.c, 9);
+
+      const bySource = db
+        .prepare(
+          "SELECT source, COUNT(*) as c FROM facts WHERE brain = 'coding' GROUP BY source ORDER BY source"
+        )
+        .all() as { source: string; c: number }[];
+      const sourceMap = Object.fromEntries(bySource.map((r) => [r.source, r.c]));
+
+      assert.deepEqual(sourceMap, {
+        claude: 2,
+        cursor: 1,
+        gemini: 1,
+        github: 1,
+        gpt: 1,
+        'local-ai': 1,
+        moodle: 1,
+      });
+
+      const fixture91 = db
+        .prepare('SELECT id, source, source_folder, fixture_id FROM facts WHERE fixture_id = ?')
+        .get('BRAIN-GRAPH-ADD-091') as
+        | { id: number; source: string; source_folder: string; fixture_id: string }
+        | undefined;
+      assert.ok(fixture91);
+      assert.equal(fixture91?.source, 'moodle');
+      assert.equal(fixture91?.source_folder, '05_moodle');
+      assert.equal(fixture91?.fixture_id, 'BRAIN-GRAPH-ADD-091');
+    } finally {
+      db.close();
+      for (const suffix of ['', '-wal', '-shm']) {
+        const p = `${disposableDbPath}${suffix}`;
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      }
+    }
+  });
+
+  it('paginates activity_logs with stable ordering and filters without omitting older events', async () => {
+    const pageDbPath = path.join(tmpDir, 'activity_pagination.db');
+    const { db } = initializeDatabase(pageDbPath, { seedOnBrandNewDb: false });
+    const app = createBrainApp(db, {
+      dbPath: pageDbPath,
+      backupDir: path.join(tmpDir, 'page_backups'),
+    });
+    const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
+      const srv = app.listen(0, '127.0.0.1', () => resolve(srv));
     });
 
-    const fixture91 = db
-      .prepare('SELECT id, source, fixture_id FROM facts WHERE fixture_id = ?')
-      .get('BRAIN-GRAPH-ADD-091') as { id: number; source: string; fixture_id: string } | undefined;
-    assert.ok(fixture91);
-    assert.equal(fixture91?.fixture_id, 'BRAIN-GRAPH-ADD-091');
+    try {
+      const addr = server.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      const baseUrl = `http://127.0.0.1:${port}`;
 
-    db.close();
+      // Clear any initial migration audit log so fixture counts are exact
+      db.prepare('DELETE FROM activity_logs').run();
+
+      // Insert 15 synthetic audit logs with deterministic timestamps
+      for (let i = 1; i <= 15; i++) {
+        const padded = String(i).padStart(2, '0');
+        db.prepare(
+          `INSERT INTO activity_logs (
+            operation_id, timestamp, category, status, brain, source, summary
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          `op_${padded}`,
+          `2026-11-09T10:${padded}:00.000Z`,
+          i % 2 === 0 ? 'imported' : 'created',
+          'success',
+          'coding',
+          'claude',
+          `Synthetic audit event #${padded}`
+        );
+      }
+
+      // Page 1 (newest first, pageSize=6) -> events 15..10
+      const resPage1 = await fetch(
+        `${baseUrl}/api/activity-logs?page=1&pageSize=6&sort=newest`
+      );
+      assert.equal(resPage1.status, 200);
+      const data1 = await resPage1.json();
+      assert.equal(data1.total, 15);
+      assert.equal(data1.page, 1);
+      assert.equal(data1.pageSize, 6);
+      assert.equal(data1.totalPages, 3);
+      assert.equal(data1.hasMore, true);
+      assert.equal(data1.logs.length, 6);
+      assert.equal(data1.logs[0].summary, 'Synthetic audit event #15');
+      assert.equal(data1.logs[5].summary, 'Synthetic audit event #10');
+
+      // Page 3 (newest first, pageSize=6) -> oldest 3 events (#03, #02, #01)
+      const resPage3 = await fetch(
+        `${baseUrl}/api/activity-logs?page=3&pageSize=6&sort=newest`
+      );
+      const data3 = await resPage3.json();
+      assert.equal(data3.total, 15);
+      assert.equal(data3.page, 3);
+      assert.equal(data3.hasMore, false);
+      assert.equal(data3.logs.length, 3);
+      assert.equal(data3.logs[0].summary, 'Synthetic audit event #03');
+      assert.equal(data3.logs[2].summary, 'Synthetic audit event #01');
+
+      // Oldest sort order + category filter ('imported' -> 7 even-numbered events)
+      const resFiltered = await fetch(
+        `${baseUrl}/api/activity-logs?page=1&pageSize=5&sort=oldest&category=imported`
+      );
+      const dataFiltered = await resFiltered.json();
+      assert.equal(dataFiltered.total, 7);
+      assert.equal(dataFiltered.totalPages, 2);
+      assert.equal(dataFiltered.logs.length, 5);
+      assert.equal(dataFiltered.logs[0].summary, 'Synthetic audit event #02');
+      assert.equal(dataFiltered.logs[4].summary, 'Synthetic audit event #10');
+    } finally {
+      server.close();
+      db.close();
+      for (const suffix of ['', '-wal', '-shm']) {
+        const p = `${pageDbPath}${suffix}`;
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      }
+    }
   });
 });
+

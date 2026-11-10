@@ -25,6 +25,7 @@ import {
   Check,
   X,
   ChevronDown,
+  ChevronRight,
   ExternalLink,
 } from 'lucide-react';
 import {
@@ -67,6 +68,7 @@ interface BrainSidebarProps {
   onExportSnapshot: () => void;
   onSwitchToWelcome: () => void;
   userIdentity?: string;
+  hasLiveIntegration?: boolean;
 }
 
 export const BrainSidebar: React.FC<BrainSidebarProps> = ({
@@ -95,10 +97,11 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
   onExportSnapshot,
   onSwitchToWelcome,
   userIdentity = 'Local Developer',
+  hasLiveIntegration = false,
 }) => {
   const [isCreatingBrain, setIsCreatingBrain] = useState(false);
   const [newBrainName, setNewBrainName] = useState('');
-  const [isWorkspaceSwitcherOpen, setIsWorkspaceSwitcherOpen] = useState(false);
+  const [isBrainsExpanded, setIsBrainsExpanded] = useState(false);
 
   const handleCreateSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -107,6 +110,7 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
     onCreateBrain(cleaned);
     setNewBrainName('');
     setIsCreatingBrain(false);
+    setIsBrainsExpanded(false);
   };
 
   const getBrainIcon = (brainName: string) => {
@@ -141,6 +145,9 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
   const activeFileTypes = (Object.keys(FILE_TYPE_CONFIG) as FactFileType[]).filter(
     (ft) => (fileTypeCounts[ft] || 0) > 0 || activeFileTypeFilter === ft
   );
+
+  const otherBrains = brains.filter((b) => b !== currentBrain);
+  const activeBrainCount = brainCounts[currentBrain] ?? totalFactsInBrain;
 
   return (
     <aside
@@ -183,90 +190,8 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
 
       {/* Scrollable Navigation Content */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden py-3 px-2.5 space-y-5 scrollbar-thin">
-        {/* Top Workspace Selector Card (Expanded) or Quick Action (Collapsed) */}
-        {!isCollapsed ? (
-          <div className="relative">
-            <button
-              type="button"
-              onClick={() => setIsWorkspaceSwitcherOpen((prev) => !prev)}
-              aria-expanded={isWorkspaceSwitcherOpen}
-              className="flex w-full items-center justify-between gap-2.5 rounded-xl border border-white/12 bg-white/[0.04] p-2.5 text-left transition hover:border-white/25 hover:bg-white/[0.07]"
-            >
-              <div className="flex items-center gap-2.5 min-w-0">
-                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-white text-black shadow-sm">
-                  {getBrainIcon(currentBrain)}
-                </div>
-                <div className="min-w-0">
-                  <div className="text-xs font-semibold capitalize text-white truncate">
-                    {currentBrain}
-                  </div>
-                  <div className="mono text-[10.5px] tabular-nums text-white/45 truncate">
-                    {totalFactsInBrain} {totalFactsInBrain === 1 ? 'memory' : 'memories'} · local
-                  </div>
-                </div>
-              </div>
-              <ChevronDown
-                className={`h-3.5 w-3.5 shrink-0 text-white/45 transition-transform ${
-                  isWorkspaceSwitcherOpen ? 'rotate-180 text-white' : ''
-                }`}
-              />
-            </button>
-
-            {isWorkspaceSwitcherOpen && (
-              <div className="mt-1.5 rounded-xl border border-white/15 bg-[#0a0d1a] p-1.5 shadow-2xl space-y-0.5">
-                {brains.map((b) => {
-                  const isCurrent = b === currentBrain;
-                  const c = brainCounts[b] || 0;
-                  return (
-                    <button
-                      key={b}
-                      type="button"
-                      onClick={() => {
-                        onSelectBrain(b);
-                        setIsWorkspaceSwitcherOpen(false);
-                      }}
-                      className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-xs transition ${
-                        isCurrent
-                          ? 'bg-white/[0.12] text-white font-medium'
-                          : 'text-white/65 hover:bg-white/[0.05] hover:text-white'
-                      }`}
-                    >
-                      <span className="flex items-center gap-2 capitalize truncate">
-                        {getBrainIcon(b)}
-                        <span>{b}</span>
-                      </span>
-                      <span className="mono text-[10.5px] tabular-nums text-white/45">
-                        {c}
-                      </span>
-                    </button>
-                  );
-                })}
-                <div className="border-t border-white/10 pt-1 mt-1 flex items-center justify-between px-1">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsWorkspaceSwitcherOpen(false);
-                      setIsCreatingBrain(true);
-                    }}
-                    className="mono text-[10.5px] text-white/60 hover:text-white py-1 px-1.5"
-                  >
-                    + New brain
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsWorkspaceSwitcherOpen(false);
-                      onOpenManageBrains();
-                    }}
-                    className="mono text-[10.5px] text-white/50 hover:text-white py-1 px-1.5"
-                  >
-                    Manage
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        ) : (
+        {/* Quick Action in Collapsed Mode */}
+        {isCollapsed && (
           <div className="flex flex-col items-center gap-1.5">
             <button
               type="button"
@@ -350,9 +275,9 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
                 <Sparkles className="h-4 w-4 shrink-0 text-amber-400" />
                 {!isCollapsed && <span>AI Sync Studio</span>}
               </span>
-              {!isCollapsed && (
+              {!isCollapsed && hasLiveIntegration && (
                 <span className="mono rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
-                  2-way
+                  Live
                 </span>
               )}
             </button>
@@ -402,7 +327,7 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
           </div>
         </div>
 
-        {/* SECTION 2: Memory Brains */}
+        {/* SECTION 2: Memory Brains (Single Brain Navigation Control) */}
         <div className="border-t border-white/10 pt-4">
           {!isCollapsed ? (
             <div className="flex items-center justify-between px-2 pb-1.5">
@@ -410,19 +335,45 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
                 Memory Brains
               </span>
               <div className="flex items-center gap-1">
+                {otherBrains.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => setIsBrainsExpanded((v) => !v)}
+                    aria-expanded={isBrainsExpanded}
+                    aria-label={
+                      isBrainsExpanded
+                        ? 'Collapse other Memory Brains'
+                        : `Expand ${otherBrains.length} other Memory Brains`
+                    }
+                    className="flex h-5 w-5 items-center justify-center rounded text-white/45 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
+                    title={
+                      isBrainsExpanded
+                        ? 'Collapse other Brains'
+                        : `Show all Brains (${brains.length})`
+                    }
+                  >
+                    <ChevronDown
+                      className={`h-3.5 w-3.5 transition-transform duration-150 ${
+                        isBrainsExpanded ? 'rotate-180 text-white' : ''
+                      }`}
+                    />
+                  </button>
+                )}
                 <button
                   type="button"
                   onClick={() => setIsCreatingBrain((v) => !v)}
-                  className="flex h-5 w-5 items-center justify-center rounded text-white/45 transition hover:bg-white/10 hover:text-white"
+                  className="flex h-5 w-5 items-center justify-center rounded text-white/45 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
                   title="Create New Brain"
+                  aria-label="Create New Brain"
                 >
                   <Plus className="h-3.5 w-3.5" />
                 </button>
                 <button
                   type="button"
                   onClick={onOpenManageBrains}
-                  className="flex h-5 w-5 items-center justify-center rounded text-white/45 transition hover:bg-white/10 hover:text-white"
+                  className="flex h-5 w-5 items-center justify-center rounded text-white/45 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
                   title="Manage All Brains"
+                  aria-label="Manage All Brains"
                 >
                   <Settings2 className="h-3.5 w-3.5" />
                 </button>
@@ -435,6 +386,7 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
                 onClick={onOpenManageBrains}
                 className="flex h-7 w-7 items-center justify-center rounded-md text-white/45 hover:bg-white/10 hover:text-white"
                 title="Manage Brains"
+                aria-label="Manage Brains"
               >
                 <BrainCircuit className="h-3.5 w-3.5" />
               </button>
@@ -470,69 +422,124 @@ export const BrainSidebar: React.FC<BrainSidebarProps> = ({
             </form>
           )}
 
-          <div className="space-y-0.5">
-            {brains.map((b) => {
-              const isSelected = currentBrain === b;
-              const count = brainCounts[b] || 0;
-              return (
-                <div
-                  key={b}
-                  className={`group flex items-center rounded-lg transition-colors ${
-                    isCollapsed ? 'justify-center py-2' : 'justify-between px-2.5 py-1.5'
-                  } ${
-                    isSelected
-                      ? 'bg-white/[0.11] text-white font-medium'
-                      : 'text-white/60 hover:bg-white/[0.04] hover:text-white'
+          {/* Active Brain + Collapsible Remaining Brains */}
+          {!isCollapsed ? (
+            <div className="space-y-0.5">
+              {/* Currently Active Brain Row */}
+              <div className="group flex items-center justify-between rounded-lg bg-white/[0.11] px-2.5 py-1.5 text-white font-medium transition-colors">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (otherBrains.length > 0) {
+                      setIsBrainsExpanded((prev) => !prev);
+                    }
+                  }}
+                  aria-expanded={otherBrains.length > 0 ? isBrainsExpanded : undefined}
+                  title={`Active Brain: ${currentBrain} (${activeBrainCount} memories)${
+                    otherBrains.length > 0
+                      ? isBrainsExpanded
+                        ? ' — Click to collapse other brains'
+                        : ' — Click to expand other brains'
+                      : ''
                   }`}
+                  className="flex min-w-0 flex-1 items-center gap-2.5 text-left text-xs focus-visible:outline-none"
                 >
-                  <button
-                    type="button"
-                    onClick={() => onSelectBrain(b)}
-                    title={`Brain: ${b} (${count} memories)`}
-                    className={`flex min-w-0 flex-1 items-center gap-2.5 text-left text-xs ${
-                      isCollapsed ? 'justify-center' : ''
-                    }`}
-                  >
-                    {!isCollapsed ? (
-                      <span
-                        className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                          isSelected ? 'bg-white' : 'bg-white/30'
-                        }`}
-                      />
-                    ) : (
-                      <span className={isSelected ? 'text-white' : 'text-white/50'}>
-                        {getBrainIcon(b)}
-                      </span>
-                    )}
-                    {!isCollapsed && (
-                      <span className="truncate capitalize whitespace-nowrap">{b}</span>
-                    )}
-                  </button>
+                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-white" />
+                  <span className="truncate capitalize whitespace-nowrap">{currentBrain}</span>
+                </button>
 
-                  {!isCollapsed && (
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      <span className="mono text-[11px] tabular-nums text-white/40">
-                        {count}
-                      </span>
-                      {brains.length > 1 && (
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onDeleteBrain(b);
-                          }}
-                          className="opacity-0 group-hover:opacity-100 text-white/35 hover:text-rose-400 transition-opacity p-0.5"
-                          title={`Delete brain "${b}"`}
-                        >
-                          <Trash2 className="h-3 w-3" />
-                        </button>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <span className="mono text-[11px] tabular-nums text-white/65">
+                    {activeBrainCount}
+                  </span>
+                  {otherBrains.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setIsBrainsExpanded((prev) => !prev)}
+                      aria-expanded={isBrainsExpanded}
+                      aria-label={
+                        isBrainsExpanded ? 'Collapse other brains' : 'Expand other brains'
+                      }
+                      title={
+                        isBrainsExpanded
+                          ? 'Hide other brains'
+                          : `Show ${otherBrains.length} other ${
+                              otherBrains.length === 1 ? 'brain' : 'brains'
+                            }`
+                      }
+                      className="flex h-5 w-5 items-center justify-center rounded text-white/55 transition hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/30"
+                    >
+                      {isBrainsExpanded ? (
+                        <ChevronDown className="h-3.5 w-3.5" />
+                      ) : (
+                        <ChevronRight className="h-3.5 w-3.5" />
                       )}
-                    </div>
+                    </button>
                   )}
                 </div>
-              );
-            })}
-          </div>
+              </div>
+
+              {/* Expanded Remaining Brains */}
+              {isBrainsExpanded &&
+                otherBrains.map((b) => {
+                  const count = brainCounts[b] || 0;
+                  return (
+                    <div
+                      key={b}
+                      className="group flex items-center justify-between rounded-lg px-2.5 py-1.5 text-white/60 transition-colors hover:bg-white/[0.04] hover:text-white"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onSelectBrain(b);
+                          setIsBrainsExpanded(false);
+                        }}
+                        title={`Switch to Brain: ${b} (${count} memories)`}
+                        className="flex min-w-0 flex-1 items-center gap-2.5 text-left text-xs focus-visible:outline-none"
+                      >
+                        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-white/30" />
+                        <span className="truncate capitalize whitespace-nowrap">{b}</span>
+                      </button>
+
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <span className="mono text-[11px] tabular-nums text-white/40">
+                          {count}
+                        </span>
+                        {brains.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onDeleteBrain(b);
+                            }}
+                            className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-white/35 hover:text-rose-400 transition-opacity p-0.5"
+                            title={`Delete brain "${b}"`}
+                            aria-label={`Delete brain ${b}`}
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+          ) : (
+            /* Collapsed Sidebar: Show only active Brain icon button */
+            <div className="space-y-0.5">
+              <div className="flex justify-center py-2 rounded-lg bg-white/[0.11] text-white font-medium">
+                <button
+                  type="button"
+                  onClick={onOpenManageBrains}
+                  title={`Active Brain: ${currentBrain} (${activeBrainCount} memories) — Click to switch or manage brains`}
+                  aria-label={`Active Brain: ${currentBrain} (${activeBrainCount} memories)`}
+                  className="flex items-center justify-center text-xs"
+                >
+                  <span className="text-white">{getBrainIcon(currentBrain)}</span>
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* SECTION 3: AI Sources */}

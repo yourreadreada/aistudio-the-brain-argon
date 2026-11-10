@@ -3642,17 +3642,57 @@ export function createBrainApp(
   });
 
   // 1d. Activity Log & Diagnostics APIs (Section 8)
-  function queryActivityLogs(query: Record<string, any>) {
-    const brain = typeof query.brain === 'string' && query.brain !== 'all' ? query.brain.trim() : '';
-    const category = typeof query.category === 'string' && query.category !== 'all' ? query.category.trim() : '';
-    const source = typeof query.source === 'string' && query.source !== 'all' ? query.source.trim() : '';
-    const status = typeof query.status === 'string' && query.status !== 'all' ? query.status.trim() : '';
-    const search = typeof query.search === 'string' ? query.search.trim().toLowerCase() : '';
-    const startDate = typeof query.startDate === 'string' ? query.startDate.trim() : '';
-    const endDate = typeof query.endDate === 'string' ? query.endDate.trim() : '';
+  function queryActivityLogs(
+    query: Record<string, any>,
+    options: { unpaginated?: boolean } = {}
+  ) {
+    const brain =
+      typeof query.brain === 'string' && query.brain !== 'all'
+        ? query.brain.trim()
+        : '';
+    const category =
+      typeof query.category === 'string' && query.category !== 'all'
+        ? query.category.trim()
+        : '';
+    const source =
+      typeof query.source === 'string' && query.source !== 'all'
+        ? query.source.trim()
+        : '';
+    const status =
+      typeof query.status === 'string' && query.status !== 'all'
+        ? query.status.trim()
+        : '';
+    const search =
+      typeof query.search === 'string' ? query.search.trim().toLowerCase() : '';
+    const startDate =
+      typeof query.startDate === 'string'
+        ? query.startDate.trim()
+        : typeof query.fromDate === 'string'
+        ? query.fromDate.trim()
+        : '';
+    const endDate =
+      typeof query.endDate === 'string'
+        ? query.endDate.trim()
+        : typeof query.toDate === 'string'
+        ? query.toDate.trim()
+        : '';
     const sort = typeof query.sort === 'string' ? query.sort.trim() : 'newest';
-    const rawLimit = parseInt(String(query.limit || '500'), 10);
-    const limit = Math.min(2000, Math.max(1, Number.isFinite(rawLimit) ? rawLimit : 500));
+
+    const rawPageSize = parseInt(
+      String(query.pageSize || query.limit || '50'),
+      10
+    );
+    const pageSize = Math.min(
+      2000,
+      Math.max(1, Number.isFinite(rawPageSize) ? rawPageSize : 50)
+    );
+    const rawPage = parseInt(String(query.page || '1'), 10);
+    const page = Math.max(1, Number.isFinite(rawPage) ? rawPage : 1);
+    const rawOffset =
+      query.offset !== undefined ? parseInt(String(query.offset), 10) : NaN;
+    const offset = Number.isFinite(rawOffset)
+      ? Math.max(0, rawOffset)
+      : (page - 1) * pageSize;
 
     const clauses: string[] = [];
     const params: any[] = [];
@@ -3679,11 +3719,13 @@ export function createBrainApp(
     }
     if (endDate) {
       clauses.push('timestamp <= ?');
-      params.push(endDate.includes('T') ? endDate : `${endDate}T23:59:59.999Z`);
+      params.push(
+        endDate.includes('T') ? endDate : `${endDate}T23:59:59.999Z`
+      );
     }
     if (search) {
       clauses.push(
-        '(LOWER(summary) LIKE ? OR LOWER(COALESCE(file_name, \'\')) LIKE ? OR LOWER(COALESCE(category, \'\')) LIKE ? OR LOWER(COALESCE(batch_or_backup_id, \'\')) LIKE ? OR CAST(COALESCE(record_id, \'\') AS TEXT) LIKE ?)'
+        "(LOWER(summary) LIKE ? OR LOWER(COALESCE(file_name, '')) LIKE ? OR LOWER(COALESCE(category, '')) LIKE ? OR LOWER(COALESCE(batch_or_backup_id, '')) LIKE ? OR CAST(COALESCE(record_id, '') AS TEXT) LIKE ?)"
       );
       const pat = `%${search}%`;
       params.push(pat, pat, pat, pat, pat);
@@ -3691,19 +3733,32 @@ export function createBrainApp(
 
     const whereSql = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     const orderSql =
-      sort === 'oldest'
-        ? 'ORDER BY timestamp ASC'
+      sort === 'oldest' || sort === 'asc'
+        ? 'ORDER BY timestamp ASC, id ASC'
         : sort === 'category'
-        ? 'ORDER BY category ASC, timestamp DESC'
+        ? 'ORDER BY category ASC, timestamp DESC, id DESC'
         : sort === 'status'
-        ? 'ORDER BY status ASC, timestamp DESC'
-        : 'ORDER BY timestamp DESC';
+        ? 'ORDER BY status ASC, timestamp DESC, id DESC'
+        : 'ORDER BY timestamp DESC, id DESC';
 
-    const rows = db
-      .prepare(`SELECT * FROM activity_logs ${whereSql} ${orderSql} LIMIT ?`)
-      .all(...params, limit) as any[];
+    const countRow = db
+      .prepare(`SELECT COUNT(*) as total FROM activity_logs ${whereSql}`)
+      .get(...params) as { total: number } | undefined;
+    const total = Number(countRow?.total || 0);
 
-    return rows.map((r) => {
+    const rows = (
+      options.unpaginated
+        ? db
+            .prepare(`SELECT * FROM activity_logs ${whereSql} ${orderSql}`)
+            .all(...params)
+        : db
+            .prepare(
+              `SELECT * FROM activity_logs ${whereSql} ${orderSql} LIMIT ? OFFSET ?`
+            )
+            .all(...params, pageSize, offset)
+    ) as any[];
+
+    const logs = rows.map((r) => {
       let details: any = undefined;
       try {
         if (r.details_json) details = redactSecrets(JSON.parse(r.details_json));
@@ -3726,12 +3781,25 @@ export function createBrainApp(
         recoveryAction: r.recovery_action || undefined,
       };
     });
+
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const hasMore = offset + logs.length < total;
+
+    return {
+      logs,
+      total,
+      page,
+      pageSize,
+      offset,
+      totalPages,
+      hasMore,
+    };
   }
 
   app.get('/api/activity-logs', (req: Request, res: Response) => {
     try {
-      const logs = queryActivityLogs(req.query);
-      res.json({ logs, total: logs.length });
+      const result = queryActivityLogs(req.query);
+      res.json(result);
     } catch (err: any) {
       res.status(500).json({
         error: err?.message || 'Failed to query activity logs',
@@ -3772,7 +3840,7 @@ export function createBrainApp(
   app.get('/api/activity-logs/export', (req: Request, res: Response) => {
     try {
       const format = String(req.query.format || 'json').toLowerCase();
-      const logs = queryActivityLogs({ ...req.query, limit: '2000' });
+      const { logs } = queryActivityLogs(req.query, { unpaginated: true });
       const stamp = new Date().toISOString().slice(0, 10);
 
       if (format === 'csv') {

@@ -3539,9 +3539,22 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
     search?: string;
     fromDate?: string;
     toDate?: string;
-    sort?: 'newest' | 'oldest';
+    sort?: 'newest' | 'oldest' | 'desc' | 'asc';
+    page?: number;
+    pageSize?: number;
+    offset?: number;
     limit?: number;
-  }): Promise<{ total: number; logs: ActivityLogEntry[] }> {
+  }): Promise<{
+    total: number;
+    page: number;
+    pageSize: number;
+    totalPages: number;
+    hasMore: boolean;
+    logs: ActivityLogEntry[];
+  }> {
+    const requestedPage = Math.max(1, filters?.page || 1);
+    const requestedPageSize = Math.max(1, filters?.pageSize || filters?.limit || 50);
+
     try {
       const params = new URLSearchParams();
       if (filters?.category) params.set('category', filters.category);
@@ -3552,20 +3565,36 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
       if (filters?.fromDate) params.set('fromDate', filters.fromDate);
       if (filters?.toDate) params.set('toDate', filters.toDate);
       if (filters?.sort) params.set('sort', filters.sort);
-      if (filters?.limit) params.set('limit', String(filters.limit));
+      params.set('page', String(requestedPage));
+      params.set('pageSize', String(requestedPageSize));
+      if (filters?.offset !== undefined) params.set('offset', String(filters.offset));
 
       const res = await fetch(`${API_BASE}/api/activity-logs?${params.toString()}`);
       if (res.ok) {
         const data = await res.json();
+        const logs: ActivityLogEntry[] = Array.isArray(data.logs) ? data.logs : [];
+        const total = typeof data.total === 'number' ? data.total : logs.length;
+        const page = typeof data.page === 'number' ? data.page : requestedPage;
+        const pageSize = typeof data.pageSize === 'number' ? data.pageSize : requestedPageSize;
+        const totalPages =
+          typeof data.totalPages === 'number'
+            ? data.totalPages
+            : Math.max(1, Math.ceil(total / pageSize));
+        const hasMore =
+          typeof data.hasMore === 'boolean' ? data.hasMore : page < totalPages;
         return {
-          total: data.total ?? (Array.isArray(data.logs) ? data.logs.length : 0),
-          logs: Array.isArray(data.logs) ? data.logs : [],
+          total,
+          page,
+          pageSize,
+          totalPages,
+          hasMore,
+          logs,
         };
       }
     } catch {}
 
-    // Offline fallback mapped from local recent activities
-    const fallbackLogs: ActivityLogEntry[] = this.activities.map((a) => ({
+    // Offline fallback mapped from local recent activities with client-side filter & pagination
+    let fallbackLogs: ActivityLogEntry[] = this.activities.map((a) => ({
       id: a.id,
       timestamp: a.timestamp,
       category:
@@ -3581,7 +3610,46 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
       factId: a.factId,
       summary: a.snippet,
     }));
-    return { total: fallbackLogs.length, logs: fallbackLogs };
+
+    if (filters?.category && filters.category !== 'all') {
+      fallbackLogs = fallbackLogs.filter((l) => l.category === filters.category);
+    }
+    if (filters?.status && filters.status !== 'all') {
+      fallbackLogs = fallbackLogs.filter((l) => l.status === filters.status);
+    }
+    if (filters?.source && filters.source !== 'all') {
+      fallbackLogs = fallbackLogs.filter((l) => l.source === filters.source);
+    }
+    if (filters?.search) {
+      const q = filters.search.toLowerCase();
+      fallbackLogs = fallbackLogs.filter(
+        (l) =>
+          l.summary.toLowerCase().includes(q) ||
+          (l.category && l.category.toLowerCase().includes(q))
+      );
+    }
+
+    fallbackLogs.sort((a, b) => {
+      const ta = new Date(a.timestamp).getTime();
+      const tb = new Date(b.timestamp).getTime();
+      return filters?.sort === 'oldest' || filters?.sort === 'asc'
+        ? ta - tb
+        : tb - ta;
+    });
+
+    const total = fallbackLogs.length;
+    const totalPages = Math.max(1, Math.ceil(total / requestedPageSize));
+    const start = (requestedPage - 1) * requestedPageSize;
+    const pagedLogs = fallbackLogs.slice(start, start + requestedPageSize);
+
+    return {
+      total,
+      page: requestedPage,
+      pageSize: requestedPageSize,
+      totalPages,
+      hasMore: start + pagedLogs.length < total,
+      logs: pagedLogs,
+    };
   }
 
   public async recordAuditLog(entry: {
