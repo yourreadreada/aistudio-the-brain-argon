@@ -66,8 +66,8 @@ function formatRelativeTimestamp(isoString?: string | null): string {
   return date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
-function formatFullTimestamp(isoString?: string | null): string {
-  if (!isoString) return 'Unknown';
+export function formatFullTimestamp(isoString?: string | null): string {
+  if (!isoString) return 'Not recorded';
   const d = new Date(isoString);
   if (Number.isNaN(d.getTime())) return isoString;
   return d.toLocaleString(undefined, {
@@ -77,6 +77,65 @@ function formatFullTimestamp(isoString?: string | null): string {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+export interface NodeTimestampSummary {
+  createdAdded: string;
+  createdAddedRaw: string | null;
+  originalDocumentDate: string;
+  originalDocumentDateRaw: string | null;
+  importedAt: string;
+  importedAtRaw: string | null;
+  lastModified: string;
+  lastModifiedRaw: string | null;
+  updatedAt: string;
+  updatedAtRaw: string | null;
+  hasSeparateUpdate: boolean;
+}
+
+/**
+ * Extracts and formats all node timestamp metadata using existing database fields
+ * without fabricating missing dates. Keeps the Timeline and Node Inspector consistent.
+ */
+export function getNodeTimestampSummary(fact: Fact): NodeTimestampSummary {
+  const createdAddedRaw = fact.created_at || null;
+  const originalDocumentDateRaw = fact.originalCreatedAt || null;
+  const importedAtRaw = fact.importedAt || null;
+  const lastModifiedRaw = fact.updated_at || fact.created_at || null;
+  const baselineRaw = fact.importedAt || fact.created_at || null;
+  const hasSeparateUpdate = Boolean(
+    fact.updated_at &&
+      baselineRaw &&
+      fact.updated_at !== fact.created_at &&
+      fact.updated_at !== fact.importedAt
+  );
+  const updatedAtRaw = fact.updated_at || null;
+
+  return {
+    createdAdded: createdAddedRaw
+      ? formatFullTimestamp(createdAddedRaw)
+      : 'Not recorded',
+    createdAddedRaw,
+    originalDocumentDate: originalDocumentDateRaw
+      ? formatFullTimestamp(originalDocumentDateRaw)
+      : 'Not specified in document',
+    originalDocumentDateRaw,
+    importedAt: importedAtRaw
+      ? formatFullTimestamp(importedAtRaw)
+      : 'Direct entry (not file-imported)',
+    importedAtRaw,
+    lastModified: lastModifiedRaw
+      ? formatFullTimestamp(lastModifiedRaw)
+      : 'Not recorded',
+    lastModifiedRaw,
+    updatedAt: updatedAtRaw
+      ? hasSeparateUpdate
+        ? formatFullTimestamp(updatedAtRaw)
+        : `${formatFullTimestamp(updatedAtRaw)} (initial)`
+      : 'Not recorded',
+    updatedAtRaw,
+    hasSeparateUpdate,
+  };
 }
 
 function formatBytes(bytes?: number): string {
@@ -153,10 +212,11 @@ export const FactPanel: React.FC<FactPanelProps> = ({
     return present;
   }, [allBrainFacts, activeSourceKey]);
 
-  // Compute deterministic workspace relationships for the active fact
+  // Compute deterministic workspace relationships only when an active fact is inspected
   const workspaceEdges = useMemo(() => {
+    if (!fact) return [];
     return brainStore.computeWorkspaceRelationships(allBrainFacts);
-  }, [allBrainFacts]);
+  }, [fact, allBrainFacts]);
 
   const factRelationships = useMemo(() => {
     if (!fact) return { provenance: [], semanticAndExplicit: [] };
@@ -924,50 +984,87 @@ export const FactPanel: React.FC<FactPanelProps> = ({
         </div>
 
         {/* Section 5.B: Provenance & Timestamp Metadata Grid */}
-        <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3.5 space-y-2 text-[11px]">
-          <div className="flex items-center gap-1.5 mono text-[10px] font-semibold uppercase tracking-wider text-white/50">
-            <FolderGit2 className="h-3.5 w-3.5 text-emerald-400" />
-            <span>Provenance & Chronology</span>
-          </div>
+        {(() => {
+          const tsSummary = getNodeTimestampSummary(fact);
+          return (
+            <div
+              className="rounded-xl border border-white/10 bg-white/[0.02] p-3.5 space-y-2 text-[11px]"
+              data-testid="node-timestamp-metadata"
+            >
+              <div className="flex items-center gap-1.5 mono text-[10px] font-semibold uppercase tracking-wider text-white/50">
+                <FolderGit2 className="h-3.5 w-3.5 text-emerald-400" />
+                <span>Provenance & Chronology</span>
+              </div>
 
-          <dl className="grid grid-cols-1 gap-1.5 pt-1">
-            {fact.filePath && (
-              <div className="flex items-start justify-between gap-2 border-b border-white/[0.05] pb-1">
-                <dt className="text-white/45 shrink-0">File Path</dt>
-                <dd className="mono text-right text-white/90 break-all">{fact.filePath}</dd>
-              </div>
-            )}
-            {fact.sourceFolder && (
-              <div className="flex items-center justify-between gap-2 border-b border-white/[0.05] pb-1">
-                <dt className="text-white/45">Source Folder</dt>
-                <dd className="mono text-emerald-300">{fact.sourceFolder}</dd>
-              </div>
-            )}
-            <div className="flex items-center justify-between gap-2 border-b border-white/[0.05] pb-1">
-              <dt className="text-white/45">Original Doc Date</dt>
-              <dd className="mono text-white/85">
-                {fact.originalCreatedAt ? formatFullTimestamp(fact.originalCreatedAt) : 'Unknown'}
-              </dd>
+              <dl className="grid grid-cols-1 gap-1.5 pt-1">
+                {fact.filePath && (
+                  <div className="flex items-start justify-between gap-2 border-b border-white/[0.05] pb-1">
+                    <dt className="text-white/45 shrink-0">File Path</dt>
+                    <dd className="mono text-right text-white/90 break-all">{fact.filePath}</dd>
+                  </div>
+                )}
+                {fact.sourceFolder && (
+                  <div className="flex items-center justify-between gap-2 border-b border-white/[0.05] pb-1">
+                    <dt className="text-white/45">Source Folder</dt>
+                    <dd className="mono text-emerald-300">{fact.sourceFolder}</dd>
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-2 border-b border-white/[0.05] pb-1">
+                  <dt className="text-white/45">Created / Added</dt>
+                  <dd className="mono text-white/85" data-testid="meta-created-added">
+                    {tsSummary.createdAdded}
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between gap-2 border-b border-white/[0.05] pb-1">
+                  <dt className="text-white/45">Original Document Date</dt>
+                  <dd
+                    className={`mono ${
+                      tsSummary.originalDocumentDateRaw ? 'text-white/85' : 'text-white/45'
+                    }`}
+                    data-testid="meta-original-doc-date"
+                  >
+                    {tsSummary.originalDocumentDate}
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between gap-2 border-b border-white/[0.05] pb-1">
+                  <dt className="text-white/45">Imported At</dt>
+                  <dd
+                    className={`mono ${
+                      tsSummary.importedAtRaw ? 'text-white/85' : 'text-white/45'
+                    }`}
+                    data-testid="meta-imported-at"
+                  >
+                    {tsSummary.importedAt}
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between gap-2 border-b border-white/[0.05] pb-1">
+                  <dt className="text-white/45">Last Modified</dt>
+                  <dd className="mono text-white/85" data-testid="meta-last-modified">
+                    {tsSummary.lastModified}
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between gap-2 border-b border-white/[0.05] pb-1">
+                  <dt className="text-white/45">Updated At</dt>
+                  <dd
+                    className={`mono ${
+                      tsSummary.hasSeparateUpdate ? 'text-emerald-300' : 'text-white/65'
+                    }`}
+                    data-testid="meta-updated-at"
+                  >
+                    {tsSummary.updatedAt}
+                  </dd>
+                </div>
+                <div className="flex items-center justify-between gap-2">
+                  <dt className="text-white/45">Size & Checksum</dt>
+                  <dd className="mono text-white/75">
+                    {formatBytes(fact.fileSizeBytes || fact.content.length)} ·{' '}
+                    {fact.checksum || `${fact.content.length} chars`}
+                  </dd>
+                </div>
+              </dl>
             </div>
-            <div className="flex items-center justify-between gap-2 border-b border-white/[0.05] pb-1">
-              <dt className="text-white/45">Imported / Created</dt>
-              <dd className="mono text-white/80">
-                {formatFullTimestamp(fact.importedAt || fact.created_at)}
-              </dd>
-            </div>
-            <div className="flex items-center justify-between gap-2 border-b border-white/[0.05] pb-1">
-              <dt className="text-white/45">Last Modified</dt>
-              <dd className="mono text-white/80">{formatFullTimestamp(fact.updated_at)}</dd>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <dt className="text-white/45">Size & Checksum</dt>
-              <dd className="mono text-white/75">
-                {formatBytes(fact.fileSizeBytes || fact.content.length)} ·{' '}
-                {fact.checksum || `${fact.content.length} chars`}
-              </dd>
-            </div>
-          </dl>
-        </div>
+          );
+        })()}
 
         {/* Section 5.C: Format-Aware Document & Content Viewer Tabs */}
         <div className="border-t border-white/10 pt-4 space-y-3">

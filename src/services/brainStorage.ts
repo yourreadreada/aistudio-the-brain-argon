@@ -3371,8 +3371,22 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
     return data;
   }
 
+  private relationshipCacheKey = '';
+  private relationshipCacheEdges: GraphRelationshipEdge[] = [];
+
   // --- Section 2: Deterministic Graph Relationship Engine (shared by Radial, Force, and Inspector) ---
   public computeWorkspaceRelationships(facts: Fact[]): GraphRelationshipEdge[] {
+    if (!facts || facts.length === 0) return [];
+
+    // Fast deterministic fingerprint cache so BrainViewerCanvas and FactPanel share computed edges in O(1)
+    const first = facts[0];
+    const last = facts[facts.length - 1];
+    const mid = facts[facts.length >> 1];
+    const cacheKey = `${facts.length}:${first?.id ?? 0}:${first?.updated_at ?? ''}:${mid?.id ?? 0}:${last?.id ?? 0}:${last?.updated_at ?? ''}`;
+    if (this.relationshipCacheKey === cacheKey) {
+      return this.relationshipCacheEdges;
+    }
+
     const edges: GraphRelationshipEdge[] = [];
     const seenEdgeIds = new Set<string>();
     const genericTags = new Set([
@@ -3394,8 +3408,18 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
       edges.push(edge);
     };
 
-    // 1. Source relationships (Fact -> Source Hub) & Explicit Cross-Source relationships
-    for (const fact of facts) {
+    const n = facts.length;
+    const cleanTagsByIdx: string[][] = new Array(n);
+    const tagSetByIdx: Set<string>[] = new Array(n);
+    const topicLowerByIdx: (string | null)[] = new Array(n);
+
+    const byFixtureId = new Map<string, number[]>();
+    const byTopicKey = new Map<string, number[]>();
+    const byTag = new Map<string, number[]>();
+
+    // 1. Single O(N) pass: Source edges, Hierarchy edges, Cross-Source edges, and Inverted Index construction
+    for (let i = 0; i < n; i++) {
+      const fact = facts[i];
       addEdge({
         id: `src-${fact.id}-${fact.source}`,
         fromId: `fact-${fact.id}`,
@@ -3435,65 +3459,166 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
           }
         }
       }
+
+      if (fact.fixtureId) {
+        const list = byFixtureId.get(fact.fixtureId);
+        if (list) list.push(i);
+        else byFixtureId.set(fact.fixtureId, [i]);
+      }
+
+      const tLower = fact.topicKey ? fact.topicKey.toLowerCase().trim() : null;
+      topicLowerByIdx[i] = tLower;
+      if (tLower) {
+        const list = byTopicKey.get(tLower);
+        if (list) list.push(i);
+        else byTopicKey.set(tLower, [i]);
+      }
+
+      const rawTags = fact.tags || [];
+      const filteredTags: string[] = [];
+      for (let k = 0; k < rawTags.length; k++) {
+        const norm = rawTags[k].toLowerCase().trim();
+        if (norm && !genericTags.has(norm)) {
+          filteredTags.push(norm);
+        }
+      }
+      cleanTagsByIdx[i] = filteredTags;
+      tagSetByIdx[i] = new Set(filteredTags);
+
+      for (let k = 0; k < filteredTags.length; k++) {
+        const tag = filteredTags[k];
+        const list = byTag.get(tag);
+        if (list) list.push(i);
+        else byTag.set(tag, [i]);
+      }
     }
 
-    // 2. Pairwise Explicit & Semantic Fact-to-Fact Relationships
-    // Use deterministic scoring across topicKey, fixture references, and specific domain tags
+    // 2. Explicit Fixture Links (shared fixtureId or content mention of a known fixtureId)
+    const explicitFixturePairs = new Set<string>();
+    const addFixtureEdge = (idxA: number, idxB: number, refId: string) => {
+      if (idxA === idxB) return;
+      const a = facts[idxA];
+      const b = facts[idxB];
+      const minId = Math.min(a.id, b.id);
+      const maxId = Math.max(a.id, b.id);
+      const pairKey = `${minId}-${maxId}`;
+      explicitFixturePairs.add(pairKey);
+      addEdge({
+        id: `exp-fixture-${minId}-${maxId}`,
+        fromId: `fact-${a.id}`,
+        toId: `fact-${b.id}`,
+        type: 'explicit',
+        score: 0.95,
+        label: `Fixture Link: ${refId}`,
+        explanation: `Explicit fixture cross-reference (${refId}) between Node #${a.id} and Node #${b.id}.`,
+        sharedTerms: refId ? [refId] : undefined,
+      });
+    };
+
+    // 2a. Nodes sharing the same fixtureId
+    for (const [refId, indices] of byFixtureId.entries()) {
+      for (let p = 0; p < indices.length; p++) {
+        for (let q = p + 1; q < indices.length; q++) {
+          addFixtureEdge(indices[p], indices[q], refId);
+        }
+      }
+    }
+
+    // 2b. Content cross-references to known fixtureIds (e.g. F-001 or BRAIN-GRAPH-...)
+    if (byFixtureId.size > 0) {
+      const fixturePattern = /\b(?:F-\d{3,4}|BRAIN-[A-Z0-9-]+)\b/g;
+      for (let i = 0; i < n; i++) {
+        const content = facts[i].content;
+        if (!content) continue;
+        const matches = content.match(fixturePattern);
+        if (!matches) continue;
+        for (let m = 0; m < matches.length; m++) {
+          const token = matches[m];
+          const targets = byFixtureId.get(token);
+          if (!targets) continue;
+          for (let t = 0; t < targets.length; t++) {
+            addFixtureEdge(i, targets[t], token);
+          }
+        }
+      }
+    }
+
+    // 3. Semantic Fact-to-Fact Relationships via Inverted Indices (byTopicKey & byTag)
     const perNodeSemanticCount = new Map<number, number>();
     const MAX_SEMANTIC_EDGES_PER_NODE = 4;
+    const candidateTagCount = new Int32Array(n);
+    const touchedCandidates: number[] = [];
 
-    for (let i = 0; i < facts.length; i++) {
+    for (let i = 0; i < n; i++) {
       const a = facts[i];
-      const aTags = (a.tags || [])
-        .map((t) => t.toLowerCase().trim())
-        .filter((t) => t && !genericTags.has(t));
-      const aTagSet = new Set(aTags);
+      let countA = perNodeSemanticCount.get(a.id) || 0;
+      if (countA >= MAX_SEMANTIC_EDGES_PER_NODE) continue;
 
-      for (let j = i + 1; j < facts.length; j++) {
+      const aTags = cleanTagsByIdx[i];
+      const aTagSet = tagSetByIdx[i];
+      const aTopic = topicLowerByIdx[i];
+
+      touchedCandidates.length = 0;
+
+      // Mark candidates sharing topicKey
+      if (aTopic) {
+        const topicPeers = byTopicKey.get(aTopic);
+        if (topicPeers) {
+          for (let p = 0; p < topicPeers.length; p++) {
+            const j = topicPeers[p];
+            if (j <= i) continue;
+            if (candidateTagCount[j] === 0) {
+              touchedCandidates.push(j);
+            }
+            // Use +100 sentinel to indicate sharedTopic is true
+            candidateTagCount[j] += 100;
+          }
+        }
+      }
+
+      // Accumulate shared tag counts for candidates j > i
+      for (let k = 0; k < aTags.length; k++) {
+        const tagPeers = byTag.get(aTags[k]);
+        if (!tagPeers) continue;
+        for (let p = 0; p < tagPeers.length; p++) {
+          const j = tagPeers[p];
+          if (j <= i) continue;
+          if (candidateTagCount[j] === 0) {
+            touchedCandidates.push(j);
+          }
+          candidateTagCount[j] += 1;
+        }
+      }
+
+      if (touchedCandidates.length === 0) continue;
+
+      // Sort touched candidate indices in ascending order to preserve deterministic pair order
+      touchedCandidates.sort((x, y) => x - y);
+
+      for (let c = 0; c < touchedCandidates.length; c++) {
+        const j = touchedCandidates[c];
+        const rawScoreSignal = candidateTagCount[j];
+        candidateTagCount[j] = 0; // Reset scratchpad entry immediately
+
+        if (countA >= MAX_SEMANTIC_EDGES_PER_NODE) continue;
+
+        const hasTopicMatch = rawScoreSignal >= 100;
+        const sharedTagCount = rawScoreSignal % 100;
+        if (!hasTopicMatch && sharedTagCount < 2) continue;
+
         const b = facts[j];
+        const countB = perNodeSemanticCount.get(b.id) || 0;
+        if (countB >= MAX_SEMANTIC_EDGES_PER_NODE) continue;
+
         const minId = Math.min(a.id, b.id);
         const maxId = Math.max(a.id, b.id);
+        if (explicitFixturePairs.has(`${minId}-${maxId}`)) continue;
 
-        // Explicit: shared or referenced fixtureId
-        if (
-          (a.fixtureId && b.fixtureId && a.fixtureId === b.fixtureId) ||
-          (a.fixtureId && b.content.includes(a.fixtureId)) ||
-          (b.fixtureId && a.content.includes(b.fixtureId))
-        ) {
-          const refId = a.fixtureId || b.fixtureId;
-          addEdge({
-            id: `exp-fixture-${minId}-${maxId}`,
-            fromId: `fact-${a.id}`,
-            toId: `fact-${b.id}`,
-            type: 'explicit',
-            score: 0.95,
-            label: `Fixture Link: ${refId}`,
-            explanation: `Explicit fixture cross-reference (${refId}) between Node #${a.id} and Node #${b.id}.`,
-            sharedTerms: refId ? [refId] : undefined,
-          });
-          continue;
-        }
+        const sharedTopic = hasTopicMatch ? a.topicKey || b.topicKey || null : null;
+        const bTags = cleanTagsByIdx[j];
+        const sharedTags = sharedTagCount > 0 ? bTags.filter((t) => aTagSet.has(t)) : [];
 
-        // Semantic: shared topicKey or specific domain tags
-        const sharedTopic =
-          a.topicKey && b.topicKey && a.topicKey.toLowerCase() === b.topicKey.toLowerCase()
-            ? a.topicKey
-            : null;
-
-        const bTags = (b.tags || [])
-          .map((t) => t.toLowerCase().trim())
-          .filter((t) => t && !genericTags.has(t));
-        const sharedTags = bTags.filter((t) => aTagSet.has(t));
-
-        if (!sharedTopic && sharedTags.length < 2) continue;
-
-        const countA = perNodeSemanticCount.get(a.id) || 0;
-        const countB = perNodeSemanticCount.get(b.id) || 0;
-        if (countA >= MAX_SEMANTIC_EDGES_PER_NODE || countB >= MAX_SEMANTIC_EDGES_PER_NODE) {
-          continue;
-        }
-
-        const unionSize = new Set([...aTags, ...bTags]).size || 1;
+        const unionSize = aTags.length + bTags.length - sharedTags.length || 1;
         const tagJaccard = sharedTags.length / unionSize;
         const score = Math.min(
           0.96,
@@ -3522,11 +3647,14 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
           sharedTerms,
         });
 
-        perNodeSemanticCount.set(a.id, countA + 1);
+        countA++;
+        perNodeSemanticCount.set(a.id, countA);
         perNodeSemanticCount.set(b.id, countB + 1);
       }
     }
 
+    this.relationshipCacheKey = cacheKey;
+    this.relationshipCacheEdges = edges;
     return edges;
   }
 

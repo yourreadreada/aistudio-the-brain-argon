@@ -49,7 +49,7 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
   totalFactsCount = 0,
 }) => {
   return (
-    <header className="relative z-20 flex h-14 w-full shrink-0 items-center justify-between gap-4 border-b border-white/10 bg-[#050710]/90 px-4 md:px-6 backdrop-blur-xl">
+    <header className="relative z-30 flex h-14 w-full shrink-0 items-center justify-between gap-4 border-b border-white/10 bg-[#050710]/90 px-4 md:px-6 backdrop-blur-xl">
       {/* Zone 1: Mobile Sidebar Toggle & Contextual Breadcrumb */}
       <div className="flex items-center gap-3 min-w-0 shrink-0">
         {onToggleMobileSidebar && (
@@ -104,7 +104,7 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
       </div>
 
       {/* Zone 2: Global Search Bar */}
-      <div className="flex flex-1 items-center justify-center max-w-md">
+      <div className="flex flex-1 items-center justify-center max-w-lg">
         <GlobalSearchBar
           currentBrain={currentBrain}
           filterQuery={searchQuery}

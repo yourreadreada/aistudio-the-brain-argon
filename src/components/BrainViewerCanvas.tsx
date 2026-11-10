@@ -4,18 +4,258 @@ import {
   Fact,
   AISource,
   FactFileType,
+  GraphRelationshipEdge,
   GraphRelationshipType,
   SOURCE_PALETTE,
   FILE_TYPE_CONFIG,
   getFactFileType,
 } from '../types/brain';
 import { brainStore } from '../services/brainStorage';
+import { getNodeTimestampSummary } from './FactPanel';
 
 export type GraphLayoutMode = 'radial' | 'force' | 'timeline';
+
+export interface GraphSearchHighlightState {
+  isSearchActive: boolean;
+  matchingFactIds: Set<number>;
+  dimmedFactIds: Set<number>;
+  matchingSourceIds: Set<AISource>;
+  highlightedEdgeIds: Set<string>;
+}
+
+/**
+ * Computes which graph nodes and relationship edges should be highlighted vs dimmed
+ * while a search query is active. Clearing the search returns `isSearchActive: false`.
+ */
+export function computeGraphSearchHighlightState(
+  facts: Fact[],
+  edges: GraphRelationshipEdge[],
+  searchQuery: string,
+  searchMatchIds?: ReadonlySet<number> | null,
+  brainName = 'coding'
+): GraphSearchHighlightState {
+  const trimmed = (searchQuery || '').trim();
+  const isSearchActive = Boolean(trimmed.length > 0 || (searchMatchIds && searchMatchIds.size > 0));
+  const matchingFactIds = new Set<number>();
+  const dimmedFactIds = new Set<number>();
+  const matchingSourceIds = new Set<AISource>();
+  const highlightedEdgeIds = new Set<string>();
+
+  if (!isSearchActive) {
+    return {
+      isSearchActive: false,
+      matchingFactIds,
+      dimmedFactIds,
+      matchingSourceIds,
+      highlightedEdgeIds,
+    };
+  }
+
+  if (searchMatchIds) {
+    for (const f of facts) {
+      if (searchMatchIds.has(f.id)) {
+        matchingFactIds.add(f.id);
+        matchingSourceIds.add(f.source);
+      } else {
+        dimmedFactIds.add(f.id);
+      }
+    }
+  } else {
+    const recalled = brainStore.recall(brainName, trimmed, null, null);
+    const recalledIds = new Set(recalled.map((f) => f.id));
+    const lower = trimmed.toLowerCase();
+    for (const f of facts) {
+      const matched =
+        recalledIds.has(f.id) ||
+        (f.documentTitle && f.documentTitle.toLowerCase().includes(lower)) ||
+        (f.fileName && f.fileName.toLowerCase().includes(lower)) ||
+        (f.filePath && f.filePath.toLowerCase().includes(lower)) ||
+        (f.fixtureId && f.fixtureId.toLowerCase().includes(lower)) ||
+        (f.topicKey && f.topicKey.toLowerCase().includes(lower)) ||
+        f.content.toLowerCase().includes(lower) ||
+        (Array.isArray(f.tags) && f.tags.some((t) => t.toLowerCase().includes(lower)));
+      if (matched) {
+        matchingFactIds.add(f.id);
+        matchingSourceIds.add(f.source);
+      } else {
+        dimmedFactIds.add(f.id);
+      }
+    }
+  }
+
+  for (const edge of edges) {
+    const fromFactId = edge.fromId.startsWith('fact-')
+      ? Number(edge.fromId.slice(5))
+      : null;
+    const toFactId = edge.toId.startsWith('fact-')
+      ? Number(edge.toId.slice(5))
+      : null;
+
+    if (fromFactId !== null && toFactId !== null) {
+      if (matchingFactIds.has(fromFactId) && matchingFactIds.has(toFactId)) {
+        highlightedEdgeIds.add(edge.id);
+      }
+    } else if (fromFactId !== null && edge.toId.startsWith('source-')) {
+      if (matchingFactIds.has(fromFactId)) {
+        highlightedEdgeIds.add(edge.id);
+      }
+    }
+  }
+
+  return {
+    isSearchActive: true,
+    matchingFactIds,
+    dimmedFactIds,
+    matchingSourceIds,
+    highlightedEdgeIds,
+  };
+}
+
+/**
+ * Spatial-grid accelerated Force-Directed layout solver that scales smoothly from
+ * 10 nodes to 5,000+ nodes without O(N^2) main-thread blocking.
+ */
+export function applySpatialGridForceLayout(
+  nodeList: {
+    id: string;
+    isCenter?: boolean;
+    isSourceHub?: boolean;
+    unclusteredBaseX: number;
+    unclusteredBaseY: number;
+  }[],
+  lineList: {
+    a: number;
+    b: number;
+    relationshipType: GraphRelationshipType;
+  }[],
+  isLarge: boolean
+): void {
+  const n = nodeList.length;
+  if (n <= 1) return;
+
+  const iterations = n <= 250 ? 36 : n <= 1200 ? 18 : 10;
+  const useSpatialGrid = n > 180;
+  const cellSize = 95;
+
+  for (let iter = 0; iter < iterations; iter++) {
+    const damping = 1 - iter / (iterations * 1.15);
+
+    if (!useSpatialGrid) {
+      for (let i = 1; i < n; i++) {
+        const na = nodeList[i];
+        for (let j = i + 1; j < n; j++) {
+          const nb = nodeList[j];
+          const dx = nb.unclusteredBaseX - na.unclusteredBaseX;
+          const dy = nb.unclusteredBaseY - na.unclusteredBaseY;
+          const distSq = Math.max(36, dx * dx + dy * dy);
+          const minDist = na.isSourceHub || nb.isSourceHub ? 115 : isLarge ? 30 : 38;
+          if (distSq < minDist * minDist) {
+            const dist = Math.sqrt(distSq);
+            const push = ((minDist - dist) / dist) * 0.24 * damping;
+            if (!na.isCenter) {
+              na.unclusteredBaseX -= dx * push;
+              na.unclusteredBaseY -= dy * push;
+            }
+            if (!nb.isCenter) {
+              nb.unclusteredBaseX += dx * push;
+              nb.unclusteredBaseY += dy * push;
+            }
+          }
+        }
+      }
+    } else {
+      // Spatial hash grid for O(N) local repulsion on 200 to 5,000+ nodes
+      const grid = new Map<number, number[]>();
+      for (let i = 1; i < n; i++) {
+        const nd = nodeList[i];
+        const gx = Math.floor(nd.unclusteredBaseX / cellSize);
+        const gy = Math.floor(nd.unclusteredBaseY / cellSize);
+        const key = ((gx + 32768) << 16) | ((gy + 32768) & 0xffff);
+        const bucket = grid.get(key);
+        if (bucket) {
+          // Cap bucket density check to prevent worst-case super-cluster quadratic blowup
+          if (bucket.length < 32) bucket.push(i);
+        } else {
+          grid.set(key, [i]);
+        }
+      }
+
+      for (let i = 1; i < n; i++) {
+        const na = nodeList[i];
+        const gx = Math.floor(na.unclusteredBaseX / cellSize);
+        const gy = Math.floor(na.unclusteredBaseY / cellSize);
+
+        for (let ox = -1; ox <= 1; ox++) {
+          for (let oy = -1; oy <= 1; oy++) {
+            const key = ((gx + ox + 32768) << 16) | ((gy + oy + 32768) & 0xffff);
+            const bucket = grid.get(key);
+            if (!bucket) continue;
+            for (let bIdx = 0; bIdx < bucket.length; bIdx++) {
+              const j = bucket[bIdx];
+              if (j <= i) continue;
+              const nb = nodeList[j];
+              const dx = nb.unclusteredBaseX - na.unclusteredBaseX;
+              const dy = nb.unclusteredBaseY - na.unclusteredBaseY;
+              const distSq = Math.max(36, dx * dx + dy * dy);
+              const minDist = na.isSourceHub || nb.isSourceHub ? 115 : 26;
+              if (distSq < minDist * minDist) {
+                const dist = Math.sqrt(distSq);
+                const push = ((minDist - dist) / dist) * 0.22 * damping;
+                if (!na.isCenter) {
+                  na.unclusteredBaseX -= dx * push;
+                  na.unclusteredBaseY -= dy * push;
+                }
+                if (!nb.isCenter) {
+                  nb.unclusteredBaseX += dx * push;
+                  nb.unclusteredBaseY += dy * push;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Spring attraction along relationship edges
+    for (let l = 0; l < lineList.length; l++) {
+      const ln = lineList[l];
+      const na = nodeList[ln.a];
+      const nb = nodeList[ln.b];
+      if (!na || !nb) continue;
+      const dx = nb.unclusteredBaseX - na.unclusteredBaseX;
+      const dy = nb.unclusteredBaseY - na.unclusteredBaseY;
+      const dist = Math.max(1, Math.hypot(dx, dy));
+      const targetDist =
+        ln.relationshipType === 'explicit'
+          ? 85
+          : ln.relationshipType === 'semantic'
+          ? 110
+          : na.isCenter
+          ? 175
+          : 54;
+      const pullStrength =
+        ln.relationshipType === 'explicit'
+          ? 0.12
+          : ln.relationshipType === 'semantic'
+          ? 0.08
+          : 0.15;
+      const pull = ((dist - targetDist) / dist) * pullStrength * damping;
+      if (!na.isCenter && !na.isSourceHub) {
+        na.unclusteredBaseX += dx * pull;
+        na.unclusteredBaseY += dy * pull;
+      }
+      if (!nb.isCenter && !nb.isSourceHub) {
+        nb.unclusteredBaseX -= dx * pull;
+        nb.unclusteredBaseY -= dy * pull;
+      }
+    }
+  }
+}
 
 interface BrainViewerCanvasProps {
   brainName: string;
   facts: Fact[];
+  searchMatchIds?: ReadonlySet<number> | null;
   selectedFactId: number | null;
   selectedSource?: AISource | null;
   onSelectFact: (fact: Fact | null) => void;
@@ -82,6 +322,7 @@ interface ClusterMeta {
 export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
   brainName,
   facts,
+  searchMatchIds = null,
   selectedFactId,
   selectedSource = null,
   onSelectFact,
@@ -104,6 +345,7 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
   const [timelineDateRange, setTimelineDateRange] = useState<'all' | '24h' | '7d' | '30d'>('all');
   const [timelineSourceFilter, setTimelineSourceFilter] = useState<AISource | 'all'>('all');
   const [timelineSortDir, setTimelineSortDir] = useState<'desc' | 'asc'>('desc');
+  const [timelineVisibleLimit, setTimelineVisibleLimit] = useState<number>(100);
 
   // Performance Optimization Refs
   const selectedFactIdRef = useRef(selectedFactId);
@@ -133,6 +375,11 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
   const [showHeatMap, setShowHeatMap] = useState(false);
   const showHeatMapRef = useRef(showHeatMap);
   showHeatMapRef.current = showHeatMap;
+
+  const prefersReducedMotionRef = useRef(
+    typeof window !== 'undefined' &&
+      Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches)
+  );
 
   // Real Workspace Summary Stats
   const workspaceStats = useMemo(() => {
@@ -172,6 +419,21 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
     () => brainStore.computeWorkspaceRelationships(facts),
     [facts]
   );
+
+  // Unified Search Highlight & Dim State across Graph Nodes and Relationships
+  const searchHighlightState = useMemo(
+    () =>
+      computeGraphSearchHighlightState(
+        facts,
+        workspaceRelationships,
+        searchQuery,
+        searchMatchIds,
+        brainName
+      ),
+    [facts, workspaceRelationships, searchQuery, searchMatchIds, brainName]
+  );
+  const searchHighlightRef = useRef(searchHighlightState);
+  searchHighlightRef.current = searchHighlightState;
 
   const relationshipCounts = useMemo(() => {
     let sourceEdges = 0;
@@ -561,66 +823,7 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
     // 5. Apply Layout Mode Transformations (Radial vs Force vs Timeline)
     // Both Radial and Force keep the exact same `lineList` relationships!
     if (layoutMode === 'force' && nodeList.length > 1) {
-      // Deterministic Force-Directed Layout that settles cleanly in 36 iterations
-      const iterations = 36;
-      for (let iter = 0; iter < iterations; iter++) {
-        const damping = 1 - iter / (iterations * 1.15);
-        // Repulsion between nodes to prevent overlap
-        for (let i = 1; i < nodeList.length; i++) {
-          for (let j = i + 1; j < nodeList.length; j++) {
-            const na = nodeList[i];
-            const nb = nodeList[j];
-            const dx = nb.unclusteredBaseX - na.unclusteredBaseX;
-            const dy = nb.unclusteredBaseY - na.unclusteredBaseY;
-            const distSq = Math.max(36, dx * dx + dy * dy);
-            const minDist = na.isSourceHub || nb.isSourceHub ? 115 : isLarge ? 30 : 38;
-            if (distSq < minDist * minDist) {
-              const dist = Math.sqrt(distSq);
-              const push = ((minDist - dist) / dist) * 0.24 * damping;
-              if (!na.isCenter) {
-                na.unclusteredBaseX -= dx * push;
-                na.unclusteredBaseY -= dy * push;
-              }
-              if (!nb.isCenter) {
-                nb.unclusteredBaseX += dx * push;
-                nb.unclusteredBaseY += dy * push;
-              }
-            }
-          }
-        }
-        // Spring attraction along all relationship edges (Source, Semantic, Explicit)
-        for (const ln of lineList) {
-          const na = nodeList[ln.a];
-          const nb = nodeList[ln.b];
-          if (!na || !nb) continue;
-          const dx = nb.unclusteredBaseX - na.unclusteredBaseX;
-          const dy = nb.unclusteredBaseY - na.unclusteredBaseY;
-          const dist = Math.max(1, Math.hypot(dx, dy));
-          const targetDist =
-            ln.relationshipType === 'explicit'
-              ? 85
-              : ln.relationshipType === 'semantic'
-              ? 110
-              : na.isCenter
-              ? 175
-              : 54;
-          const pullStrength =
-            ln.relationshipType === 'explicit'
-              ? 0.12
-              : ln.relationshipType === 'semantic'
-              ? 0.08
-              : 0.15;
-          const pull = ((dist - targetDist) / dist) * pullStrength * damping;
-          if (!na.isCenter && !na.isSourceHub) {
-            na.unclusteredBaseX += dx * pull;
-            na.unclusteredBaseY += dy * pull;
-          }
-          if (!nb.isCenter && !nb.isSourceHub) {
-            nb.unclusteredBaseX -= dx * pull;
-            nb.unclusteredBaseY -= dy * pull;
-          }
-        }
-      }
+      applySpatialGridForceLayout(nodeList, lineList, isLarge);
       for (const nd of nodeList) {
         nd.baseX = nd.unclusteredBaseX;
         nd.baseY = nd.unclusteredBaseY;
@@ -1110,11 +1313,12 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
         });
       }
 
-      // 4. Node Positioning (Harmonic subtle motion without jitter in Force mode)
+      // 4. Node Positioning (Harmonic subtle motion, paused on reduced-motion or large graphs >450 nodes)
       const pX = pointerRef.current.x;
       const pY = pointerRef.current.y;
       const isPointerActive = pX < 9;
       const magnetStrength = 0.025;
+      const enableOscillation = !prefersReducedMotionRef.current && nodes.length <= 450;
 
       for (let i = 0; i < nodes.length; i++) {
         const nd = nodes[i];
@@ -1129,15 +1333,19 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
           const contractedBaseX = nd.clusterHubX + relX * contractFactor;
           const contractedBaseY = nd.clusterHubY + relY * contractFactor;
 
-          const oscScale = layoutMode === 'force' ? 0.35 : 0.75;
-          const oscX =
-            nd.amp * oscScale * Math.cos(now * nd.speed + nd.phase) * (1 - clusterWeight * 0.4);
-          const oscY =
-            nd.amp * oscScale * Math.sin(now * nd.speed * 1.3 + nd.phase) * (1 - clusterWeight * 0.4);
+          let oscX = 0;
+          let oscY = 0;
+          if (enableOscillation && nd.amp > 0) {
+            const oscScale = layoutMode === 'force' ? 0.35 : 0.75;
+            oscX =
+              nd.amp * oscScale * Math.cos(now * nd.speed + nd.phase) * (1 - clusterWeight * 0.4);
+            oscY =
+              nd.amp * oscScale * Math.sin(now * nd.speed * 1.3 + nd.phase) * (1 - clusterWeight * 0.4);
+          }
 
           let magX = 0;
           let magY = 0;
-          if (isPointerActive) {
+          if (isPointerActive && enableOscillation) {
             const nodeNormX = nd.baseX / (width * 0.5);
             const nodeNormY = nd.baseY / (height * 0.5);
             const distFromPointer = Math.hypot(nodeNormX - pX, nodeNormY - pY);
@@ -1153,7 +1361,8 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
         }
       }
 
-      const isSearchActive = Boolean(searchQuery.trim() || activeSourceFilter);
+      const searchHl = searchHighlightRef.current;
+      const isSearchActive = Boolean(searchHl.isSearchActive || activeSourceFilter);
       const focusFactId = hoveredFact?.id || selectedFactId;
 
       // 6. Synaptic Links (Source, Semantic, Explicit)
@@ -1167,6 +1376,15 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
           const na = nodes[ln.a];
           const nb = nodes[ln.b];
           if (!na || !nb) continue;
+
+          if (
+            (na.x < -40 && nb.x < -40) ||
+            (na.x > width + 40 && nb.x > width + 40) ||
+            (na.y < -40 && nb.y < -40) ||
+            (na.y > height + 40 && nb.y > height + 40)
+          ) {
+            continue;
+          }
 
           const isFactLine = Boolean(nb.fact || na.fact);
           let opacity = ln.baseOpacity;
@@ -1185,43 +1403,50 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
             focusFactId !== null &&
             ((na.fact && na.fact.id === focusFactId) || (nb.fact && nb.fact.id === focusFactId));
 
+          let isSearchHighlightedEdge = false;
+          if (searchHl.isSearchActive) {
+            if (na.fact && nb.fact) {
+              isSearchHighlightedEdge =
+                searchHl.matchingFactIds.has(na.fact.id) &&
+                searchHl.matchingFactIds.has(nb.fact.id);
+            } else if (na.fact || nb.fact) {
+              const fNode = na.fact || nb.fact;
+              isSearchHighlightedEdge = Boolean(fNode && searchHl.matchingFactIds.has(fNode.id));
+            } else if (nb.isSourceHub && nb.sourceKey) {
+              isSearchHighlightedEdge = searchHl.matchingSourceIds.has(nb.sourceKey);
+            }
+          }
+
           if (focusFactId) {
-            opacity = touchesFocusedFact ? 0.92 : ln.tier === 2 ? 0.25 : 0.06;
+            opacity = touchesFocusedFact ? 0.92 : ln.tier === 2 ? 0.25 : 0.05;
+          } else if (searchHl.isSearchActive) {
+            opacity = isSearchHighlightedEdge ? 0.82 : 0.04;
           } else if (isSearchActive && (nb.fact || na.fact)) {
             const targetFact = nb.fact || na.fact;
-            const targetContentLower = nb.factContentLower || na.factContentLower || '';
             const matches =
-              (!activeSourceFilter || targetFact?.source === activeSourceFilter) &&
-              (!lowerSearch || targetContentLower.includes(lowerSearch));
+              !activeSourceFilter || targetFact?.source === activeSourceFilter;
             opacity = matches ? 0.82 : 0.08;
           } else if (activeSourceFilter && nb.isSourceHub && nb.sourceKey) {
             opacity = nb.sourceKey === activeSourceFilter ? 0.85 : 0.22;
           }
 
-          if (
-            (na.x < -40 && nb.x < -40) ||
-            (na.x > width + 40 && nb.x > width + 40) ||
-            (na.y < -40 && nb.y < -40) ||
-            (na.y > height + 40 && nb.y > height + 40)
-          ) {
-            continue;
-          }
+          const isEmphasizedEdge = touchesFocusedFact || isSearchHighlightedEdge;
 
           ctx.beginPath();
           ctx.moveTo(na.x, na.y);
           ctx.lineTo(nb.x, nb.y);
 
           if (ln.relationshipType === 'explicit') {
-            ctx.strokeStyle = touchesFocusedFact ? '#34d399' : ln.color;
+            ctx.strokeStyle = isEmphasizedEdge ? '#34d399' : ln.color;
             ctx.setLineDash([5, 3]);
-            ctx.lineWidth = touchesFocusedFact ? 1.6 : 1.05;
+            ctx.lineWidth = isEmphasizedEdge ? 1.6 : 1.05;
           } else if (ln.relationshipType === 'semantic') {
-            ctx.strokeStyle = touchesFocusedFact ? '#9db4ff' : ln.color;
+            ctx.strokeStyle = isEmphasizedEdge ? '#9db4ff' : ln.color;
             ctx.setLineDash([2, 4]);
-            ctx.lineWidth = touchesFocusedFact ? 1.4 : 0.85;
+            ctx.lineWidth = isEmphasizedEdge ? 1.45 : 0.85;
           } else {
             ctx.strokeStyle = ln.color;
-            ctx.lineWidth = isFactLine ? (touchesFocusedFact ? 1.4 : 0.85) : 1.4;
+            ctx.lineWidth = isFactLine ? (isEmphasizedEdge ? 1.4 : 0.85) : 1.4;
           }
 
           ctx.globalAlpha = opacity;
@@ -1230,7 +1455,13 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
             ctx.setLineDash([]);
           }
 
-          if (opacity > 0.16 && !ln.isCrossLink && clusterWeight < 0.6) {
+          if (
+            enableOscillation &&
+            opacity > 0.16 &&
+            !ln.isCrossLink &&
+            clusterWeight < 0.6 &&
+            nodes.length <= 350
+          ) {
             const pulseT = (now * 0.00045 + (l % 7) * 0.14) % 1;
             const px = na.x + (nb.x - na.x) * pulseT;
             const py = na.y + (nb.y - na.y) * pulseT;
@@ -1252,8 +1483,11 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
           continue;
         }
 
-        const isSelected = nd.fact && nd.fact.id === selectedFactId;
-        const isHovered = nd.fact && hoveredFact?.id === nd.fact.id;
+        const isSelected = Boolean(nd.fact && nd.fact.id === selectedFactId);
+        const isHovered = Boolean(nd.fact && hoveredFact?.id === nd.fact.id);
+        const isSearchMatch = Boolean(
+          nd.fact && searchHl.isSearchActive && searchHl.matchingFactIds.has(nd.fact.id)
+        );
 
         const nodeDelay = nd.isCenter ? 0.02 : nd.isSourceHub ? 0.08 : 0.16;
         const nodeAppear = Math.max(0, Math.min(1, (revealSec - nodeDelay) / 0.35));
@@ -1266,17 +1500,28 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
             const isNeighbor = edgesByFactId
               .get(selectedFactId)
               ?.some((e) => e.otherFactId === nd.fact?.id);
-            alpha = isSelected ? 1 : isNeighbor ? 0.88 : 0.24;
-          } else if (isSearchActive) {
-            const matches =
-              (!activeSourceFilter || nd.fact.source === activeSourceFilter) &&
-              (!lowerSearch || (nd.factContentLower ? nd.factContentLower.includes(lowerSearch) : false));
-            alpha = matches ? (isHovered ? 1 : 0.95) : 0.22;
+            alpha = isSelected
+              ? 1
+              : isSearchMatch
+              ? 0.95
+              : isNeighbor
+              ? 0.88
+              : 0.18;
+          } else if (searchHl.isSearchActive) {
+            alpha = isSearchMatch ? 1.0 : 0.14;
+          } else if (activeSourceFilter) {
+            alpha = nd.fact.source === activeSourceFilter ? (isHovered ? 1 : 0.95) : 0.18;
           } else {
-            alpha = 0.72 + 0.24 * Math.sin(now * nd.twspeed + nd.phase2);
+            alpha = enableOscillation
+              ? 0.72 + 0.24 * Math.sin(now * nd.twspeed + nd.phase2)
+              : 0.88;
           }
-        } else if (nd.isSourceHub && activeSourceFilter) {
-          alpha = nd.sourceKey === activeSourceFilter ? 1 : 0.45;
+        } else if (nd.isSourceHub && nd.sourceKey) {
+          if (searchHl.isSearchActive) {
+            alpha = searchHl.matchingSourceIds.has(nd.sourceKey) ? 0.96 : 0.24;
+          } else if (activeSourceFilter) {
+            alpha = nd.sourceKey === activeSourceFilter ? 1 : 0.45;
+          }
         }
         alpha *= nodeEase * tabSwitchEase;
 
@@ -1287,20 +1532,26 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
           nodeClusteredScale *
           (0.25 + 0.75 * nodeEase) *
           (0.85 + 0.15 * tabSwitchEase) *
-          (isSelected || isHovered ? 1.48 : 1);
+          (isSelected || isHovered ? 1.48 : isSearchMatch ? 1.32 : 1);
 
-        if (isSelected || isHovered || nd.isCenter || nd.isSourceHub) {
+        if (isSelected || isHovered || isSearchMatch || nd.isCenter || nd.isSourceHub) {
           ctx.beginPath();
-          ctx.arc(nd.x, nd.y, radius + (nd.isCenter ? 12 : 7), 0, Math.PI * 2);
-          ctx.fillStyle = nd.color;
-          ctx.globalAlpha = nd.isCenter ? 0.12 : isSelected || isHovered ? 0.35 : 0.18;
+          ctx.arc(nd.x, nd.y, radius + (nd.isCenter ? 12 : isSearchMatch ? 8 : 7), 0, Math.PI * 2);
+          ctx.fillStyle = isSearchMatch && !isSelected ? '#34d399' : nd.color;
+          ctx.globalAlpha = nd.isCenter
+            ? 0.12
+            : isSelected || isHovered
+            ? 0.36
+            : isSearchMatch
+            ? 0.28
+            : 0.18;
           ctx.fill();
 
           ctx.beginPath();
-          ctx.arc(nd.x, nd.y, radius + (nd.isCenter ? 6 : 3), 0, Math.PI * 2);
-          ctx.strokeStyle = nd.dotColor;
-          ctx.lineWidth = nd.isCenter ? 1.6 : 1.2;
-          ctx.globalAlpha = isSelected || isHovered ? 0.9 : 0.5;
+          ctx.arc(nd.x, nd.y, radius + (nd.isCenter ? 6 : isSearchMatch ? 3.5 : 3), 0, Math.PI * 2);
+          ctx.strokeStyle = isSearchMatch && !isSelected ? '#34d399' : nd.dotColor;
+          ctx.lineWidth = nd.isCenter ? 1.6 : isSearchMatch ? 1.5 : 1.2;
+          ctx.globalAlpha = isSelected || isHovered || isSearchMatch ? 0.92 : 0.5;
           ctx.stroke();
           ctx.globalAlpha = 1;
         }
@@ -1315,12 +1566,16 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
         const showLabel =
           nd.isCenter ||
           (nd.isSourceHub && clusterWeight < 0.6) ||
-          ((isSelected || isHovered) && clusterWeight < 0.85);
+          ((isSelected || isHovered) && clusterWeight < 0.85) ||
+          (isSearchMatch &&
+            (searchHl.matchingFactIds.size <= 35 || zoom >= 1.15) &&
+            clusterWeight < 0.7);
 
         if (showLabel) {
           const fontSize = nd.isCenter ? 12.5 : nd.isSourceHub ? 11 : 10;
           ctx.font = `${nd.isCenter ? '600' : '500'} ${fontSize}px JetBrains Mono, monospace`;
-          ctx.fillStyle = nd.isCenter ? '#ffffff' : isSelected || isHovered ? '#ffffff' : nd.color;
+          ctx.fillStyle =
+            nd.isCenter || isSelected || isHovered || isSearchMatch ? '#ffffff' : nd.color;
           ctx.globalAlpha = Math.max(0.68, alpha);
           ctx.fillText(nd.label, nd.x + radius + 7, nd.y + 3.5);
 
@@ -1333,16 +1588,12 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
         }
       }
 
-      timerId = window.setTimeout(() => {
-        animId = requestAnimationFrame(render);
-      }, 16);
+      animId = requestAnimationFrame(render);
     }
 
-    let timerId = 0;
     animId = requestAnimationFrame(render);
 
     return () => {
-      window.clearTimeout(timerId);
       cancelAnimationFrame(animId);
       window.removeEventListener('resize', resize);
       window.removeEventListener('pointermove', handlePointerMove);
@@ -1495,9 +1746,15 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
 
   const isCurrentlyClustered = currentZoomDisplay < 80;
 
-  // Filtered and Grouped Chronological Timeline Events (Section 6)
-  const timelineGroups = useMemo(() => {
-    if (layoutMode !== 'timeline') return [];
+  useEffect(() => {
+    setTimelineVisibleLimit(100);
+  }, [timelineSourceFilter, timelineDateRange, timelineSortDir, brainName]);
+
+  // Filtered and Grouped Chronological Timeline Events (Section 6) with windowed DOM rendering
+  const { timelineGroups, totalTimelineMatchingCount } = useMemo(() => {
+    if (layoutMode !== 'timeline') {
+      return { timelineGroups: [], totalTimelineMatchingCount: 0 };
+    }
     const nowMs = Date.now();
     const filtered = facts.filter((f) => {
       if (timelineSourceFilter !== 'all' && f.source !== timelineSourceFilter) return false;
@@ -1518,9 +1775,12 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
       return timelineSortDir === 'desc' ? tb - ta : ta - tb;
     });
 
+    const totalMatching = filtered.length;
+    const sliced = filtered.slice(0, timelineVisibleLimit);
+
     const groups: { dateLabel: string; items: Fact[] }[] = [];
     const map = new Map<string, Fact[]>();
-    for (const f of filtered) {
+    for (const f of sliced) {
       const d = new Date(f.created_at || f.updated_at);
       const key = Number.isNaN(d.getTime())
         ? 'Undated'
@@ -1532,8 +1792,15 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
     for (const [dateLabel, items] of map.entries()) {
       groups.push({ dateLabel, items });
     }
-    return groups;
-  }, [facts, layoutMode, timelineSourceFilter, timelineDateRange, timelineSortDir]);
+    return { timelineGroups: groups, totalTimelineMatchingCount: totalMatching };
+  }, [
+    facts,
+    layoutMode,
+    timelineSourceFilter,
+    timelineDateRange,
+    timelineSortDir,
+    timelineVisibleLimit,
+  ]);
 
   return (
     <div className="relative h-full w-full select-none overflow-hidden bg-[#03040a]">
@@ -1701,91 +1968,121 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-3.5 space-y-4 scrollbar-thin">
+          <div
+            onScroll={(e) => {
+              if (timelineVisibleLimit >= totalTimelineMatchingCount) return;
+              const el = e.currentTarget;
+              if (el.scrollTop + el.clientHeight >= el.scrollHeight - 100) {
+                setTimelineVisibleLimit((prev) =>
+                  Math.min(totalTimelineMatchingCount, prev + 100)
+                );
+              }
+            }}
+            className="flex-1 overflow-y-auto overscroll-contain p-3.5 space-y-4 scrollbar-thin"
+          >
             {timelineGroups.length === 0 ? (
               <div className="py-12 text-center text-xs text-white/45">
                 No timeline events match the selected date or source filter.
               </div>
             ) : (
-              timelineGroups.map((group) => (
-                <div key={group.dateLabel} className="space-y-2">
-                  <div className="sticky top-0 z-10 flex items-center justify-between rounded-md bg-[#0b0f1e]/95 px-2.5 py-1 border border-white/10">
-                    <span className="mono text-[10px] font-semibold text-indigo-300">
-                      {group.dateLabel}
-                    </span>
-                    <span className="mono text-[9.5px] text-white/45">
-                      {group.items.length} {group.items.length === 1 ? 'event' : 'events'}
-                    </span>
-                  </div>
+              <>
+                {timelineGroups.map((group) => (
+                  <div key={group.dateLabel} className="space-y-2">
+                    <div className="sticky top-0 z-10 flex items-center justify-between rounded-md bg-[#0b0f1e]/95 px-2.5 py-1 border border-white/10">
+                      <span className="mono text-[10px] font-semibold text-indigo-300">
+                        {group.dateLabel}
+                      </span>
+                      <span className="mono text-[9.5px] text-white/45">
+                        {group.items.length} {group.items.length === 1 ? 'event' : 'events'}
+                      </span>
+                    </div>
 
-                  <div className="space-y-2 pl-2 border-l border-white/10">
-                    {group.items.map((fact) => {
-                      const sMeta = SOURCE_PALETTE[fact.source];
-                      const isSelected = selectedFactId === fact.id;
-                      const relatedEdges = edgesByFactId.get(fact.id) || [];
-                      return (
-                        <button
-                          key={fact.id}
-                          type="button"
-                          onClick={() => onSelectFact(fact)}
-                          className={`w-full text-left rounded-xl border p-2.5 transition ${
-                            isSelected
-                              ? 'border-indigo-400/50 bg-indigo-500/15'
-                              : 'border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]'
-                          }`}
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <span
-                              className="mono text-[10px] font-semibold"
-                              style={{ color: sMeta?.color || '#fff' }}
-                            >
-                              {sMeta?.name || fact.source}
-                            </span>
-                            <span className="mono text-[9.5px] text-white/40">#{fact.id}</span>
-                          </div>
-                          <div className="mt-1 text-[11px] font-medium text-white truncate">
-                            {fact.documentTitle || fact.fileName || fact.content.slice(0, 65)}
-                          </div>
-                          <div className="mt-1.5 grid grid-cols-2 gap-x-2 gap-y-0.5 mono text-[9.5px] text-white/50">
-                            <div>
-                              Created:{' '}
-                              <span className="text-white/75">
-                                {fact.created_at ? new Date(fact.created_at).toLocaleDateString() : '—'}
+                    <div className="space-y-2 pl-2 border-l border-white/10">
+                      {group.items.map((fact) => {
+                        const sMeta = SOURCE_PALETTE[fact.source];
+                        const isSelected = selectedFactId === fact.id;
+                        const relatedEdges = edgesByFactId.get(fact.id) || [];
+                        const tsSummary = getNodeTimestampSummary(fact);
+                        return (
+                          <button
+                            key={fact.id}
+                            type="button"
+                            onClick={() => onSelectFact(fact)}
+                            className={`w-full text-left rounded-xl border p-2.5 transition ${
+                              isSelected
+                                ? 'border-indigo-400/50 bg-indigo-500/15'
+                                : 'border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]'
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span
+                                className="mono text-[10px] font-semibold"
+                                style={{ color: sMeta?.color || '#fff' }}
+                              >
+                                {sMeta?.name || fact.source}
                               </span>
+                              <span className="mono text-[9.5px] text-white/40">#{fact.id}</span>
                             </div>
-                            <div>
-                              Original Doc:{' '}
-                              <span className="text-white/75">
-                                {fact.originalCreatedAt
-                                  ? new Date(fact.originalCreatedAt).toLocaleDateString()
-                                  : 'Unknown'}
-                              </span>
+                            <div className="mt-1 text-[11px] font-medium text-white truncate">
+                              {fact.documentTitle || fact.fileName || fact.content.slice(0, 65)}
                             </div>
-                            <div>
-                              Imported:{' '}
-                              <span className="text-white/75">
-                                {fact.importedAt ? new Date(fact.importedAt).toLocaleDateString() : '—'}
-                              </span>
+                            <div className="mt-1.5 grid grid-cols-1 gap-y-0.5 mono text-[9.5px] text-white/50">
+                              <div className="flex items-center justify-between gap-2">
+                                <span>Created / Added:</span>
+                                <span className="text-white/80">{tsSummary.createdAdded}</span>
+                              </div>
+                              <div className="flex items-center justify-between gap-2">
+                                <span>Original Doc Date:</span>
+                                <span className="text-white/75">
+                                  {tsSummary.originalDocumentDateRaw
+                                    ? tsSummary.originalDocumentDate
+                                    : 'Not specified'}
+                                </span>
+                              </div>
+                              <div className="flex items-center justify-between gap-2">
+                                <span>Imported At:</span>
+                                <span className="text-white/75">
+                                  {tsSummary.importedAtRaw ? tsSummary.importedAt : '—'}
+                                </span>
+                              </div>
+                              <div className="flex items-center justify-between gap-2">
+                                <span>Last Modified:</span>
+                                <span className="text-white/80">{tsSummary.lastModified}</span>
+                              </div>
+                              {tsSummary.hasSeparateUpdate && (
+                                <div className="flex items-center justify-between gap-2">
+                                  <span>Updated At:</span>
+                                  <span className="text-emerald-300">{tsSummary.updatedAt}</span>
+                                </div>
+                              )}
                             </div>
-                            <div>
-                              Updated:{' '}
-                              <span className="text-white/75">
-                                {new Date(fact.updated_at).toLocaleDateString()}
-                              </span>
-                            </div>
-                          </div>
-                          {relatedEdges.length > 0 && (
-                            <div className="mt-1.5 mono text-[9px] text-emerald-300/85">
-                              {relatedEdges.length} related graph{' '}
-                              {relatedEdges.length === 1 ? 'connection' : 'connections'}
-                            </div>
-                          )}
-                        </button>
-                      );
-                    })}
+                            {relatedEdges.length > 0 && (
+                              <div className="mt-1.5 mono text-[9px] text-emerald-300/85">
+                                {relatedEdges.length} related graph{' '}
+                                {relatedEdges.length === 1 ? 'connection' : 'connections'}
+                              </div>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
-                </div>
-              ))
+                ))}
+                {timelineVisibleLimit < totalTimelineMatchingCount && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setTimelineVisibleLimit((prev) =>
+                        Math.min(totalTimelineMatchingCount, prev + 100)
+                      )
+                    }
+                    className="w-full rounded-xl border border-white/12 bg-white/[0.04] py-2 mono text-[10.5px] text-[#9db4ff] hover:bg-white/[0.08] transition"
+                  >
+                    Show more timeline events ({totalTimelineMatchingCount - timelineVisibleLimit}{' '}
+                    remaining)
+                  </button>
+                )}
+              </>
             )}
           </div>
         </div>

@@ -44,6 +44,79 @@ export type {
   BatchExecutionProgress,
 };
 
+export const DEFAULT_IMPORT_CONCURRENCY = 3;
+export const MIN_IMPORT_CONCURRENCY = 1;
+export const MAX_IMPORT_CONCURRENCY = 8;
+
+export function normalizeImportConcurrency(value?: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return DEFAULT_IMPORT_CONCURRENCY;
+  }
+  return Math.max(
+    MIN_IMPORT_CONCURRENCY,
+    Math.min(MAX_IMPORT_CONCURRENCY, Math.floor(value))
+  );
+}
+
+/**
+ * Computes a deterministic checkpoint fingerprint for an ImportReviewItem so that
+ * interrupted batches or resumed queues can recognize already-imported files and
+ * avoid reprocessing them.
+ */
+export function computeImportCheckpointKey(
+  item: Pick<
+    ImportReviewItem,
+    'destinationBrain' | 'filePath' | 'fileName' | 'checksum' | 'text'
+  >
+): string {
+  const brain = (item.destinationBrain || 'coding').trim().toLowerCase();
+  const pathKey = (item.filePath || item.fileName || '').trim().toLowerCase();
+  const sig =
+    item.checksum ||
+    `${(item.text || '').length}:${(item.text || '').slice(0, 64)}`;
+  return `${brain}::${pathKey}::${sig}`;
+}
+
+/**
+ * Filters a queue after an interruption so items that already reached `status === 'imported'`
+ * or match a persisted checkpoint key are never reprocessed.
+ */
+export function filterRemainingItemsAfterInterruption(
+  items: ImportReviewItem[],
+  completedCheckpointKeys?: ReadonlySet<string>
+): {
+  remaining: ImportReviewItem[];
+  alreadyImported: ImportReviewItem[];
+} {
+  const remaining: ImportReviewItem[] = [];
+  const alreadyImported: ImportReviewItem[] = [];
+
+  for (const item of items) {
+    const key = computeImportCheckpointKey(item);
+    if (
+      item.status === 'imported' ||
+      (completedCheckpointKeys && completedCheckpointKeys.has(key))
+    ) {
+      alreadyImported.push(
+        item.status === 'imported'
+          ? item
+          : {
+              ...item,
+              status: 'imported',
+              statusMessage:
+                item.statusMessage ||
+                'Already imported prior to interruption — skipped reprocessing',
+              progress: undefined,
+            }
+      );
+    } else {
+      remaining.push(item);
+    }
+  }
+
+  return { remaining, alreadyImported };
+}
+
 export interface ImportReviewQueueProps {
   items: ImportReviewItem[];
   destinations: string[];
@@ -51,6 +124,7 @@ export interface ImportReviewQueueProps {
   isBatchProcessing?: boolean;
   batchProgress?: BatchExecutionProgress | null;
   concurrencyLimit?: number;
+  onConcurrencyLimitChange?: (nextLimit: number) => void;
   selectedIds?: string[];
   onSelectionChange?: (selectedIds: string[]) => void;
   onMerge: (item: ImportReviewItem) => Promise<boolean | void> | boolean | void;
@@ -113,22 +187,40 @@ export function getDefaultResolutionForDuplicateState(
   }
 }
 
+export interface ControlledConcurrencyOptions<T> {
+  shouldSkip?: (item: T, index: number) => boolean;
+  onSkipped?: (item: T, index: number) => void;
+  signal?: AbortSignal;
+}
+
 /**
  * Bounded concurrency runner to prevent firing an uncontrolled number of simultaneous
  * backend persistence requests during bulk operations.
+ * Defaults to DEFAULT_IMPORT_CONCURRENCY (3) when not specified and supports skipping
+ * already-imported items when resuming after an interruption.
  */
 export async function runWithControlledConcurrency<T>(
   items: T[],
-  concurrencyLimit: number,
-  worker: (item: T, index: number) => Promise<void>
+  concurrencyLimit: number = DEFAULT_IMPORT_CONCURRENCY,
+  worker: (item: T, index: number) => Promise<void>,
+  options?: ControlledConcurrencyOptions<T>
 ): Promise<void> {
-  const safeLimit = Math.max(1, Math.min(concurrencyLimit, items.length || 1));
+  const normalizedLimit = normalizeImportConcurrency(concurrencyLimit);
+  const safeLimit = Math.max(1, Math.min(normalizedLimit, items.length || 1));
   let cursor = 0;
 
   const runners = Array.from({ length: safeLimit }, async () => {
     while (cursor < items.length) {
+      if (options?.signal?.aborted) {
+        break;
+      }
       const currentIndex = cursor++;
-      await worker(items[currentIndex], currentIndex);
+      const currentItem = items[currentIndex];
+      if (options?.shouldSkip?.(currentItem, currentIndex)) {
+        options.onSkipped?.(currentItem, currentIndex);
+        continue;
+      }
+      await worker(currentItem, currentIndex);
     }
   });
 
@@ -333,7 +425,8 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
   sources = Object.keys(SOURCE_PALETTE) as AISource[],
   isBatchProcessing = false,
   batchProgress: externalBatchProgress = null,
-  concurrencyLimit = 3,
+  concurrencyLimit = DEFAULT_IMPORT_CONCURRENCY,
+  onConcurrencyLimitChange,
   selectedIds: controlledSelectedIds,
   onSelectionChange,
   onMerge,
@@ -357,12 +450,25 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
   const [internalSelectedIds, setInternalSelectedIds] = useState<string[]>([]);
   const [internalBatchProgress, setInternalBatchProgress] =
     useState<BatchExecutionProgress | null>(null);
+  const [internalConcurrency, setInternalConcurrency] = useState<number>(() =>
+    normalizeImportConcurrency(concurrencyLimit)
+  );
   const [bulkSafeguardNotice, setBulkSafeguardNotice] = useState<string | null>(
     null
   );
   const [bulkSourceValue, setBulkSourceValue] = useState<AISource>(
     sources[0] || 'claude'
   );
+
+  const effectiveConcurrency = onConcurrencyLimitChange
+    ? normalizeImportConcurrency(concurrencyLimit)
+    : normalizeImportConcurrency(internalConcurrency);
+
+  const handleConcurrencyChange = (rawVal: number) => {
+    const next = normalizeImportConcurrency(rawVal);
+    setInternalConcurrency(next);
+    onConcurrencyLimitChange?.(next);
+  };
 
   // Support both controlled and uncontrolled selection
   const selectedIds =
@@ -608,13 +714,13 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
       actionLabel: action === 'merge' ? 'Bulk Merge' : 'Bulk Replace',
       completed: 0,
       total: totalToRun,
-      activeCount: Math.min(concurrencyLimit, totalToRun),
+      activeCount: Math.min(effectiveConcurrency, totalToRun),
     });
 
     try {
       await runWithControlledConcurrency(
         eligibleList,
-        concurrencyLimit,
+        effectiveConcurrency,
         async (item) => {
           activeWorkers++;
           setInternalBatchProgress({
@@ -639,6 +745,12 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
               activeCount: activeWorkers,
             });
           }
+        },
+        {
+          shouldSkip: (item) => item.status === 'imported',
+          onSkipped: () => {
+            completedCount++;
+          },
         }
       );
     } finally {
@@ -660,13 +772,13 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
       actionLabel: 'Retry Failed Items',
       completed: 0,
       total: failedToRun.length,
-      activeCount: Math.min(concurrencyLimit, failedToRun.length),
+      activeCount: Math.min(effectiveConcurrency, failedToRun.length),
     });
 
     try {
       await runWithControlledConcurrency(
         failedToRun,
-        concurrencyLimit,
+        effectiveConcurrency,
         async (item) => {
           activeWorkers++;
           setInternalBatchProgress({
@@ -687,6 +799,12 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
               activeCount: activeWorkers,
             });
           }
+        },
+        {
+          shouldSkip: (item) => item.status === 'imported',
+          onSkipped: () => {
+            completedCount++;
+          },
         }
       );
     } finally {
@@ -1230,31 +1348,56 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
           )}
         </div>
 
-        {items.length > 0 && (
-          <div className="flex flex-wrap items-center gap-2">
-            {metrics.failed > 0 && (
-              <button
-                type="button"
-                disabled={isAnyBatchRunning || metrics.processing > 0}
-                onClick={handleRetryFailedBatch}
-                className="inline-flex items-center gap-1.5 mono rounded-md border border-rose-400/40 bg-rose-500/20 px-2.5 py-1 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/30 disabled:opacity-40 transition"
-              >
-                <RotateCcw className="h-3 w-3" />
-                <span>Retry Failed ({metrics.failed})</span>
-              </button>
-            )}
-            {onClearQueue && (
-              <button
-                type="button"
-                disabled={isAnyBatchRunning || metrics.processing > 0}
-                onClick={onClearQueue}
-                className="mono rounded-md border border-rose-500/25 bg-rose-500/10 px-2.5 py-1 text-[11px] text-rose-300 hover:bg-rose-500/20 disabled:opacity-40 transition"
-              >
-                Clear Queue
-              </button>
-            )}
-          </div>
-        )}
+        <div className="flex flex-wrap items-center gap-2">
+          <label
+            className="inline-flex items-center gap-1.5 rounded-md border border-white/12 bg-black/40 px-2 py-1 mono text-[11px] text-white/65"
+            title="Configurable import queue concurrency (default: 3)"
+          >
+            <span>Concurrency:</span>
+            <select
+              value={effectiveConcurrency}
+              disabled={isAnyBatchRunning || metrics.processing > 0}
+              onChange={(e) =>
+                handleConcurrencyChange(parseInt(e.target.value, 10))
+              }
+              aria-label="Import queue concurrency limit"
+              data-testid="import-concurrency-select"
+              className="mono rounded bg-transparent text-[11px] font-semibold text-[#9db4ff] outline-none disabled:opacity-50"
+            >
+              {[1, 2, 3, 4, 5, 6, 8].map((n) => (
+                <option key={n} value={n} className="bg-[#050711] text-white">
+                  {n}
+                  {n === DEFAULT_IMPORT_CONCURRENCY ? ' (default)' : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+          {items.length > 0 && (
+            <>
+              {metrics.failed > 0 && (
+                <button
+                  type="button"
+                  disabled={isAnyBatchRunning || metrics.processing > 0}
+                  onClick={handleRetryFailedBatch}
+                  className="inline-flex items-center gap-1.5 mono rounded-md border border-rose-400/40 bg-rose-500/20 px-2.5 py-1 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/30 disabled:opacity-40 transition"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  <span>Retry Failed ({metrics.failed})</span>
+                </button>
+              )}
+              {onClearQueue && (
+                <button
+                  type="button"
+                  disabled={isAnyBatchRunning || metrics.processing > 0}
+                  onClick={onClearQueue}
+                  className="mono rounded-md border border-rose-500/25 bg-rose-500/10 px-2.5 py-1 text-[11px] text-rose-300 hover:bg-rose-500/20 disabled:opacity-40 transition"
+                >
+                  Clear Queue
+                </button>
+              )}
+            </>
+          )}
+        </div>
       </div>
 
       {/* Bulk Selection & Bulk Actions Toolbar */}
@@ -1437,7 +1580,7 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
               <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
               <span>
                 Running <strong>{activeBatchProgress.actionLabel}</strong> (max{' '}
-                {concurrencyLimit} concurrent requests)
+                {effectiveConcurrency} concurrent requests)
               </span>
             </div>
             <span className="tabular-nums text-white/80">

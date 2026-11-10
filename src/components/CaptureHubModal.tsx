@@ -52,6 +52,10 @@ import {
 import { areDocumentsExactDuplicates } from '../services/semanticChunker';
 import {
   ImportReviewQueue,
+  DEFAULT_IMPORT_CONCURRENCY,
+  normalizeImportConcurrency,
+  computeImportCheckpointKey,
+  filterRemainingItemsAfterInterruption,
   runWithControlledConcurrency,
   isItemEligibleForAction,
   getDefaultResolutionForDuplicateState,
@@ -75,6 +79,7 @@ export interface CaptureHubModalProps {
   currentBrain: string;
   brains: string[];
   initialTab?: CaptureHubTab;
+  initialConcurrencyLimit?: number;
   onCreateBrain?: (name: string) => void;
   onImportComplete?: (summary: {
     imported: number;
@@ -101,7 +106,7 @@ const WORKFLOW_STEPS = [
   'EXPORT',
 ] as const;
 
-const BULK_CONCURRENCY_LIMIT = 3;
+const BULK_CONCURRENCY_LIMIT = DEFAULT_IMPORT_CONCURRENCY;
 
 /**
  * Reconciles intra-queue exact duplicates so that when multiple identical files
@@ -219,6 +224,10 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   // --- Workflow 2: Import Files & Review Queue State ---
   const [reviewQueue, setReviewQueue] = useState<ImportReviewItem[]>([]);
   const [selectedQueueIds, setSelectedQueueIds] = useState<string[]>([]);
+  const [concurrencyLimit, setConcurrencyLimit] = useState<number>(
+    DEFAULT_IMPORT_CONCURRENCY
+  );
+  const completedCheckpointKeysRef = useRef<Set<string>>(new Set());
   const [isDragging, setIsDragging] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
   const [batchProgress, setBatchProgress] =
@@ -905,6 +914,30 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       return false;
     }
 
+    // Avoid reprocessing files that have already been successfully imported prior to an interruption
+    const checkpointKey = computeImportCheckpointKey(item);
+    if (
+      item.status === 'imported' ||
+      completedCheckpointKeysRef.current.has(checkpointKey)
+    ) {
+      setReviewQueue((prev) =>
+        prev.map((q) =>
+          q.id === item.id
+            ? {
+                ...q,
+                status: 'imported',
+                errorMessage: undefined,
+                statusMessage:
+                  q.statusMessage ||
+                  'Already imported prior to interruption — skipped reprocessing.',
+                progress: undefined,
+              }
+            : q
+        )
+      );
+      return true;
+    }
+
     // Strict Duplicate Safety Rule: NEVER allow Merge or Replace if duplicate state is Unable to determine
     if (
       item.duplicateState === 'unable_to_determine' &&
@@ -1027,6 +1060,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       });
 
       // Only mark as Imported AFTER backend/local persistence succeeds
+      completedCheckpointKeysRef.current.add(checkpointKey);
       setReviewQueue((prev) =>
         prev.map((q) =>
           q.id === item.id
@@ -1158,19 +1192,28 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     let failedCount = 0;
     let completedCount = 0;
     let activeWorkers = 0;
-    const totalToRun = failedItems.length;
+    const { remaining: retryTargets } = filterRemainingItemsAfterInterruption(
+      failedItems,
+      completedCheckpointKeysRef.current
+    );
+    if (retryTargets.length === 0) {
+      setIsCommitting(false);
+      return;
+    }
+    const totalToRun = retryTargets.length;
+    const activeConcurrency = normalizeImportConcurrency(concurrencyLimit);
 
     setBatchProgress({
       actionLabel: 'Retry Failed Items',
       completed: 0,
       total: totalToRun,
-      activeCount: Math.min(BULK_CONCURRENCY_LIMIT, totalToRun),
+      activeCount: Math.min(activeConcurrency, totalToRun),
     });
 
     try {
       await runWithControlledConcurrency(
-        failedItems,
-        BULK_CONCURRENCY_LIMIT,
+        retryTargets,
+        activeConcurrency,
         async (item) => {
           activeWorkers++;
           setBatchProgress({
@@ -1193,6 +1236,16 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               activeCount: activeWorkers,
             });
           }
+        },
+        {
+          shouldSkip: (item) =>
+            item.status === 'imported' ||
+            completedCheckpointKeysRef.current.has(
+              computeImportCheckpointKey(item)
+            ),
+          onSkipped: () => {
+            completedCount++;
+          },
         }
       );
     } finally {
@@ -1246,7 +1299,11 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       return;
     }
 
-    const eligibleItems = itemsToProcess.filter(
+    const { remaining: candidateItems } = filterRemainingItemsAfterInterruption(
+      itemsToProcess,
+      completedCheckpointKeysRef.current
+    );
+    const eligibleItems = candidateItems.filter(
       (item) => isItemEligibleForAction(item, action).eligible
     );
     if (eligibleItems.length === 0) return;
@@ -1260,18 +1317,19 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     let activeWorkers = 0;
     const totalToRun = eligibleItems.length;
     const label = action === 'merge' ? 'Bulk Merge' : 'Bulk Replace';
+    const activeConcurrency = normalizeImportConcurrency(concurrencyLimit);
 
     setBatchProgress({
       actionLabel: label,
       completed: 0,
       total: totalToRun,
-      activeCount: Math.min(BULK_CONCURRENCY_LIMIT, totalToRun),
+      activeCount: Math.min(activeConcurrency, totalToRun),
     });
 
     try {
       await runWithControlledConcurrency(
         eligibleItems,
-        BULK_CONCURRENCY_LIMIT,
+        activeConcurrency,
         async (item) => {
           activeWorkers++;
           setBatchProgress({
@@ -1297,6 +1355,16 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               activeCount: activeWorkers,
             });
           }
+        },
+        {
+          shouldSkip: (item) =>
+            item.status === 'imported' ||
+            completedCheckpointKeysRef.current.has(
+              computeImportCheckpointKey(item)
+            ),
+          onSkipped: () => {
+            completedCount++;
+          },
         }
       );
     } finally {
@@ -1408,20 +1476,21 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     const totalToRun = toPersist.length;
     let completedCount = 0;
     let activeWorkers = 0;
+    const activeConcurrency = normalizeImportConcurrency(concurrencyLimit);
 
     if (totalToRun > 0) {
       setBatchProgress({
         actionLabel: 'Queue Import',
         completed: 0,
         total: totalToRun,
-        activeCount: Math.min(BULK_CONCURRENCY_LIMIT, totalToRun),
+        activeCount: Math.min(activeConcurrency, totalToRun),
       });
     }
 
     try {
       await runWithControlledConcurrency(
         toPersist,
-        BULK_CONCURRENCY_LIMIT,
+        activeConcurrency,
         async ({ item, action }) => {
           activeWorkers++;
           setBatchProgress({
@@ -1447,6 +1516,16 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               activeCount: activeWorkers,
             });
           }
+        },
+        {
+          shouldSkip: ({ item }) =>
+            item.status === 'imported' ||
+            completedCheckpointKeysRef.current.has(
+              computeImportCheckpointKey(item)
+            ),
+          onSkipped: () => {
+            completedCount++;
+          },
         }
       );
     } finally {
@@ -2527,7 +2606,10 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 destinations={brains}
                 isBatchProcessing={isCommitting}
                 batchProgress={batchProgress}
-                concurrencyLimit={BULK_CONCURRENCY_LIMIT}
+                concurrencyLimit={concurrencyLimit}
+                onConcurrencyLimitChange={(next) =>
+                  setConcurrencyLimit(normalizeImportConcurrency(next))
+                }
                 selectedIds={selectedQueueIds}
                 onSelectionChange={setSelectedQueueIds}
                 onMerge={handleMergeItem}
@@ -2546,6 +2628,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 onClearQueue={() => {
                   setReviewQueue([]);
                   setSelectedQueueIds([]);
+                  completedCheckpointKeysRef.current.clear();
                 }}
               />
             </div>

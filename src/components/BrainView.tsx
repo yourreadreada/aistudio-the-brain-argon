@@ -253,6 +253,23 @@ export const BrainView: React.FC<BrainViewProps> = ({
     refreshConnectionStatus();
   };
 
+  const graphFacts = useMemo(() => {
+    if (!activeSourceFilter && !activeFileTypeFilter) {
+      return allBrainFacts;
+    }
+    return brainStore.recall(
+      currentBrain,
+      '',
+      activeSourceFilter,
+      activeFileTypeFilter
+    );
+  }, [allBrainFacts, currentBrain, activeSourceFilter, activeFileTypeFilter]);
+
+  const searchMatchIds = useMemo(() => {
+    if (!searchQuery.trim()) return null;
+    return new Set(facts.map((f) => f.id));
+  }, [facts, searchQuery]);
+
   useEffect(() => {
     refreshData();
     setCurrentPage(1);
@@ -384,6 +401,10 @@ export const BrainView: React.FC<BrainViewProps> = ({
     if (targetBrain && targetBrain !== currentBrain) {
       setCurrentBrain(targetBrain);
     }
+    if (viewMode !== 'graph' && viewMode !== 'list') {
+      setViewMode('graph');
+    }
+    setSelectedSource(null);
     setSelectedFact(fact);
     setIsRecentActivityOpen(false);
     brainStore.recordActivity(fact, 'accessed');
@@ -857,11 +878,8 @@ export const BrainView: React.FC<BrainViewProps> = ({
             <>
               <BrainViewerCanvas
                 brainName={currentBrain}
-                facts={
-                  searchQuery.trim() || activeFileTypeFilter || activeSourceFilter
-                    ? facts
-                    : allBrainFacts
-                }
+                facts={graphFacts}
+                searchMatchIds={searchMatchIds}
                 selectedFactId={selectedFact?.id || null}
                 selectedSource={selectedSource}
                 onSelectFact={handleFactSelected}
@@ -878,7 +896,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
                 isInspectorOpen={Boolean(selectedFact || selectedSource)}
               />
 
-              {facts.length === 0 && (
+              {graphFacts.length === 0 && (
                 <div className="pointer-events-none absolute inset-0 flex items-center justify-center p-4">
                   <div className="pointer-events-auto rounded-xl border border-white/12 bg-[#070913]/95 p-6 text-center max-w-sm backdrop-blur-xl">
                     <h3 className="text-sm font-semibold text-white">
