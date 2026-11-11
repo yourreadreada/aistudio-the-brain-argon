@@ -2731,10 +2731,12 @@ export function createBrainApp(
       merged.autoBackup.lastBackupAt = latestVerified.createdAt;
       merged.autoBackup.lastBackupFileName = latestVerified.fileName;
     }
-    if (merged.autoBackup.enabled && !merged.autoBackup.nextScheduledBackupAt) {
-      const baseTime = merged.autoBackup.lastBackupAt
-        ? new Date(merged.autoBackup.lastBackupAt).getTime()
-        : Date.now();
+    if (
+      merged.autoBackup.enabled &&
+      !merged.autoBackup.nextScheduledBackupAt &&
+      merged.autoBackup.lastBackupAt
+    ) {
+      const baseTime = new Date(merged.autoBackup.lastBackupAt).getTime();
       const safeBase = Number.isFinite(baseTime) ? baseTime : Date.now();
       merged.autoBackup.nextScheduledBackupAt = new Date(
         safeBase + computeScheduleIntervalMs(merged.autoBackup.schedule)
@@ -2782,19 +2784,28 @@ export function createBrainApp(
         patch.autoBackup.schedule !== current.autoBackup.schedule;
       const enabledTurnedOn =
         patch.autoBackup?.enabled === true && !current.autoBackup.enabled;
-      if (
-        scheduleChanged ||
-        enabledTurnedOn ||
-        !sanitized.autoBackup.nextScheduledBackupAt
-      ) {
-        const refMs = sanitized.autoBackup.lastBackupAt
-          ? new Date(sanitized.autoBackup.lastBackupAt).getTime()
-          : Date.now();
-        const baseMs = Number.isFinite(refMs) ? refMs : Date.now();
-        const candidateNext =
-          baseMs + computeScheduleIntervalMs(sanitized.autoBackup.schedule);
+      const explicitNextProvided =
+        patch.autoBackup !== undefined &&
+        Object.prototype.hasOwnProperty.call(
+          patch.autoBackup,
+          'nextScheduledBackupAt'
+        );
+
+      if (scheduleChanged || enabledTurnedOn) {
         sanitized.autoBackup.nextScheduledBackupAt = new Date(
-          Math.max(Date.now() + 1000, candidateNext)
+          Date.now() + computeScheduleIntervalMs(sanitized.autoBackup.schedule)
+        ).toISOString();
+      } else if (explicitNextProvided) {
+        sanitized.autoBackup.nextScheduledBackupAt =
+          patch.autoBackup?.nextScheduledBackupAt ?? null;
+      } else if (
+        !sanitized.autoBackup.nextScheduledBackupAt &&
+        sanitized.autoBackup.lastBackupAt
+      ) {
+        const refMs = new Date(sanitized.autoBackup.lastBackupAt).getTime();
+        const baseMs = Number.isFinite(refMs) ? refMs : Date.now();
+        sanitized.autoBackup.nextScheduledBackupAt = new Date(
+          baseMs + computeScheduleIntervalMs(sanitized.autoBackup.schedule)
         ).toISOString();
       }
     } else {
@@ -2829,6 +2840,8 @@ export function createBrainApp(
     return clamped;
   }
 
+  let schedulerInFlight = false;
+
   function runScheduledBackupIfDue(options?: {
     force?: boolean;
     kind?: BackupKind;
@@ -2839,27 +2852,53 @@ export function createBrainApp(
     settings: ArgonGlobalSettings;
     error?: string;
   } {
-    const currentSettings = readGlobalSettings();
-    if (!options?.force && !currentSettings.autoBackup.enabled) {
-      return { triggered: false, settings: currentSettings };
+    const initialSettings = readGlobalSettings();
+    if (!options?.force && !initialSettings.autoBackup.enabled) {
+      return { triggered: false, settings: initialSettings };
     }
     if (resolvedDbPath === ':memory:') {
-      return { triggered: false, settings: currentSettings };
+      return { triggered: false, settings: initialSettings };
+    }
+    if (schedulerInFlight) {
+      return { triggered: false, settings: initialSettings };
     }
 
-    const nowMs = Date.now();
-    const nextDueMs = currentSettings.autoBackup.nextScheduledBackupAt
-      ? new Date(currentSettings.autoBackup.nextScheduledBackupAt).getTime()
-      : 0;
-    const isDue =
-      options?.force === true || !nextDueMs || Number.isNaN(nextDueMs) || nowMs >= nextDueMs;
-
-    if (!isDue) {
-      return { triggered: false, settings: currentSettings };
+    if (!fs.existsSync(resolvedBackupDir)) {
+      fs.mkdirSync(resolvedBackupDir, { recursive: true });
+    }
+    const lockPath = path.join(resolvedBackupDir, '.scheduler.lock');
+    let lockFd: number | null = null;
+    try {
+      if (fs.existsSync(lockPath)) {
+        const lockStat = fs.statSync(lockPath);
+        if (Date.now() - lockStat.mtimeMs > 30_000) {
+          fs.unlinkSync(lockPath);
+        }
+      }
+      lockFd = fs.openSync(lockPath, 'wx');
+    } catch {
+      return { triggered: false, settings: initialSettings };
     }
 
+    schedulerInFlight = true;
     const startedAt = Date.now();
     try {
+      // Re-read settings after acquiring cross-instance lock
+      const currentSettings = readGlobalSettings();
+      const nowMs = Date.now();
+      const nextDueMs = currentSettings.autoBackup.nextScheduledBackupAt
+        ? new Date(currentSettings.autoBackup.nextScheduledBackupAt).getTime()
+        : 0;
+      const isDue =
+        options?.force === true ||
+        !nextDueMs ||
+        Number.isNaN(nextDueMs) ||
+        nowMs >= nextDueMs;
+
+      if (!isDue) {
+        return { triggered: false, settings: currentSettings };
+      }
+
       if (options?.simulateFailure) {
         throw new Error('Simulated scheduled backup failure');
       }
@@ -2908,6 +2947,7 @@ export function createBrainApp(
         settings: updatedSettings,
       };
     } catch (err: any) {
+      const currentSettings = readGlobalSettings();
       const errMsg = err?.message || 'Scheduled backup failed';
       const updatedSettings = saveGlobalSettings({
         autoBackup: {
@@ -2928,6 +2968,18 @@ export function createBrainApp(
         settings: updatedSettings,
         error: errMsg,
       };
+    } finally {
+      schedulerInFlight = false;
+      if (lockFd !== null) {
+        try {
+          fs.closeSync(lockFd);
+        } catch {}
+      }
+      try {
+        if (fs.existsSync(lockPath)) {
+          fs.unlinkSync(lockPath);
+        }
+      } catch {}
     }
   }
 
