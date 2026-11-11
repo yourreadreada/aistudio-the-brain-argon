@@ -2720,25 +2720,23 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                     </div>
                   )}
 
-                  {/* Per-Import Override Bar (Synchronized with Settings -> Import & Processing) */}
-                  <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/10 mono text-[10.5px] text-white/60">
+                  {/* Per-Import Override Bar (Session-only overrides; initialized from Settings -> Import & Processing) */}
+                  <div
+                    data-testid="capture-hub-override-bar"
+                    className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/10 mono text-[10.5px] text-white/60"
+                  >
                     <label className="inline-flex items-center gap-1.5">
-                      <span>Max Batch:</span>
+                      <span>Max Batch (Session Override):</span>
                       <select
                         value={maxFilesPerBatch}
                         onChange={(e) => {
                           const next = parseInt(e.target.value, 10) || 1000;
                           setMaxFilesPerBatch(next);
-                          brainStore
-                            .updateGlobalSettings({
-                              importProcessing: { maxFilesPerBatch: next },
-                            })
-                            .catch(() => {});
                         }}
                         data-testid="capture-hub-max-batch-select"
                         className="rounded border border-white/15 bg-black/60 px-1.5 py-0.5 text-[10.5px] text-[#9db4ff] outline-none"
                       >
-                        {[100, 350, 500, 1000, 2000, 5000].map((limit) => (
+                        {[100, 350, 500, 1000, 1500, 2000, 5000].map((limit) => (
                           <option
                             key={limit}
                             value={limit}
@@ -2752,18 +2750,13 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                     </label>
 
                     <label className="inline-flex items-center gap-1.5">
-                      <span>Duplicates:</span>
+                      <span>Duplicates (Session Override):</span>
                       <select
                         value={defaultDuplicatePolicy}
                         onChange={(e) => {
                           const next = e.target
                             .value as DuplicateHandlingPolicy;
                           setDefaultDuplicatePolicy(next);
-                          brainStore
-                            .updateGlobalSettings({
-                              importProcessing: { defaultDuplicatePolicy: next },
-                            })
-                            .catch(() => {});
                         }}
                         data-testid="capture-hub-duplicate-policy-select"
                         className="rounded border border-white/15 bg-black/60 px-1.5 py-0.5 text-[10.5px] text-[#9db4ff] outline-none"
@@ -2883,11 +2876,6 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 onConcurrencyLimitChange={(next) => {
                   const normalized = normalizeImportConcurrency(next);
                   setConcurrencyLimit(normalized);
-                  brainStore
-                    .updateGlobalSettings({
-                      importProcessing: { concurrency: normalized },
-                    })
-                    .catch(() => {});
                 }}
                 selectedIds={selectedQueueIds}
                 onSelectionChange={setSelectedQueueIds}

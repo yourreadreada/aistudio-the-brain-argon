@@ -2522,6 +2522,222 @@ export function serializeCompanionCaptureRow(row: any) {
 export interface CreateBrainAppOptions {
   dbPath?: string;
   backupDir?: string;
+  runStartupBackupCheck?: boolean;
+}
+
+export interface RepositoryDatabaseAuditResult {
+  available: boolean;
+  status: string;
+  historicalCorpusStatus: string;
+  path: string;
+  sizeBytes: number;
+  integrity: string;
+  totalRows: number;
+  perBrain: Array<{ brain: string; count: number }>;
+  rootRecords: number;
+  childRecords: number;
+}
+
+/**
+ * Non-destructively audits a SQLite database file on disk without modifying or fabricating any records.
+ * Explicitly reports `INCONCLUSIVE — DATABASE NOT AVAILABLE` when the database file is missing.
+ */
+export function auditRepositoryDatabase(
+  targetDbPath: string = path.join(process.cwd(), 'data', 'brain.db')
+): RepositoryDatabaseAuditResult {
+  if (!targetDbPath || !fs.existsSync(targetDbPath)) {
+    return {
+      available: false,
+      status: 'INCONCLUSIVE — DATABASE NOT AVAILABLE',
+      historicalCorpusStatus: 'INCONCLUSIVE — DATABASE NOT AVAILABLE',
+      path: targetDbPath,
+      sizeBytes: 0,
+      integrity: 'missing',
+      totalRows: 0,
+      perBrain: [],
+      rootRecords: 0,
+      childRecords: 0,
+    };
+  }
+
+  let statSize = 0;
+  try {
+    statSize = fs.statSync(targetDbPath).size;
+  } catch {}
+  if (statSize === 0) {
+    return {
+      available: false,
+      status: 'INCONCLUSIVE — DATABASE NOT AVAILABLE',
+      historicalCorpusStatus: 'INCONCLUSIVE — DATABASE NOT AVAILABLE',
+      path: targetDbPath,
+      sizeBytes: 0,
+      integrity: 'empty',
+      totalRows: 0,
+      perBrain: [],
+      rootRecords: 0,
+      childRecords: 0,
+    };
+  }
+
+  const readDb = new DatabaseSync(targetDbPath, { open: true, readOnly: true });
+  try {
+    const integrityRow = readDb.prepare('PRAGMA integrity_check').get() as
+      | { integrity_check?: string }
+      | undefined;
+    const integrity = integrityRow?.integrity_check || 'unknown';
+    const totalRows = (
+      readDb.prepare('SELECT COUNT(*) as c FROM facts').get() as { c: number }
+    ).c;
+    const perBrain = readDb
+      .prepare(
+        'SELECT brain, COUNT(*) as count FROM facts GROUP BY brain ORDER BY brain'
+      )
+      .all() as Array<{ brain: string; count: number }>;
+    const rootRecords = (
+      readDb
+        .prepare('SELECT COUNT(*) as c FROM facts WHERE is_document_root = 1')
+        .get() as { c: number }
+    ).c;
+    const childRecords = (
+      readDb
+        .prepare('SELECT COUNT(*) as c FROM facts WHERE parent_id IS NOT NULL')
+        .get() as { c: number }
+    ).c;
+
+    const hasPostImportCorpus = totalRows > INITIAL_SEED_FACTS.length;
+    return {
+      available: true,
+      status: hasPostImportCorpus
+        ? 'VERIFIED — POST-IMPORT RECORDS PRESENT ON DISK'
+        : 'INCONCLUSIVE — POST-IMPORT 200-FILE DATABASE NOT AVAILABLE ON DISK (ONLY 13 SEED RECORDS PRESENT)',
+      historicalCorpusStatus: hasPostImportCorpus
+        ? 'PRESENT'
+        : 'INCONCLUSIVE — DATABASE NOT AVAILABLE FOR 200-FILE CORPUS (ONLY 13 SEED RECORDS ON DISK)',
+      path: targetDbPath,
+      sizeBytes: statSize,
+      integrity,
+      totalRows,
+      perBrain,
+      rootRecords,
+      childRecords,
+    };
+  } finally {
+    try {
+      readDb.close();
+    } catch {}
+  }
+}
+
+export const SCHEDULER_LOCK_MAX_AGE_MS = 15 * 60 * 1000; // 15-minute emergency ceiling
+
+export interface SchedulerLockPayload {
+  ownerId: string;
+  pid: number;
+  acquiredAt: number;
+}
+
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    // EPERM means the process exists even if owned by another user; ESRCH means dead
+    return err?.code === 'EPERM';
+  }
+}
+
+/**
+ * Acquires `.scheduler.lock` atomically (`wx`).
+ * Never steals a lock held by an active live process unless it exceeds the 15-minute emergency ceiling.
+ * Only cleans up an existing lock if its holding PID is dead (`!isProcessAlive(pid)`) or past 15 minutes.
+ */
+export function acquireSchedulerLock(
+  lockPath: string,
+  ownerId: string = `${process.pid}-${Date.now()}-${crypto.randomUUID()}`,
+  maxAgeMs: number = SCHEDULER_LOCK_MAX_AGE_MS
+): { acquired: boolean; ownerId: string } {
+  const dir = path.dirname(lockPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  if (fs.existsSync(lockPath)) {
+    try {
+      const raw = fs.readFileSync(lockPath, 'utf8');
+      const parsed = JSON.parse(raw) as Partial<SchedulerLockPayload>;
+      const lockPid = Number(parsed.pid);
+      const acquiredAt = Number(parsed.acquiredAt) || 0;
+      const ageMs = Date.now() - acquiredAt;
+      const holderDead = Number.isInteger(lockPid) && lockPid > 0 && !isProcessAlive(lockPid);
+      const expiredCeiling = acquiredAt > 0 && ageMs > maxAgeMs;
+
+      if (holderDead || expiredCeiling) {
+        try {
+          fs.unlinkSync(lockPath);
+        } catch {}
+      } else {
+        // Active process owns the lock — do not steal it!
+        return { acquired: false, ownerId };
+      }
+    } catch {
+      // If lock file is currently being written or unreadable, only remove if file mtime exceeds maxAgeMs
+      try {
+        const stat = fs.statSync(lockPath);
+        if (Date.now() - stat.mtimeMs > maxAgeMs) {
+          fs.unlinkSync(lockPath);
+        } else {
+          return { acquired: false, ownerId };
+        }
+      } catch {
+        return { acquired: false, ownerId };
+      }
+    }
+  }
+
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(lockPath, 'wx');
+    const payload: SchedulerLockPayload = {
+      ownerId,
+      pid: process.pid,
+      acquiredAt: Date.now(),
+    };
+    fs.writeFileSync(fd, JSON.stringify(payload), 'utf8');
+    fs.closeSync(fd);
+    fd = null;
+    return { acquired: true, ownerId };
+  } catch {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+    return { acquired: false, ownerId };
+  }
+}
+
+/**
+ * Releases `.scheduler.lock` ONLY if the lock file on disk is still owned by `expectedOwnerId` and `expectedPid`.
+ * Prevents a process from ever deleting another process's lock.
+ */
+export function releaseSchedulerLockIfOwned(
+  lockPath: string,
+  expectedOwnerId: string,
+  expectedPid: number = process.pid
+): boolean {
+  if (!fs.existsSync(lockPath)) return false;
+  try {
+    const raw = fs.readFileSync(lockPath, 'utf8');
+    const parsed = JSON.parse(raw) as Partial<SchedulerLockPayload>;
+    if (parsed.ownerId === expectedOwnerId && parsed.pid === expectedPid) {
+      fs.unlinkSync(lockPath);
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 function formatSafeDisplayPath(targetPath: string): string {
@@ -2867,18 +3083,11 @@ export function createBrainApp(
       fs.mkdirSync(resolvedBackupDir, { recursive: true });
     }
     const lockPath = path.join(resolvedBackupDir, '.scheduler.lock');
-    let lockFd: number | null = null;
-    try {
-      if (fs.existsSync(lockPath)) {
-        const lockStat = fs.statSync(lockPath);
-        if (Date.now() - lockStat.mtimeMs > 30_000) {
-          fs.unlinkSync(lockPath);
-        }
-      }
-      lockFd = fs.openSync(lockPath, 'wx');
-    } catch {
+    const lockAttempt = acquireSchedulerLock(lockPath);
+    if (!lockAttempt.acquired) {
       return { triggered: false, settings: initialSettings };
     }
+    const myLockOwnerId = lockAttempt.ownerId;
 
     schedulerInFlight = true;
     const startedAt = Date.now();
@@ -2970,21 +3179,20 @@ export function createBrainApp(
       };
     } finally {
       schedulerInFlight = false;
-      if (lockFd !== null) {
-        try {
-          fs.closeSync(lockFd);
-        } catch {}
-      }
-      try {
-        if (fs.existsSync(lockPath)) {
-          fs.unlinkSync(lockPath);
-        }
-      } catch {}
+      releaseSchedulerLockIfOwned(lockPath, myLockOwnerId, process.pid);
     }
   }
 
   // Start background automatic backup scheduler check (every 60s, unref'd so tests never hang)
   if (resolvedDbPath !== ':memory:') {
+    if (
+      options.runStartupBackupCheck === true ||
+      process.env.BRAIN_RUN_STARTUP_BACKUP_CHECK === 'true'
+    ) {
+      try {
+        runScheduledBackupIfDue();
+      } catch {}
+    }
     const schedulerTimer = setInterval(() => {
       try {
         runScheduledBackupIfDue();

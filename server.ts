@@ -20,6 +20,9 @@ if (!fs.existsSync(DB_DIR)) {
 const DB_PATH = process.env.BRAIN_DB_PATH
   ? path.resolve(process.env.BRAIN_DB_PATH)
   : path.join(DB_DIR, 'brain.db');
+const BACKUP_DIR = process.env.BRAIN_BACKUP_DIR
+  ? path.resolve(process.env.BRAIN_BACKUP_DIR)
+  : path.join(path.dirname(DB_PATH), 'backups');
 
 // Safe SQLite initialization:
 // - Runs versioned schema migrations with pre-migration backup
@@ -28,10 +31,14 @@ const DB_PATH = process.env.BRAIN_DB_PATH
 const { db } = initializeDatabase(DB_PATH, {
   seedOnBrandNewDb: process.env.BRAIN_SEED_DEMO !== 'false',
   forceDemoSeed: process.env.BRAIN_SEED_DEMO === 'true',
-  backupDir: path.join(DB_DIR, 'backups'),
+  backupDir: BACKUP_DIR,
 });
 
-const app = createBrainApp(db);
+const app = createBrainApp(db, {
+  dbPath: DB_PATH,
+  backupDir: BACKUP_DIR,
+  runStartupBackupCheck: true,
+});
 
 async function setupFrontend() {
   const isDev = process.env.NODE_ENV !== 'production';

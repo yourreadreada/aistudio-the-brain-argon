@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import { spawn } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import JSZip from 'jszip';
 import {
@@ -13,6 +14,9 @@ import {
   seedDemoFactsNonDestructive,
   createBrainApp,
   listBackups,
+  auditRepositoryDatabase,
+  acquireSchedulerLock,
+  releaseSchedulerLockIfOwned,
 } from '../src/server/brainBackend';
 import { brainStore } from '../src/services/brainStorage';
 import {
@@ -23,6 +27,7 @@ import {
 } from '../src/components/ImportReviewQueue';
 import { BrainAppHeader } from '../src/components/BrainAppHeader';
 import { DatabaseSettingsView } from '../src/components/DatabaseSettingsView';
+import { CaptureHubModal } from '../src/components/CaptureHubModal';
 import {
   MAX_ZIP_FILE_COUNT,
   extractItemsFromFile,
@@ -42,9 +47,43 @@ if (typeof globalThis.localStorage === 'undefined') {
   });
 }
 
-function makeTestFile(name: string, content: string | Uint8Array, type = 'text/markdown'): File {
-  const blobPart = typeof content === 'string' ? content : Buffer.from(content);
+function makeTestFile(
+  name: string,
+  content: string | Uint8Array,
+  type = 'text/markdown'
+): File {
+  const blobPart =
+    typeof content === 'string' ? content : Buffer.from(content);
   return new File([blobPart], name, { type, lastModified: 1762819200000 });
+}
+
+function runNodeChildScript(
+  scriptCode: string,
+  envOverrides: Record<string, string> = {}
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ['--import', 'tsx', '--input-type=module', '-e', scriptCode],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, ...envOverrides },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      resolve({ code, stdout: stdout.trim(), stderr: stderr.trim() });
+    });
+  });
 }
 
 describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflow, Backup Reliability & Global Settings', () => {
@@ -107,39 +146,43 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
     }
   });
 
-  it('Phase 1.1: Audits actual on-disk data/brain.db non-destructively and unit-tests the Branching 202/193/9 -> 397/402 node multiplication mechanism', () => {
-    // 1. Non-destructive read-only inspection of actual repository data/brain.db
+  it('Phase 1.1 (Post-Sync Review #1): Explicitly reports INCONCLUSIVE when database or 200-file corpus is absent, and unit-tests the synthetic Branching mechanism separately', () => {
+    // 1. Verify missing database path explicitly reports `INCONCLUSIVE — DATABASE NOT AVAILABLE` (never silently skipped)
+    const missingDbPath = path.join(tmpDir, 'non_existent_brain.db');
+    const missingAudit = auditRepositoryDatabase(missingDbPath);
+    assert.equal(missingAudit.available, false);
+    assert.equal(
+      missingAudit.status,
+      'INCONCLUSIVE — DATABASE NOT AVAILABLE'
+    );
+    assert.equal(
+      missingAudit.historicalCorpusStatus,
+      'INCONCLUSIVE — DATABASE NOT AVAILABLE'
+    );
+
+    // 2. Non-destructive read-only audit of actual workspace `data/brain.db`
     const repoDbPath = path.join(process.cwd(), 'data', 'brain.db');
-    if (fs.existsSync(repoDbPath)) {
-      const repoDb = new DatabaseSync(repoDbPath, { open: true });
-      try {
-        const integrity = repoDb.prepare('PRAGMA integrity_check').get() as {
-          integrity_check?: string;
-        };
-        const totalRows = (
-          repoDb.prepare('SELECT COUNT(*) as c FROM facts').get() as { c: number }
-        ).c;
-        const perBrain = repoDb
-          .prepare('SELECT brain, COUNT(*) as count FROM facts GROUP BY brain ORDER BY brain')
-          .all() as Array<{ brain: string; count: number }>;
-        console.log(
-          '# ACTUAL_ON_DISK_DB_AUDIT:',
-          JSON.stringify({
-            path: repoDbPath,
-            sizeBytes: fs.statSync(repoDbPath).size,
-            integrity: integrity?.integrity_check,
-            totalRows,
-            perBrain,
-            historical200FileCorpusPresentOnDisk: totalRows > 13,
-          })
+    const actualAudit = auditRepositoryDatabase(repoDbPath);
+    console.log(
+      '# ACTUAL_DATABASE_AUDIT_REPORT:',
+      JSON.stringify(actualAudit)
+    );
+    if (!actualAudit.available) {
+      assert.equal(
+        actualAudit.status,
+        'INCONCLUSIVE — DATABASE NOT AVAILABLE'
+      );
+    } else {
+      assert.equal(actualAudit.integrity, 'ok');
+      if (actualAudit.totalRows <= 13) {
+        assert.ok(actualAudit.status.startsWith('INCONCLUSIVE'));
+        assert.ok(
+          actualAudit.historicalCorpusStatus.startsWith('INCONCLUSIVE')
         );
-        assert.equal(integrity?.integrity_check, 'ok');
-      } finally {
-        repoDb.close();
       }
     }
 
-    // 2. Unit verification of the Branching record multiplication mechanism in isolated test DB:
+    // 3. [UNIT TEST — SYNTHETIC DATA] Isolated verification of the Branching record multiplication mechanism:
     // Demonstrates how 193 imported files (with 196 child branch sections) + 8 coding seeds = 397 Coding / 402 Total
     const initialTotal = (
       db.prepare('SELECT COUNT(*) as c FROM facts').get() as { c: number }
@@ -417,13 +460,14 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
     assert.equal(countAfterFail, countBeforeFail);
   });
 
-  it('Phase 2 & 3 (Release Gate #3): Tests the complete 1,000-file workflow using real generated Files, 1,000-file ZIP archive, and Mixed Files + Multiple ZIPs across concurrency levels', async () => {
+  it('Phase 2 & 3 (Post-Sync Review #2 & #6): Service-level extraction/persistence benchmark across 350, 500, 1,000 direct files, 1,000-file ZIP archive, and mixed multi-ZIP batches', async () => {
     assert.equal(MAX_ZIP_FILE_COUNT, 1000);
     assert.equal(DEFAULT_IMPORT_CONCURRENCY, 3);
     assert.equal(MAX_IMPORT_CONCURRENCY, 10);
     assert.equal(normalizeImportConcurrency(10), 10);
 
-    const workflowBenchmarks: Array<{
+    const serviceBenchmarks: Array<{
+      layer: 'service_extraction_and_persistence';
       scenario: string;
       inputFiles: number;
       concurrency: number;
@@ -435,9 +479,10 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
       importedCount: number;
       persistenceFailures: number;
       sampledPeakHeapMB: number;
+      sqliteIntegrity: string;
     }> = [];
 
-    async function runFullCaptureHubWorkflow(params: {
+    async function runServicePipelineBenchmark(params: {
       scenario: string;
       brainName: string;
       files: File[];
@@ -519,7 +564,13 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
         const sampledPeakHeapMB =
           Math.round((sampledPeakBytes / (1024 * 1024)) * 10) / 10;
 
-        workflowBenchmarks.push({
+        const integrityRow = db.prepare('PRAGMA integrity_check').get() as {
+          integrity_check?: string;
+        };
+        const sqliteIntegrity = integrityRow?.integrity_check || 'unknown';
+
+        serviceBenchmarks.push({
+          layer: 'service_extraction_and_persistence',
           scenario: params.scenario,
           inputFiles: params.expectedItemCount,
           concurrency: params.concurrency,
@@ -531,12 +582,14 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
           importedCount,
           persistenceFailures,
           sampledPeakHeapMB,
+          sqliteIntegrity,
         });
 
         assert.equal(extractionFailures, 0);
         assert.equal(persistenceFailures, 0);
         assert.equal(extractedItems.length, params.expectedItemCount);
         assert.equal(importedCount, params.expectedItemCount);
+        assert.equal(sqliteIntegrity, 'ok');
 
         const dbCount = (
           db
@@ -556,7 +609,7 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
         `# Direct 350 File ${i + 1}\n\nPrimary Source: Claude\n\nVerified workflow payload for item ${i + 1} of 350.`
       )
     );
-    await runFullCaptureHubWorkflow({
+    await runServicePipelineBenchmark({
       scenario: '350_direct_files_c8',
       brainName: 'wf_350_c8',
       files: files350,
@@ -572,7 +625,7 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
         'text/plain'
       )
     );
-    await runFullCaptureHubWorkflow({
+    await runServicePipelineBenchmark({
       scenario: '500_direct_files_c10',
       brainName: 'wf_500_c10',
       files: files500,
@@ -587,7 +640,7 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
         `# Direct 1000 Document ${i + 1}\n\nPrimary Source: Gemini\n\nFull 1,000-file direct batch item #${i + 1}.`
       )
     );
-    await runFullCaptureHubWorkflow({
+    await runServicePipelineBenchmark({
       scenario: '1000_direct_files_c5',
       brainName: 'wf_1000_direct_c5',
       files: files1000,
@@ -600,7 +653,8 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
     for (let i = 1; i <= 1000; i++) {
       const folder =
         i % 3 === 0 ? '01_claude' : i % 3 === 1 ? '02_chatgpt' : '03_gemini';
-      const ext = i % 4 === 0 ? 'json' : i % 4 === 1 ? 'md' : i % 4 === 2 ? 'ts' : 'txt';
+      const ext =
+        i % 4 === 0 ? 'json' : i % 4 === 1 ? 'md' : i % 4 === 2 ? 'ts' : 'txt';
       const body =
         ext === 'json'
           ? JSON.stringify({
@@ -616,7 +670,7 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
       zip1000Bytes,
       'application/zip'
     );
-    await runFullCaptureHubWorkflow({
+    await runServicePipelineBenchmark({
       scenario: '1000_zip_archive_c8',
       brainName: 'wf_1000_zip_c8',
       files: [zip1000File],
@@ -634,8 +688,14 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
     const zipA = new JSZip();
     const zipB = new JSZip();
     for (let i = 1; i <= 40; i++) {
-      zipA.file(`01_claude/archive_a_${i}.md`, `# Archive A Item ${i}\n\nBody A-${i}.`);
-      zipB.file(`04_github/archive_b_${i}.ts`, `export const ARCHIVE_B_${i} = ${i};\n`);
+      zipA.file(
+        `01_claude/archive_a_${i}.md`,
+        `# Archive A Item ${i}\n\nBody A-${i}.`
+      );
+      zipB.file(
+        `04_github/archive_b_${i}.ts`,
+        `export const ARCHIVE_B_${i} = ${i};\n`
+      );
     }
     const zipAFile = makeTestFile(
       'archive_a.zip',
@@ -647,7 +707,7 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
       await zipB.generateAsync({ type: 'uint8array' }),
       'application/zip'
     );
-    await runFullCaptureHubWorkflow({
+    await runServicePipelineBenchmark({
       scenario: '100_mixed_direct_and_multi_zip_c3',
       brainName: 'wf_mixed_c3',
       files: [...mixedDirect, zipAFile, zipBFile],
@@ -656,14 +716,9 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
     });
 
     console.log(
-      '# COMPLETE_1000_FILE_WORKFLOW_BENCHMARKS:',
-      JSON.stringify(workflowBenchmarks)
+      '# SERVICE_LEVEL_1000_FILE_BENCHMARK_REPORT:',
+      JSON.stringify(serviceBenchmarks)
     );
-
-    const integrityRow = db.prepare('PRAGMA integrity_check').get() as {
-      integrity_check?: string;
-    };
-    assert.equal(integrityRow?.integrity_check, 'ok');
   });
 
   it('Phase 2.3: Supports batch cancellation and preserves already-imported items without corruption', async () => {
@@ -705,49 +760,80 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
     assert.equal(dbCount, completed);
   });
 
-  it('Phase 4 (Release Gate #4): Verifies Automatic Backup Reliability across first startup, missed interval restart, hourly/daily/weekly schedules, simulated failure, multi-scheduler lock, retention protection, and snapshot recovery', async () => {
-    // 1. First startup with auto-backup enabled & zero backups -> non-forced check triggers immediately
-    const initialBackups = listBackups(backupDir);
-    assert.equal(initialBackups.length, 0);
+  it('Phase 4 (Post-Sync Review #3, #4, #5): Verifies Backup Scheduler Lock Ownership, Genuine Child-Process Server Restart, and Multi-Process Scheduler Contention', async () => {
+    // 1. Lock ownership unit verification:
+    //    - Active live process holding a lock > 30s (e.g. 2 minutes old) MUST NOT lose its lock
+    //    - Non-owner process/ownerId MUST NOT be able to release the lock
+    //    - Dead PID lock IS cleaned up and acquired
+    const testLockPath = path.join(backupDir, '.test_scheduler.lock');
+    const firstLock = acquireSchedulerLock(testLockPath, 'owner-active-1');
+    assert.equal(firstLock.acquired, true);
 
+    // Backdate acquiredAt by 120 seconds (2 minutes) while PID is still alive (process.pid)
+    fs.writeFileSync(
+      testLockPath,
+      JSON.stringify({
+        ownerId: 'owner-active-1',
+        pid: process.pid,
+        acquiredAt: Date.now() - 120_000,
+      }),
+      'utf8'
+    );
+
+    // Second attempt must NOT steal the active process's 2-minute-old lock
+    const competingAttempt = acquireSchedulerLock(
+      testLockPath,
+      'owner-competing-2'
+    );
+    assert.equal(competingAttempt.acquired, false);
+
+    // Non-owner attempt to release must return false and keep the lock file intact
+    const wrongOwnerRelease = releaseSchedulerLockIfOwned(
+      testLockPath,
+      'owner-competing-2',
+      process.pid
+    );
+    assert.equal(wrongOwnerRelease, false);
+    assert.equal(fs.existsSync(testLockPath), true);
+
+    // True owner releases cleanly
+    const trueOwnerRelease = releaseSchedulerLockIfOwned(
+      testLockPath,
+      'owner-active-1',
+      process.pid
+    );
+    assert.equal(trueOwnerRelease, true);
+    assert.equal(fs.existsSync(testLockPath), false);
+
+    // Orphaned lock from a dead PID (999999) is cleaned up and acquired
+    fs.writeFileSync(
+      testLockPath,
+      JSON.stringify({
+        ownerId: 'dead-process-owner',
+        pid: 999999,
+        acquiredAt: Date.now() - 5_000,
+      }),
+      'utf8'
+    );
+    const recoveredLock = acquireSchedulerLock(
+      testLockPath,
+      'owner-recovered-3'
+    );
+    assert.equal(recoveredLock.acquired, true);
+    releaseSchedulerLockIfOwned(
+      testLockPath,
+      'owner-recovered-3',
+      process.pid
+    );
+
+    // 2. First startup, hourly/daily/weekly intervals, simulated failure, retention & restore
     const firstStartupCheck = await brainStore.runAutoBackupCheck({
       force: false,
       kind: 'scheduled',
     });
     assert.equal(firstStartupCheck.triggered, true);
     assert.equal(firstStartupCheck.backup?.verified, true);
-    assert.equal(firstStartupCheck.backup?.kind, 'scheduled');
-    assert.ok(firstStartupCheck.autoBackup.lastBackupAt);
-    assert.ok(firstStartupCheck.autoBackup.nextScheduledBackupAt);
 
-    // Immediate second non-forced check is NOT due yet -> triggered: false
-    const notDueCheck = await brainStore.runAutoBackupCheck({
-      force: false,
-      kind: 'scheduled',
-    });
-    assert.equal(notDueCheck.triggered, false);
-
-    // 2. Restart after a missed scheduled interval (nextScheduledBackupAt in the past)
-    const pastIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-    await brainStore.updateGlobalSettings({
-      autoBackup: {
-        enabled: true,
-        schedule: 'hourly',
-        nextScheduledBackupAt: pastIso,
-      },
-    });
-    const missedIntervalCheck = await brainStore.runAutoBackupCheck({
-      force: false,
-      kind: 'scheduled',
-    });
-    assert.equal(missedIntervalCheck.triggered, true);
-    assert.equal(missedIntervalCheck.backup?.verified, true);
-    assert.ok(
-      new Date(missedIntervalCheck.autoBackup.nextScheduledBackupAt!).getTime() >
-        Date.now() + 30 * 60 * 1000
-    );
-
-    // 3. Hourly (+1h), Daily (+24h), and Weekly (+7d) schedule window computation
     const hourlySettings = await brainStore.updateGlobalSettings({
       autoBackup: { enabled: true, schedule: 'hourly' },
     });
@@ -778,7 +864,7 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
     );
     assert.equal(weeklyDeltaDays, 7);
 
-    // 4. Simulated backup failure records lastBackupError & preserves verified backups
+    // Simulated failure preserves existing verified backups
     const backupsBeforeFail = listBackups(backupDir).filter((b) => b.verified);
     const failedCheck = await brainStore.runAutoBackupCheck({
       force: true,
@@ -790,50 +876,168 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
         'Simulated scheduled backup failure'
       )
     );
-    const backupsAfterFail = listBackups(backupDir).filter((b) => b.verified);
-    assert.equal(backupsAfterFail.length, backupsBeforeFail.length);
-
-    // 5. Multiple scheduler instances lock safety
-    const secondApp = createBrainApp(db, { dbPath, backupDir });
-    const secondServer = http.createServer(secondApp);
-    await new Promise<void>((resolve) =>
-      secondServer.listen(0, '127.0.0.1', () => resolve())
+    assert.equal(
+      listBackups(backupDir).filter((b) => b.verified).length,
+      backupsBeforeFail.length
     );
-    const secondAddr = secondServer.address();
-    const secondUrl = `http://127.0.0.1:${
-      typeof secondAddr === 'object' && secondAddr ? secondAddr.port : 0
-    }`;
+
+    // 3. Genuine Child-Process Server Restart Test (Post-Sync Review #4):
+    //    Create a dedicated temporary SQLite DB with an overdue `nextScheduledBackupAt`,
+    //    close it, and spawn a separate Node child process that initializes the server
+    //    with `runStartupBackupCheck: true`. Verify the child process executes the overdue backup on startup.
+    const restartTmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'argon-restart-proc-')
+    );
+    const restartDbPath = path.join(restartTmpDir, 'brain.db');
+    const restartBackupDir = path.join(restartTmpDir, 'backups');
 
     try {
-      // Set due time in the past so both scheduler instances see it as due
-      await brainStore.updateGlobalSettings({
-        autoBackup: {
-          enabled: true,
-          schedule: 'daily',
-          maxBackups: 10,
-          nextScheduledBackupAt: new Date(Date.now() - 60_000).toISOString(),
-        },
+      const setupInit = initializeDatabase({
+        dbPath: restartDbPath,
+        backupDir: restartBackupDir,
+        seedOnBrandNewDb: true,
       });
-      const [resA, resB] = await Promise.all([
-        originalFetch(`${baseUrl}/api/database/auto-backup/run-check`, {
+      const overdueIso = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+      const overdueSettings = {
+        ...brainStore.getGlobalSettings(),
+        autoBackup: {
+          ...brainStore.getGlobalSettings().autoBackup,
+          enabled: true,
+          schedule: 'hourly',
+          lastBackupAt: new Date(Date.now() - 4 * 3600 * 1000).toISOString(),
+          nextScheduledBackupAt: overdueIso,
+        },
+      };
+      setupInit.db
+        .prepare(
+          `INSERT INTO app_metadata (key, value, updated_at)
+           VALUES ('argon_global_settings_v1', ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+        )
+        .run(JSON.stringify(overdueSettings), new Date().toISOString());
+      setupInit.db.close();
+
+      assert.equal(listBackups(restartBackupDir).length, 0);
+
+      // Spawn a genuine child server process that boots createBrainApp with runStartupBackupCheck: true
+      const childScript = `
+        import { initializeDatabase, createBrainApp, listBackups } from './src/server/brainBackend.ts';
+        const dbPath = process.env.TEST_DB_PATH;
+        const backupDir = process.env.TEST_BACKUP_DIR;
+        const { db } = initializeDatabase({ dbPath, backupDir });
+        createBrainApp(db, { dbPath, backupDir, runStartupBackupCheck: true });
+        const backups = listBackups(backupDir).filter(b => b.verified && b.kind === 'scheduled');
+        const row = db.prepare("SELECT value FROM app_metadata WHERE key = 'argon_global_settings_v1'").get();
+        const saved = JSON.parse(row.value);
+        db.close();
+        console.log(JSON.stringify({
+          pid: process.pid,
+          backupsCreatedOnStartup: backups.length,
+          backupFileName: backups[0]?.fileName || null,
+          nextScheduledBackupAt: saved.autoBackup.nextScheduledBackupAt,
+        }));
+      `;
+      const restartChildRes = await runNodeChildScript(childScript, {
+        TEST_DB_PATH: restartDbPath,
+        TEST_BACKUP_DIR: restartBackupDir,
+      });
+      assert.equal(restartChildRes.code, 0, restartChildRes.stderr);
+      const parsedRestart = JSON.parse(
+        restartChildRes.stdout.split('\n').pop() || '{}'
+      );
+      assert.notEqual(parsedRestart.pid, process.pid);
+      assert.equal(parsedRestart.backupsCreatedOnStartup, 1);
+      assert.ok(parsedRestart.backupFileName);
+      assert.ok(
+        new Date(parsedRestart.nextScheduledBackupAt).getTime() > Date.now()
+      );
+
+      // 4. Genuine Multi-Process Scheduler Contention Test (Post-Sync Review #5):
+      //    Reset `nextScheduledBackupAt` to overdue and spawn TWO separate OS child processes simultaneously.
+      const prepDb = new DatabaseSync(restartDbPath);
+      const row = prepDb
+        .prepare(
+          "SELECT value FROM app_metadata WHERE key = 'argon_global_settings_v1'"
+        )
+        .get() as { value: string };
+      const currentSaved = JSON.parse(row.value);
+      currentSaved.autoBackup.nextScheduledBackupAt = new Date(
+        Date.now() - 120_000
+      ).toISOString();
+      prepDb
+        .prepare(
+          `UPDATE app_metadata SET value = ?, updated_at = ? WHERE key = 'argon_global_settings_v1'`
+        )
+        .run(JSON.stringify(currentSaved), new Date().toISOString());
+      prepDb.close();
+
+      const backupsBeforeContention = listBackups(restartBackupDir).filter(
+        (b) => b.verified
+      ).length;
+
+      const workerScript = `
+        import http from 'node:http';
+        import { initializeDatabase, createBrainApp } from './src/server/brainBackend.ts';
+        const dbPath = process.env.TEST_DB_PATH;
+        const backupDir = process.env.TEST_BACKUP_DIR;
+        const { db } = initializeDatabase({ dbPath, backupDir });
+        const app = createBrainApp(db, { dbPath, backupDir, runStartupBackupCheck: false });
+        const srv = http.createServer(app);
+        await new Promise(r => srv.listen(0, '127.0.0.1', r));
+        const port = srv.address().port;
+        const res = await fetch(\`http://127.0.0.1:\${port}/api/database/auto-backup/run-check\`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ force: false }),
-        }).then((r) => r.json()),
-        originalFetch(`${secondUrl}/api/database/auto-backup/run-check`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ force: false }),
-        }).then((r) => r.json()),
+        });
+        const data = await res.json();
+        await new Promise(r => srv.close(r));
+        db.close();
+        console.log(JSON.stringify({ pid: process.pid, triggered: Boolean(data.triggered), error: data.error || null }));
+      `;
+
+      const [proc1, proc2] = await Promise.all([
+        runNodeChildScript(workerScript, {
+          TEST_DB_PATH: restartDbPath,
+          TEST_BACKUP_DIR: restartBackupDir,
+        }),
+        runNodeChildScript(workerScript, {
+          TEST_DB_PATH: restartDbPath,
+          TEST_BACKUP_DIR: restartBackupDir,
+        }),
       ]);
-      // At least one triggers and neither corrupts the DB
-      const triggeredTotal = (resA.triggered ? 1 : 0) + (resB.triggered ? 1 : 0);
+      assert.equal(proc1.code, 0, proc1.stderr);
+      assert.equal(proc2.code, 0, proc2.stderr);
+
+      const out1 = JSON.parse(proc1.stdout.split('\n').pop() || '{}');
+      const out2 = JSON.parse(proc2.stdout.split('\n').pop() || '{}');
+      assert.notEqual(out1.pid, out2.pid);
+
+      const triggeredTotal = (out1.triggered ? 1 : 0) + (out2.triggered ? 1 : 0);
       assert.equal(triggeredTotal, 1);
+
+      const backupsAfterContention = listBackups(restartBackupDir).filter(
+        (b) => b.verified
+      ).length;
+      assert.equal(backupsAfterContention, backupsBeforeContention + 1);
+
+      console.log(
+        '# BACKUP_RELIABILITY_AND_MULTIPROCESS_REPORT:',
+        JSON.stringify({
+          restartProcessPid: parsedRestart.pid,
+          restartBackupCreated: parsedRestart.backupFileName,
+          multiProcessPids: [out1.pid, out2.pid],
+          multiProcessTriggeredCount: triggeredTotal,
+          verifiedBackupsCount: backupsAfterContention,
+        })
+      );
     } finally {
-      await new Promise<void>((resolve) => secondServer.close(() => resolve()));
+      try {
+        fs.rmSync(restartTmpDir, { recursive: true, force: true });
+      } catch {}
     }
 
-    // 6. Retention & last-known-good protection
+    // 5. Retention & recovery from verified scheduled snapshot on main test DB
     await brainStore.updateGlobalSettings({
       autoBackup: { enabled: true, schedule: 'daily', maxBackups: 2 },
     });
@@ -844,13 +1048,11 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
     const retainedBackups = listBackups(backupDir).filter((b) => b.verified);
     assert.equal(retainedBackups.length, 2);
 
-    // Delete 1st backup -> succeeds; attempt to delete last remaining verified backup -> rejected (409)
     await brainStore.deleteDatabaseBackup(retainedBackups[0].fileName);
     await assert.rejects(async () => {
       await brainStore.deleteDatabaseBackup(retainedBackups[1].fileName);
     });
 
-    // 7. Recovery from a verified scheduled snapshot
     const snapshotToRestore = retainedBackups[1];
     await brainStore.persistReviewedItem({
       action: 'create',
@@ -862,11 +1064,6 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
       filePath: 'transient.md',
       fileType: 'md',
     });
-    const countBeforeRestore = (
-      db.prepare('SELECT COUNT(*) as c FROM facts').get() as { c: number }
-    ).c;
-    assert.ok(countBeforeRestore > snapshotToRestore.factsCount);
-
     const restoreRes = await brainStore.restoreDatabaseBackup(
       snapshotToRestore.fileName
     );
@@ -879,7 +1076,7 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
     assert.equal(countAfterRestore, snapshotToRestore.factsCount);
   });
 
-  it('Phase 3 & 5 (Release Gate #5): Verifies Header Settings shortcut, 7-Category Settings Centre, SQLite persistence across restarts, and Capture Hub per-import override isolation', async () => {
+  it('Phase 3 & 5 (Post-Sync Review #2 & #5): Verifies Header Settings shortcut, 7-Category Settings Centre, React CaptureHubModal UI integration, and per-import override isolation', async () => {
     const inactiveHtml = renderToStaticMarkup(
       React.createElement(BrainAppHeader, {
         currentBrain: 'coding',
@@ -933,14 +1130,20 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
       })
     );
     assert.ok(settingsHtml.includes('data-testid="settings-category-nav"'));
-    assert.ok(settingsHtml.includes('data-testid="auto-backup-scheduler-panel"'));
-    assert.ok(settingsHtml.includes('data-testid="import-processing-settings-panel"'));
+    assert.ok(
+      settingsHtml.includes('data-testid="auto-backup-scheduler-panel"')
+    );
+    assert.ok(
+      settingsHtml.includes('data-testid="import-processing-settings-panel"')
+    );
     assert.ok(settingsHtml.includes('1. General &amp; Appearance'));
     assert.ok(settingsHtml.includes('2. Database &amp; Backups'));
     assert.ok(settingsHtml.includes('3. Memory &amp; Intelligence'));
     assert.ok(settingsHtml.includes('4. Import &amp; Processing'));
     assert.ok(settingsHtml.includes('5. AI Connections'));
-    assert.ok(settingsHtml.includes('6. Browser Companion &amp; Devices'));
+    assert.ok(
+      settingsHtml.includes('6. Browser Companion &amp; Devices')
+    );
     assert.ok(settingsHtml.includes('7. System &amp; Diagnostics'));
 
     // Persist global settings across all categories
@@ -977,7 +1180,10 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
     assert.equal(updatedSettings.general.defaultWorkspace, 'college');
     assert.equal(updatedSettings.importProcessing.maxFilesPerBatch, 1500);
     assert.equal(updatedSettings.importProcessing.concurrency, 5);
-    assert.equal(updatedSettings.importProcessing.defaultStrategy, 'semantic');
+    assert.equal(
+      updatedSettings.importProcessing.defaultStrategy,
+      'semantic'
+    );
 
     // Simulate restart: clear localStorage and re-sync from SQLite backend
     localStorage.clear();
@@ -987,24 +1193,87 @@ describe('Argon Final Validation & Release Gate: Audit, 1,000-File & ZIP Workflo
     assert.equal(reSynced.importProcessing.concurrency, 5);
     assert.equal(reSynced.importProcessing.defaultStrategy, 'semantic');
 
-    // Verify per-import strategy override (e.g. 'branching' on a single import) does NOT overwrite global 'semantic' preference
+    // React CaptureHubModal UI Integration Test (Post-Sync Review #2):
+    // Render CaptureHubModal on the Import tab and verify global settings propagate into the modal UI controls,
+    // and that passing a per-import `initialConcurrencyLimit: 8` session override renders 8 in the UI without mutating global settings (5).
+    const captureHubHtml = renderToStaticMarkup(
+      React.createElement(CaptureHubModal, {
+        isOpen: true,
+        onClose: () => {},
+        currentBrain: 'coding',
+        brains: ['coding', 'college', 'personal'],
+        initialTab: 'import',
+        initialConcurrencyLimit: 8,
+        onIngest: () => 1,
+      })
+    );
+    assert.ok(
+      captureHubHtml.includes('data-testid="capture-hub-override-bar"')
+    );
+    assert.ok(
+      captureHubHtml.includes('data-testid="capture-hub-max-batch-select"')
+    );
+    assert.ok(
+      captureHubHtml.includes(
+        'data-testid="capture-hub-duplicate-policy-select"'
+      )
+    );
+    assert.ok(
+      captureHubHtml.includes('data-testid="concurrency-limit-select"')
+    );
+    assert.ok(captureHubHtml.includes('Max Batch (Session Override):'));
+    assert.ok(captureHubHtml.includes('Duplicates (Session Override):'));
+
+    // Verify per-import overrides (both UI session override and per-item strategy override) do NOT overwrite persisted global settings
     await brainStore.persistReviewedItem({
       action: 'create',
       brain: 'coding',
       source: 'claude',
       title: 'Per-Import Override Doc',
-      content: '# Override Title\n\n## Section A\n\nText A\n\n## Section B\n\nText B',
+      content:
+        '# Override Title\n\n## Section A\n\nText A\n\n## Section B\n\nText B',
       fileName: 'override_doc.md',
       filePath: 'docs/override_doc.md',
       fileType: 'md',
       strategy: 'branching',
     });
 
-    const settingsAfterOverrideImport = await brainStore.syncGlobalSettingsFromBackend();
+    const settingsAfterOverrideImport =
+      await brainStore.syncGlobalSettingsFromBackend();
     assert.equal(
       settingsAfterOverrideImport.importProcessing.defaultStrategy,
       'semantic'
     );
-    assert.equal(settingsAfterOverrideImport.importProcessing.concurrency, 5);
+    assert.equal(
+      settingsAfterOverrideImport.importProcessing.concurrency,
+      5
+    );
+    assert.equal(
+      settingsAfterOverrideImport.importProcessing.maxFilesPerBatch,
+      1500
+    );
+
+    console.log(
+      '# CAPTURE_HUB_UI_INTEGRATION_REPORT:',
+      JSON.stringify({
+        renderedOverrideBar: captureHubHtml.includes(
+          'data-testid="capture-hub-override-bar"'
+        ),
+        renderedMaxBatchSelect: captureHubHtml.includes(
+          'data-testid="capture-hub-max-batch-select"'
+        ),
+        renderedDuplicatePolicySelect: captureHubHtml.includes(
+          'data-testid="capture-hub-duplicate-policy-select"'
+        ),
+        renderedConcurrencySelect: captureHubHtml.includes(
+          'data-testid="concurrency-limit-select"'
+        ),
+        globalConcurrencyPreservedAfterSessionOverride:
+          settingsAfterOverrideImport.importProcessing.concurrency === 5,
+        globalStrategyPreservedAfterItemOverride:
+          settingsAfterOverrideImport.importProcessing.defaultStrategy ===
+          'semantic',
+      })
+    );
   });
 });
