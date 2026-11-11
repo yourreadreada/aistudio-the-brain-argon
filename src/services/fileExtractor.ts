@@ -54,8 +54,8 @@ export const MAX_XLSX_COLUMNS_PER_ROW = 50;
 
 // Zip safety bounds
 export const MAX_ZIP_RECURSION_DEPTH = 3;
-export const MAX_ZIP_FILE_COUNT = 350;
-export const MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 100 * 1024 * 1024; // 100 MB
+export const MAX_ZIP_FILE_COUNT = 1000;
+export const MAX_ZIP_TOTAL_UNCOMPRESSED_BYTES = 500 * 1024 * 1024; // 500 MB
 
 export interface ExtractedFileResult {
   title: string;
@@ -775,16 +775,29 @@ export function configurePdfWorker(pdfjsLib: any): string {
   return localWorkerUrl;
 }
 
+export interface ExtractItemsOptions {
+  maxFilesPerBatch?: number;
+  signal?: AbortSignal;
+}
+
 /**
  * Unpacks a file or a .zip archive into one or more ExtractedFileResult items for the Review Queue.
  */
 export async function extractItemsFromFile(
   file: File,
-  onProgress?: ExtractionProgressCallback
+  onProgress?: ExtractionProgressCallback,
+  options?: ExtractItemsOptions
 ): Promise<ExtractedFileResult[]> {
   const ext = '.' + (file.name.split('.').pop() || '').toLowerCase();
   if (ext === '.zip') {
-    return await extractZipArchive(file, onProgress);
+    return await extractZipArchive(
+      file,
+      onProgress,
+      1,
+      '',
+      { filesProcessed: 0, totalBytesUnpacked: 0 },
+      options
+    );
   }
   const relativePath = (file as any).webkitRelativePath || file.name;
   const single = await extractTextFromFile(file, onProgress, relativePath);
@@ -1270,8 +1283,13 @@ async function extractZipArchive(
   sharedCounters: { filesProcessed: number; totalBytesUnpacked: number } = {
     filesProcessed: 0,
     totalBytesUnpacked: 0,
-  }
+  },
+  options?: ExtractItemsOptions
 ): Promise<ExtractedFileResult[]> {
+  const effectiveMaxFiles = Math.max(
+    1,
+    Math.min(5000, Math.floor(Number(options?.maxFilesPerBatch) || MAX_ZIP_FILE_COUNT))
+  );
   onProgress?.({
     mode: 'indeterminate',
     phase: 'extracting',
@@ -1326,7 +1344,13 @@ async function extractZipArchive(
   const totalFiles = validPaths.length;
 
   for (let idx = 0; idx < validPaths.length; idx++) {
-    if (sharedCounters.filesProcessed >= MAX_ZIP_FILE_COUNT) {
+    if (options?.signal?.aborted) {
+      break;
+    }
+    if (idx > 0 && idx % 25 === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    if (sharedCounters.filesProcessed >= effectiveMaxFiles) {
       results.push({
         title: 'Archive File Count Limit Reached',
         fileName: zipFile.name,
@@ -1337,7 +1361,9 @@ async function extractZipArchive(
         detectedSource: 'claude',
         status: 'warning',
         extractionStatus: 'warning',
-        statusMessage: `Stopped unpacking after ${MAX_ZIP_FILE_COUNT} files for safety.`,
+        statusMessage: `Stopped unpacking after ${effectiveMaxFiles} files (configured batch limit). Remaining ${
+          validPaths.length - idx
+        } file(s) skipped.`,
       });
       break;
     }
@@ -1414,7 +1440,8 @@ async function extractZipArchive(
           onProgress,
           currentDepth + 1,
           fullArchivePath.replace(/\.zip$/i, ''),
-          sharedCounters
+          sharedCounters,
+          options
         );
         results.push(...nestedResults);
         continue;

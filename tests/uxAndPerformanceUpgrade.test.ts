@@ -89,14 +89,15 @@ describe('Argon UX Refinement & Performance Engineering Suite', () => {
     it('keeps default concurrency at 3 and clamps custom concurrency values safely', () => {
       assert.equal(DEFAULT_IMPORT_CONCURRENCY, 3);
       assert.equal(MIN_IMPORT_CONCURRENCY, 1);
-      assert.equal(MAX_IMPORT_CONCURRENCY, 8);
+      assert.equal(MAX_IMPORT_CONCURRENCY, 10);
       assert.equal(normalizeImportConcurrency(undefined), 3);
       assert.equal(normalizeImportConcurrency(NaN), 3);
       assert.equal(normalizeImportConcurrency(0), 1);
       assert.equal(normalizeImportConcurrency(1), 1);
       assert.equal(normalizeImportConcurrency(3), 3);
       assert.equal(normalizeImportConcurrency(5), 5);
-      assert.equal(normalizeImportConcurrency(99), 8);
+      assert.equal(normalizeImportConcurrency(10), 10);
+      assert.equal(normalizeImportConcurrency(99), 10);
     });
 
     it('enforces configured concurrency limit (e.g. 1, 3, 5) during batch execution', async () => {

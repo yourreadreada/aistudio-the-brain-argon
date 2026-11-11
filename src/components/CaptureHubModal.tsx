@@ -32,6 +32,8 @@ import {
   ImportItemProgress,
   ImportReviewItem,
   BatchExecutionProgress,
+  DuplicateHandlingPolicy,
+  FailedRetryBehaviour,
 } from '../types/brain';
 import {
   brainStore,
@@ -181,14 +183,38 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   currentBrain,
   brains,
   initialTab = 'import',
+  initialConcurrencyLimit,
   onCreateBrain,
   onImportComplete,
 }) => {
+  const initialGlobalImport = brainStore.getGlobalSettings().importProcessing;
   const [activeTab, setActiveTab] = useState<CaptureHubTab>(initialTab);
-  const [defaultBrain, setDefaultBrain] = useState<string>(currentBrain);
-  const [ingestStrategy, setIngestStrategy] =
-    useState<IngestStrategy>('semantic');
-  const [chunkSize, setChunkSize] = useState<number>(1200);
+  const [defaultBrain, setDefaultBrain] = useState<string>(
+    currentBrain || initialGlobalImport.defaultBrain || 'coding'
+  );
+  const [ingestStrategy, setIngestStrategy] = useState<IngestStrategy>(
+    initialGlobalImport.defaultStrategy || 'semantic'
+  );
+  const [chunkSize, setChunkSize] = useState<number>(
+    initialGlobalImport.chunkSize || 1200
+  );
+  const [maxFilesPerBatch, setMaxFilesPerBatch] = useState<number>(
+    initialGlobalImport.maxFilesPerBatch || 1000
+  );
+  const [duplicateDetectionEnabled, setDuplicateDetectionEnabled] =
+    useState<boolean>(initialGlobalImport.duplicateDetectionEnabled ?? true);
+  const [defaultDuplicatePolicy, setDefaultDuplicatePolicy] =
+    useState<DuplicateHandlingPolicy>(
+      initialGlobalImport.defaultDuplicatePolicy || 'skip'
+    );
+  const [maxRetries, setMaxRetries] = useState<number>(
+    initialGlobalImport.maxRetries ?? 2
+  );
+  const [failedRetryBehaviour, setFailedRetryBehaviour] =
+    useState<FailedRetryBehaviour>(
+      initialGlobalImport.failedRetryBehaviour || 'manual'
+    );
+  const [totalRetriedCount, setTotalRetriedCount] = useState<number>(0);
   const [storeRevision, setStoreRevision] = useState<number>(0);
 
   // Inline brain creation inside Capture Hub
@@ -225,9 +251,12 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   const [reviewQueue, setReviewQueue] = useState<ImportReviewItem[]>([]);
   const [selectedQueueIds, setSelectedQueueIds] = useState<string[]>([]);
   const [concurrencyLimit, setConcurrencyLimit] = useState<number>(
-    DEFAULT_IMPORT_CONCURRENCY
+    normalizeImportConcurrency(
+      initialConcurrencyLimit ?? initialGlobalImport.concurrency
+    )
   );
   const completedCheckpointKeysRef = useRef<Set<string>>(new Set());
+  const batchAbortControllerRef = useRef<AbortController | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isCommitting, setIsCommitting] = useState(false);
   const [batchProgress, setBatchProgress] =
@@ -296,6 +325,14 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       };
     }
 
+    if (!duplicateDetectionEnabled) {
+      return {
+        duplicateState: 'new',
+        status: 'ready',
+        resolution: 'create',
+      };
+    }
+
     const effectivePath = (filePath || fileName || '').trim();
     const effectiveFileName = (fileName || effectivePath || 'untitled.md').trim();
 
@@ -315,7 +352,18 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           : 'possible_duplicate'
         : 'new');
 
-    const defaultResolution = getDefaultResolutionForDuplicateState(dupState);
+    let defaultResolution = getDefaultResolutionForDuplicateState(dupState);
+    if (dupState !== 'new' && dupState !== 'unable_to_determine') {
+      if (defaultDuplicatePolicy === 'skip') {
+        defaultResolution = 'skip';
+      } else if (defaultDuplicatePolicy === 'ask_user') {
+        defaultResolution = dupState === 'exact_duplicate' ? 'skip' : 'undecided';
+      } else if (defaultDuplicatePolicy === 'merge') {
+        defaultResolution = dupState === 'exact_duplicate' ? 'skip' : 'merge';
+      } else if (defaultDuplicatePolicy === 'replace') {
+        defaultResolution = dupState === 'exact_duplicate' ? 'skip' : 'replace';
+      }
+    }
 
     return {
       nodeCheck,
@@ -391,18 +439,33 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     return unsubscribe;
   }, []);
 
-  // Sync currentBrain when modal opens
+  // Sync currentBrain and global import settings when modal opens
   useEffect(() => {
     if (isOpen) {
-      setDefaultBrain(currentBrain);
-      setPasteBrain(currentBrain);
-      setExportBrain(currentBrain);
+      const globalImport = brainStore.getGlobalSettings().importProcessing;
+      setDefaultBrain(currentBrain || globalImport.defaultBrain || 'coding');
+      setPasteBrain(currentBrain || globalImport.defaultBrain || 'coding');
+      setExportBrain(currentBrain || globalImport.defaultBrain || 'coding');
+      setIngestStrategy(globalImport.defaultStrategy || 'semantic');
+      setChunkSize(globalImport.chunkSize || 1200);
+      setMaxFilesPerBatch(globalImport.maxFilesPerBatch || 1000);
+      setConcurrencyLimit(
+        normalizeImportConcurrency(
+          initialConcurrencyLimit ?? globalImport.concurrency
+        )
+      );
+      setDuplicateDetectionEnabled(
+        globalImport.duplicateDetectionEnabled ?? true
+      );
+      setDefaultDuplicatePolicy(globalImport.defaultDuplicatePolicy || 'skip');
+      setMaxRetries(globalImport.maxRetries ?? 2);
+      setFailedRetryBehaviour(globalImport.failedRetryBehaviour || 'manual');
       if (initialTab) {
         setActiveTab(initialTab);
       }
       refreshCompanionState();
     }
-  }, [isOpen, currentBrain, initialTab]);
+  }, [isOpen, currentBrain, initialTab, initialConcurrencyLimit]);
 
   const stageCompanionItemsIntoReviewQueue = (
     capturedItems: CompanionCaptureItem[]
@@ -547,6 +610,13 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     const imported = reviewQueue.filter((q) => q.status === 'imported').length;
     const skipped = reviewQueue.filter((q) => q.status === 'skipped').length;
     const failed = reviewQueue.filter((q) => q.status === 'error').length;
+    const pending = reviewQueue.filter(
+      (q) =>
+        q.status === 'ready' ||
+        q.status === 'extracting' ||
+        q.status === 'importing' ||
+        q.status === 'processing'
+    ).length;
     const ready = reviewQueue.filter(
       (q) =>
         q.status === 'ready' &&
@@ -575,12 +645,14 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       imported,
       skipped,
       failed,
+      pending,
+      retried: totalRetriedCount,
       ready,
       needsDecision,
       duplicates,
       totalUnits,
     };
-  }, [reviewQueue]);
+  }, [reviewQueue, totalRetriedCount]);
 
   if (!isOpen) return null;
 
@@ -703,9 +775,24 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
   // --- Workflow 2: File Selection & Review Queue Action Handlers ---
   const handleFilesSelected = async (files: FileList | File[]) => {
     setCommitBanner(null);
-    const fileArray = Array.from(files);
+    const rawFileArray = Array.from(files);
+    const effectiveLimit = Math.max(1, Math.min(5000, maxFilesPerBatch || 1000));
+    const fileArray =
+      rawFileArray.length > effectiveLimit
+        ? rawFileArray.slice(0, effectiveLimit)
+        : rawFileArray;
+
+    if (rawFileArray.length > effectiveLimit) {
+      setCommitBanner({
+        type: 'warning',
+        text: `Selected ${rawFileArray.length} files; capped at configured batch limit of ${effectiveLimit} files per batch (adjustable in Settings → Import & Processing).`,
+      });
+    }
+
+    let discoveredCountInBatch = 0;
 
     for (const file of fileArray) {
+      const remainingSlots = Math.max(1, effectiveLimit - discoveredCountInBatch);
       const placeholderId = `rq-${Date.now()}-${Math.random()
         .toString(36)
         .slice(2, 7)}`;
@@ -742,25 +829,30 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
 
       try {
         const extractedItems: ExtractedFileResult[] =
-          await extractItemsFromFile(file, (progInfo) => {
-            setReviewQueue((prev) =>
-              prev.map((item) =>
-                item.id === placeholderId
-                  ? {
-                      ...item,
-                      progress: {
-                        mode: progInfo.mode,
-                        phase: 'extracting',
-                        current: progInfo.current,
-                        total: progInfo.total,
-                        unit: progInfo.unit,
-                        label: progInfo.label,
-                      },
-                    }
-                  : item
-              )
-            );
-          });
+          await extractItemsFromFile(
+            file,
+            (progInfo) => {
+              setReviewQueue((prev) =>
+                prev.map((item) =>
+                  item.id === placeholderId
+                    ? {
+                        ...item,
+                        progress: {
+                          mode: progInfo.mode,
+                          phase: 'extracting',
+                          current: progInfo.current,
+                          total: progInfo.total,
+                          unit: progInfo.unit,
+                          label: progInfo.label,
+                        },
+                      }
+                    : item
+                )
+              );
+            },
+            { maxFilesPerBatch: remainingSlots }
+          );
+        discoveredCountInBatch += extractedItems.length;
 
         const batchId = `batch_${Date.now().toString(36)}`;
         const nowIso = new Date().toISOString();
@@ -1174,6 +1266,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       ...item,
       simulateFailureOnce: false,
     };
+    setTotalRetriedCount((r) => r + 1);
     const ok = await executeItemPersistence(cleanItem, retryAction);
     onImportComplete?.({
       imported: ok ? 1 : 0,
@@ -1181,6 +1274,12 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
       failed: ok ? 0 : 1,
     });
     return ok;
+  };
+
+  const handleCancelBatch = () => {
+    if (batchAbortControllerRef.current) {
+      batchAbortControllerRef.current.abort();
+    }
   };
 
   const handleRetryAllFailed = async (failedItems: ImportReviewItem[]) => {
@@ -1439,9 +1538,13 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
     setIsCommitting(true);
     setCommitBanner(null);
 
+    const abortController = new AbortController();
+    batchAbortControllerRef.current = abortController;
+
     let succeededCount = 0;
     let skippedCount = 0;
     let failedCount = 0;
+    let retriedInRun = 0;
 
     const toPersist: {
       item: ImportReviewItem;
@@ -1484,6 +1587,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         completed: 0,
         total: totalToRun,
         activeCount: Math.min(activeConcurrency, totalToRun),
+        pending: totalToRun,
+        retried: 0,
       });
     }
 
@@ -1498,9 +1603,29 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
             completed: completedCount,
             total: totalToRun,
             activeCount: activeWorkers,
+            pending: Math.max(0, totalToRun - completedCount),
+            retried: retriedInRun,
           });
           try {
-            const ok = await executeItemPersistence(item, action);
+            let ok = await executeItemPersistence(item, action);
+            if (
+              !ok &&
+              failedRetryBehaviour === 'auto_retry_transient' &&
+              maxRetries > 0 &&
+              !abortController.signal.aborted
+            ) {
+              for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                if (abortController.signal.aborted) break;
+                retriedInRun++;
+                setTotalRetriedCount((r) => r + 1);
+                const retryClean: ImportReviewItem = {
+                  ...item,
+                  simulateFailureOnce: false,
+                };
+                ok = await executeItemPersistence(retryClean, action);
+                if (ok) break;
+              }
+            }
             if (ok) {
               succeededCount++;
             } else {
@@ -1514,10 +1639,13 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
               completed: completedCount,
               total: totalToRun,
               activeCount: activeWorkers,
+              pending: Math.max(0, totalToRun - completedCount),
+              retried: retriedInRun,
             });
           }
         },
         {
+          signal: abortController.signal,
           shouldSkip: ({ item }) =>
             item.status === 'imported' ||
             completedCheckpointKeysRef.current.has(
@@ -1529,25 +1657,48 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
         }
       );
     } finally {
+      batchAbortControllerRef.current = null;
       setBatchProgress(null);
       setIsCommitting(false);
+    }
+
+    const globalImport = brainStore.getGlobalSettings().importProcessing;
+    let postImportBackupNote = '';
+    if (
+      globalImport.autoBackupAfterLargeImport &&
+      succeededCount >= (globalImport.largeImportBackupThreshold || 50)
+    ) {
+      const backupRes = await brainStore.runAutoBackupCheck(true, 'post-import');
+      if (backupRes.triggered && backupRes.backup) {
+        postImportBackupNote = ` · Post-import safety backup created (${backupRes.backup.fileName})`;
+      }
     }
 
     const undecidedRemaining = reviewQueue.filter(
       (item) => item.status === 'ready' && item.resolution === 'undecided'
     ).length;
+    const pendingRemaining = Math.max(
+      0,
+      reviewQueue.length - (succeededCount + skippedCount + failedCount)
+    );
 
-    const parts: string[] = [];
-    if (succeededCount > 0) parts.push(`${succeededCount} imported`);
-    if (skippedCount > 0) parts.push(`${skippedCount} skipped`);
-    if (failedCount > 0) parts.push(`${failedCount} failed (retry available)`);
-    if (undecidedRemaining > 0) {
+    const parts: string[] = [
+      `${reviewQueue.length} discovered`,
+      `${succeededCount} imported`,
+      `${skippedCount} skipped`,
+      `${failedCount} failed`,
+      `${pendingRemaining} pending`,
+      `${retriedInRun} retried`,
+    ];
+    if (abortController.signal.aborted) {
+      parts.push('cancelled by user (completed items preserved)');
+    } else if (undecidedRemaining > 0) {
       parts.push(`${undecidedRemaining} awaiting explicit user decision`);
     }
 
     setCommitBanner({
       type:
-        failedCount > 0
+        failedCount > 0 || abortController.signal.aborted
           ? succeededCount > 0
             ? 'warning'
             : 'error'
@@ -1556,7 +1707,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           : 'success',
       text: `Batch result (${
         succeededCount + skippedCount + failedCount
-      } processed): ${parts.join(' · ')}.`,
+      } processed): ${parts.join(' · ')}${postImportBackupNote}.`,
     });
 
     onImportComplete?.({
@@ -2568,8 +2719,130 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                       />
                     </div>
                   )}
+
+                  {/* Per-Import Override Bar (Synchronized with Settings -> Import & Processing) */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/10 mono text-[10.5px] text-white/60">
+                    <label className="inline-flex items-center gap-1.5">
+                      <span>Max Batch:</span>
+                      <select
+                        value={maxFilesPerBatch}
+                        onChange={(e) => {
+                          const next = parseInt(e.target.value, 10) || 1000;
+                          setMaxFilesPerBatch(next);
+                          brainStore
+                            .updateGlobalSettings({
+                              importProcessing: { maxFilesPerBatch: next },
+                            })
+                            .catch(() => {});
+                        }}
+                        data-testid="capture-hub-max-batch-select"
+                        className="rounded border border-white/15 bg-black/60 px-1.5 py-0.5 text-[10.5px] text-[#9db4ff] outline-none"
+                      >
+                        {[100, 350, 500, 1000, 2000, 5000].map((limit) => (
+                          <option
+                            key={limit}
+                            value={limit}
+                            className="bg-[#050711] text-white"
+                          >
+                            {limit.toLocaleString()} files
+                            {limit === 1000 ? ' (default)' : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+
+                    <label className="inline-flex items-center gap-1.5">
+                      <span>Duplicates:</span>
+                      <select
+                        value={defaultDuplicatePolicy}
+                        onChange={(e) => {
+                          const next = e.target
+                            .value as DuplicateHandlingPolicy;
+                          setDefaultDuplicatePolicy(next);
+                          brainStore
+                            .updateGlobalSettings({
+                              importProcessing: { defaultDuplicatePolicy: next },
+                            })
+                            .catch(() => {});
+                        }}
+                        data-testid="capture-hub-duplicate-policy-select"
+                        className="rounded border border-white/15 bg-black/60 px-1.5 py-0.5 text-[10.5px] text-[#9db4ff] outline-none"
+                      >
+                        <option value="skip" className="bg-[#050711] text-white">
+                          Skip duplicates
+                        </option>
+                        <option
+                          value="ask_user"
+                          className="bg-[#050711] text-white"
+                        >
+                          Ask per item
+                        </option>
+                        <option
+                          value="merge"
+                          className="bg-[#050711] text-white"
+                        >
+                          Merge modified
+                        </option>
+                        <option
+                          value="replace"
+                          className="bg-[#050711] text-white"
+                        >
+                          Replace modified
+                        </option>
+                      </select>
+                    </label>
+                  </div>
                 </div>
               </div>
+
+              {/* 6-Metric Batch Breakdown Bar when items are staged */}
+              {reviewQueue.length > 0 && (
+                <div
+                  data-testid="batch-metrics-breakdown"
+                  className="grid grid-cols-2 sm:grid-cols-6 gap-2 rounded-xl border border-white/10 bg-[#060914] p-2.5 mono text-[11px]"
+                >
+                  <div className="rounded-lg border border-white/8 bg-black/40 px-2.5 py-1.5">
+                    <div className="text-[10px] text-white/45">
+                      Total Discovered
+                    </div>
+                    <div className="text-xs font-semibold tabular-nums text-white">
+                      {queueMetrics.total}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-2.5 py-1.5">
+                    <div className="text-[10px] text-emerald-300/75">
+                      Imported
+                    </div>
+                    <div className="text-xs font-semibold tabular-nums text-emerald-300">
+                      {queueMetrics.imported}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-white/10 bg-white/[0.03] px-2.5 py-1.5">
+                    <div className="text-[10px] text-white/50">Skipped</div>
+                    <div className="text-xs font-semibold tabular-nums text-white/80">
+                      {queueMetrics.skipped}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-rose-500/25 bg-rose-500/10 px-2.5 py-1.5">
+                    <div className="text-[10px] text-rose-300/75">Failed</div>
+                    <div className="text-xs font-semibold tabular-nums text-rose-300">
+                      {queueMetrics.failed}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-[#9db4ff]/25 bg-[#9db4ff]/10 px-2.5 py-1.5">
+                    <div className="text-[10px] text-[#9db4ff]/80">Pending</div>
+                    <div className="text-xs font-semibold tabular-nums text-[#9db4ff]">
+                      {queueMetrics.pending}
+                    </div>
+                  </div>
+                  <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-2.5 py-1.5">
+                    <div className="text-[10px] text-amber-300/80">Retried</div>
+                    <div className="text-xs font-semibold tabular-nums text-amber-300">
+                      {queueMetrics.retried}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Commit Status Notification Banner */}
               {commitBanner && (
@@ -2607,9 +2880,15 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 isBatchProcessing={isCommitting}
                 batchProgress={batchProgress}
                 concurrencyLimit={concurrencyLimit}
-                onConcurrencyLimitChange={(next) =>
-                  setConcurrencyLimit(normalizeImportConcurrency(next))
-                }
+                onConcurrencyLimitChange={(next) => {
+                  const normalized = normalizeImportConcurrency(next);
+                  setConcurrencyLimit(normalized);
+                  brainStore
+                    .updateGlobalSettings({
+                      importProcessing: { concurrency: normalized },
+                    })
+                    .catch(() => {});
+                }}
                 selectedIds={selectedQueueIds}
                 onSelectionChange={setSelectedQueueIds}
                 onMerge={handleMergeItem}
@@ -2628,6 +2907,7 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                 onClearQueue={() => {
                   setReviewQueue([]);
                   setSelectedQueueIds([]);
+                  setTotalRetriedCount(0);
                   completedCheckpointKeysRef.current.clear();
                 }}
               />
@@ -3094,11 +3374,8 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
             {activeTab === 'import' && (
               <span className="tabular-nums">
                 {queueMetrics.imported} / {queueMetrics.total} imported ·{' '}
-                {selectedQueueIds.length} selected · {queueMetrics.ready}{' '}
-                actionable
-                {queueMetrics.failed > 0
-                  ? ` · ${queueMetrics.failed} failed`
-                  : ''}
+                {queueMetrics.skipped} skipped · {queueMetrics.failed} failed ·{' '}
+                {queueMetrics.pending} pending · {queueMetrics.retried} retried
               </span>
             )}
             {activeTab === 'paste' && (
@@ -3120,6 +3397,18 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {activeTab === 'import' && isCommitting && (
+              <button
+                type="button"
+                onClick={handleCancelBatch}
+                data-testid="cancel-batch-btn"
+                className="flex items-center gap-1.5 rounded-xl border border-rose-500/40 bg-rose-500/15 px-3.5 py-2 text-xs font-semibold text-rose-200 hover:bg-rose-500/25 transition"
+              >
+                <X className="h-3.5 w-3.5" />
+                <span>Cancel Batch</span>
+              </button>
+            )}
+
             <button
               type="button"
               onClick={onClose}

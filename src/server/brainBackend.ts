@@ -4,6 +4,12 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { GoogleGenAI } from '@google/genai';
+import {
+  ArgonGlobalSettings,
+  DEFAULT_ARGON_SETTINGS,
+  sanitizeArgonSettings,
+  BackupScheduleFrequency,
+} from '../types/brain';
 
 export const ALLOWED_AI_SOURCES = [
   'claude',
@@ -326,7 +332,12 @@ export function verifyCompanionToken(
   return null;
 }
 
-export type BackupKind = 'manual' | 'pre-migration' | 'pre-restore-safety';
+export type BackupKind =
+  | 'manual'
+  | 'pre-migration'
+  | 'pre-restore-safety'
+  | 'scheduled'
+  | 'post-import';
 
 export interface DatabaseIntegrityResult {
   valid: boolean;
@@ -880,6 +891,8 @@ export function listBackups(backupDir: string): BackupMetadata[] {
     const kind: BackupKind =
       sidecar.kind === 'pre-migration' ||
       sidecar.kind === 'pre-restore-safety' ||
+      sidecar.kind === 'scheduled' ||
+      sidecar.kind === 'post-import' ||
       sidecar.kind === 'manual'
         ? sidecar.kind
         : 'manual';
@@ -1254,6 +1267,8 @@ export function restoreDatabaseFromBackup(
     const restoredKind: BackupKind =
       sidecar.kind === 'pre-migration' ||
       sidecar.kind === 'pre-restore-safety' ||
+      sidecar.kind === 'scheduled' ||
+      sidecar.kind === 'post-import' ||
       sidecar.kind === 'manual'
         ? sidecar.kind
         : 'manual';
@@ -2655,6 +2670,20 @@ export function createBrainApp(
     return Array.from(new Set([...defaults, ...found]));
   }
 
+  const GLOBAL_SETTINGS_KEY = 'argon_global_settings_v1';
+
+  function computeScheduleIntervalMs(schedule: BackupScheduleFrequency): number {
+    switch (schedule) {
+      case 'hourly':
+        return 60 * 60 * 1000;
+      case 'weekly':
+        return 7 * 24 * 60 * 60 * 1000;
+      case 'daily':
+      default:
+        return 24 * 60 * 60 * 1000;
+    }
+  }
+
   function getConfiguredRetentionCount(): number {
     try {
       const row = db
@@ -2672,15 +2701,246 @@ export function createBrainApp(
     return 10;
   }
 
-  function setConfiguredRetentionCount(maxBackups: number): number {
-    const clamped = Math.max(1, Math.min(100, Math.floor(maxBackups)));
+  function readGlobalSettings(): ArgonGlobalSettings {
+    const retentionMax = getConfiguredRetentionCount();
+    let storedRaw: Partial<ArgonGlobalSettings> | null = null;
+    try {
+      const row = db
+        .prepare(`SELECT value FROM app_metadata WHERE key = ?`)
+        .get(GLOBAL_SETTINGS_KEY) as { value: string } | undefined;
+      if (row?.value) {
+        storedRaw = JSON.parse(row.value);
+      }
+    } catch {}
+
+    const baseWithRetention: ArgonGlobalSettings = {
+      ...DEFAULT_ARGON_SETTINGS,
+      autoBackup: {
+        ...DEFAULT_ARGON_SETTINGS.autoBackup,
+        maxBackups: retentionMax,
+      },
+    };
+    const merged = sanitizeArgonSettings(storedRaw, baseWithRetention);
+    // Keep autoBackup.maxBackups synchronized with backup_retention_count if not explicitly set
+    if (!storedRaw?.autoBackup?.maxBackups) {
+      merged.autoBackup.maxBackups = retentionMax;
+    }
+    const backups = listBackups(resolvedBackupDir);
+    const latestVerified = backups.find((b) => b.verified);
+    if (!merged.autoBackup.lastBackupAt && latestVerified) {
+      merged.autoBackup.lastBackupAt = latestVerified.createdAt;
+      merged.autoBackup.lastBackupFileName = latestVerified.fileName;
+    }
+    if (merged.autoBackup.enabled && !merged.autoBackup.nextScheduledBackupAt) {
+      const baseTime = merged.autoBackup.lastBackupAt
+        ? new Date(merged.autoBackup.lastBackupAt).getTime()
+        : Date.now();
+      const safeBase = Number.isFinite(baseTime) ? baseTime : Date.now();
+      merged.autoBackup.nextScheduledBackupAt = new Date(
+        safeBase + computeScheduleIntervalMs(merged.autoBackup.schedule)
+      ).toISOString();
+    }
+    return merged;
+  }
+
+  function saveGlobalSettings(
+    patch: Partial<ArgonGlobalSettings>
+  ): ArgonGlobalSettings {
+    const current = readGlobalSettings();
+    const nextInput: Partial<ArgonGlobalSettings> = {
+      ...current,
+      ...patch,
+      updatedAt: new Date().toISOString(),
+      general: {
+        ...current.general,
+        ...(patch.general || {}),
+      },
+      autoBackup: {
+        ...current.autoBackup,
+        ...(patch.autoBackup || {}),
+      },
+      memoryIntelligence: {
+        ...current.memoryIntelligence,
+        ...(patch.memoryIntelligence || {}),
+      },
+      importProcessing: {
+        ...current.importProcessing,
+        ...(patch.importProcessing || {}),
+      },
+      aiConnections: {
+        ...current.aiConnections,
+        ...(patch.aiConnections || {}),
+      },
+    };
+
+    const sanitized = sanitizeArgonSettings(nextInput, current);
+
+    // Recompute nextScheduledBackupAt when schedule or enabled status changes
+    if (sanitized.autoBackup.enabled) {
+      const scheduleChanged =
+        patch.autoBackup?.schedule !== undefined &&
+        patch.autoBackup.schedule !== current.autoBackup.schedule;
+      const enabledTurnedOn =
+        patch.autoBackup?.enabled === true && !current.autoBackup.enabled;
+      if (
+        scheduleChanged ||
+        enabledTurnedOn ||
+        !sanitized.autoBackup.nextScheduledBackupAt
+      ) {
+        const refMs = sanitized.autoBackup.lastBackupAt
+          ? new Date(sanitized.autoBackup.lastBackupAt).getTime()
+          : Date.now();
+        const baseMs = Number.isFinite(refMs) ? refMs : Date.now();
+        const candidateNext =
+          baseMs + computeScheduleIntervalMs(sanitized.autoBackup.schedule);
+        sanitized.autoBackup.nextScheduledBackupAt = new Date(
+          Math.max(Date.now() + 1000, candidateNext)
+        ).toISOString();
+      }
+    } else {
+      sanitized.autoBackup.nextScheduledBackupAt = null;
+    }
+
     const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO app_metadata (key, value, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+    ).run(GLOBAL_SETTINGS_KEY, JSON.stringify(sanitized), now);
+
+    // Keep backup_retention_count in sync with autoBackup.maxBackups
     db.prepare(
       `INSERT INTO app_metadata (key, value, updated_at)
        VALUES ('backup_retention_count', ?, ?)
        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
-    ).run(String(clamped), now);
+    ).run(String(sanitized.autoBackup.maxBackups), now);
+
+    return sanitized;
+  }
+
+  function setConfiguredRetentionCount(maxBackups: number): number {
+    const clamped = Math.max(1, Math.min(100, Math.floor(maxBackups)));
+    saveGlobalSettings({
+      autoBackup: {
+        ...readGlobalSettings().autoBackup,
+        maxBackups: clamped,
+      },
+    });
     return clamped;
+  }
+
+  function runScheduledBackupIfDue(options?: {
+    force?: boolean;
+    kind?: BackupKind;
+    simulateFailure?: boolean;
+  }): {
+    triggered: boolean;
+    backup?: BackupMetadata;
+    settings: ArgonGlobalSettings;
+    error?: string;
+  } {
+    const currentSettings = readGlobalSettings();
+    if (!options?.force && !currentSettings.autoBackup.enabled) {
+      return { triggered: false, settings: currentSettings };
+    }
+    if (resolvedDbPath === ':memory:') {
+      return { triggered: false, settings: currentSettings };
+    }
+
+    const nowMs = Date.now();
+    const nextDueMs = currentSettings.autoBackup.nextScheduledBackupAt
+      ? new Date(currentSettings.autoBackup.nextScheduledBackupAt).getTime()
+      : 0;
+    const isDue =
+      options?.force === true || !nextDueMs || Number.isNaN(nextDueMs) || nowMs >= nextDueMs;
+
+    if (!isDue) {
+      return { triggered: false, settings: currentSettings };
+    }
+
+    const startedAt = Date.now();
+    try {
+      if (options?.simulateFailure) {
+        throw new Error('Simulated scheduled backup failure');
+      }
+      const kind: BackupKind = options?.kind || 'scheduled';
+      const created = createConsistentBackup(db, resolvedDbPath, {
+        backupDir: resolvedBackupDir,
+        kind,
+        maxBackups: currentSettings.autoBackup.maxBackups,
+      });
+
+      const nextScheduledAt = new Date(
+        Date.now() + computeScheduleIntervalMs(currentSettings.autoBackup.schedule)
+      ).toISOString();
+
+      const updatedSettings = saveGlobalSettings({
+        autoBackup: {
+          ...currentSettings.autoBackup,
+          lastBackupAt: created.createdAt,
+          lastBackupFileName: created.fileName,
+          lastBackupError: null,
+          nextScheduledBackupAt: currentSettings.autoBackup.enabled
+            ? nextScheduledAt
+            : null,
+        },
+      });
+
+      recordSystemAuditLog(db, {
+        category: 'backup_created',
+        status: 'success',
+        durationMs: Date.now() - startedAt,
+        fileName: created.fileName,
+        batchOrBackupId: created.fileName,
+        summary: `Completed ${kind} SQLite backup ${created.fileName} (${created.factsCount} memories, verified: ${created.verified})`,
+        details: {
+          kind,
+          fileName: created.fileName,
+          factsCount: created.factsCount,
+          sizeBytes: created.sizeBytes,
+          nextScheduledBackupAt: updatedSettings.autoBackup.nextScheduledBackupAt,
+        },
+      });
+
+      return {
+        triggered: true,
+        backup: created,
+        settings: updatedSettings,
+      };
+    } catch (err: any) {
+      const errMsg = err?.message || 'Scheduled backup failed';
+      const updatedSettings = saveGlobalSettings({
+        autoBackup: {
+          ...currentSettings.autoBackup,
+          lastBackupError: errMsg,
+        },
+      });
+      recordSystemAuditLog(db, {
+        category: 'error',
+        status: 'error',
+        durationMs: Date.now() - startedAt,
+        summary: `Scheduled backup failed: ${errMsg}`,
+        errorCategory: 'SCHEDULED_BACKUP_FAILED',
+        recoveryAction: 'Last known-good verified backup was preserved intact',
+      });
+      return {
+        triggered: false,
+        settings: updatedSettings,
+        error: errMsg,
+      };
+    }
+  }
+
+  // Start background automatic backup scheduler check (every 60s, unref'd so tests never hang)
+  if (resolvedDbPath !== ':memory:') {
+    const schedulerTimer = setInterval(() => {
+      try {
+        runScheduledBackupIfDue();
+      } catch {}
+    }, 60_000);
+    if (typeof schedulerTimer.unref === 'function') {
+      schedulerTimer.unref();
+    }
   }
 
   function buildDatabaseStatusPayload() {
@@ -2736,7 +2996,8 @@ export function createBrainApp(
       } catch {}
     }
 
-    const maxBackups = getConfiguredRetentionCount();
+    const globalSettings = readGlobalSettings();
+    const maxBackups = globalSettings.autoBackup.maxBackups;
     const backups = listBackups(resolvedBackupDir).map((b) => ({
       ...b,
       backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${b.fileName}`,
@@ -2771,6 +3032,8 @@ export function createBrainApp(
       retention: {
         maxBackups,
       },
+      autoBackup: globalSettings.autoBackup,
+      globalSettings,
       backupsSummary: {
         totalBackups: backups.length,
         verifiedBackups: verifiedBackups.length,
@@ -2803,6 +3066,89 @@ export function createBrainApp(
       companionDevicesCount: activeDevicesCount,
       geminiLiveTest: Boolean(process.env.GEMINI_API_KEY),
     });
+  });
+
+  // 1a-0. Global Application Settings APIs
+  app.get('/api/settings', (_req: Request, res: Response) => {
+    try {
+      res.json({
+        success: true,
+        settings: readGlobalSettings(),
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        error: err?.message || 'Failed to read application settings',
+        code: 'SETTINGS_READ_FAILED',
+      });
+    }
+  });
+
+  app.put('/api/settings', (req: Request, res: Response) => {
+    try {
+      const incoming = req.body?.settings || req.body || {};
+      const updated = saveGlobalSettings(incoming);
+      if (incoming?.autoBackup?.maxBackups !== undefined) {
+        applyBackupRetention(resolvedBackupDir, updated.autoBackup.maxBackups);
+      }
+      recordSystemAuditLog(db, {
+        category: 'modified',
+        status: 'success',
+        summary: `Updated global Argon settings (maxBatch=${updated.importProcessing.maxFilesPerBatch}, concurrency=${updated.importProcessing.concurrency}, strategy=${updated.importProcessing.defaultStrategy}, autoBackup=${updated.autoBackup.enabled ? updated.autoBackup.schedule : 'disabled'})`,
+        details: {
+          importProcessing: updated.importProcessing,
+          autoBackup: updated.autoBackup,
+          general: updated.general,
+        },
+      });
+      res.json({
+        success: true,
+        settings: updated,
+        status: buildDatabaseStatusPayload(),
+      });
+    } catch (err: any) {
+      res.status(400).json({
+        error: err?.message || 'Failed to update application settings',
+        code: 'SETTINGS_UPDATE_FAILED',
+      });
+    }
+  });
+
+  app.post('/api/database/auto-backup/run-check', (req: Request, res: Response) => {
+    try {
+      const force = req.body?.force === true;
+      const simulateFailure =
+        req.headers['x-simulate-failure'] === 'true' ||
+        req.body?.simulateFailure === true;
+      const kind: BackupKind =
+        req.body?.kind === 'post-import' || req.body?.kind === 'scheduled'
+          ? req.body.kind
+          : 'scheduled';
+      const outcome = runScheduledBackupIfDue({
+        force,
+        kind,
+        simulateFailure,
+      });
+      if (outcome.error) {
+        return res.status(500).json({
+          success: false,
+          triggered: false,
+          error: outcome.error,
+          settings: outcome.settings,
+          status: buildDatabaseStatusPayload(),
+        });
+      }
+      res.json({
+        success: true,
+        triggered: outcome.triggered,
+        backup: outcome.backup || null,
+        settings: outcome.settings,
+        status: buildDatabaseStatusPayload(),
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        error: err?.message || 'Failed to execute automatic backup check',
+      });
+    }
   });
 
   // 1a. Database & Backup Settings APIs
@@ -2841,6 +3187,13 @@ export function createBrainApp(
     const startedAt = Date.now();
     try {
       if (req.headers['x-simulate-failure'] === 'true') {
+        const currentSettings = readGlobalSettings();
+        saveGlobalSettings({
+          autoBackup: {
+            ...currentSettings.autoBackup,
+            lastBackupError: 'Simulated backup creation failure',
+          },
+        });
         recordSystemAuditLog(db, {
           category: 'error',
           status: 'error',
@@ -2854,15 +3207,28 @@ export function createBrainApp(
           code: 'BACKUP_FAILED',
         });
       }
+      const requestedKind: BackupKind =
+        req.body?.kind === 'scheduled' || req.body?.kind === 'post-import'
+          ? req.body.kind
+          : 'manual';
       const maxBackups = getConfiguredRetentionCount();
       const created = createConsistentBackup(db, resolvedDbPath, {
         backupDir: resolvedBackupDir,
-        kind: 'manual',
+        kind: requestedKind,
       });
       const retentionResult = applyBackupRetention(
         resolvedBackupDir,
         maxBackups
       );
+      const currentSettings = readGlobalSettings();
+      saveGlobalSettings({
+        autoBackup: {
+          ...currentSettings.autoBackup,
+          lastBackupAt: created.createdAt,
+          lastBackupFileName: created.fileName,
+          lastBackupError: null,
+        },
+      });
       const backups = listBackups(resolvedBackupDir).map((b) => ({
         ...b,
         backupPath: `${formatSafeDisplayPath(resolvedBackupDir)}/${b.fileName}`,
@@ -2874,9 +3240,10 @@ export function createBrainApp(
         durationMs: Date.now() - startedAt,
         fileName: created.fileName,
         batchOrBackupId: created.fileName,
-        summary: `Created verified SQLite backup ${created.fileName} (${created.factsCount} memories, schema v${created.schemaVersion})`,
+        summary: `Created verified SQLite backup ${created.fileName} (${created.factsCount} memories, schema v${created.schemaVersion}, kind=${requestedKind})`,
         details: {
           fileName: created.fileName,
+          kind: requestedKind,
           sizeBytes: created.sizeBytes,
           factsCount: created.factsCount,
           schemaVersion: created.schemaVersion,

@@ -19,6 +19,11 @@ import {
   ActivityLogStatus,
   inferFileTypeFromExtension,
   getFactFileType,
+  ArgonGlobalSettings,
+  DeepPartialArgonGlobalSettings,
+  DEFAULT_ARGON_SETTINGS,
+  sanitizeArgonSettings,
+  AutoBackupSettings,
 } from '../types/brain';
 import {
   parseSemanticSections,
@@ -86,6 +91,7 @@ const STORAGE_KEY_BRAINS = 'brain_local_brains_v1';
 const STORAGE_KEY_TAGS = 'brain_fact_tags_v1';
 const STORAGE_KEY_ACTIVITIES = 'brain_recent_activity_v1';
 const STORAGE_KEY_COMPANION_CAPTURES = 'brain_companion_captures_v1';
+const STORAGE_KEY_GLOBAL_SETTINGS = 'brain_global_settings_v1';
 
 // Seed initial memory facts based on user's real projects mentioned in conversation
 const SEED_FACTS: Fact[] = [
@@ -268,6 +274,7 @@ class BrainStorageService {
   private activities: RecentActivityItem[] = [];
   private companionCaptures: CompanionCaptureItem[] = [];
   private tagsByFactId: Record<number, string[]> = {};
+  private globalSettings: ArgonGlobalSettings = sanitizeArgonSettings(null);
   private listeners: Listener[] = [];
   private backendReachable = false;
   private backendChecked = false;
@@ -275,6 +282,7 @@ class BrainStorageService {
   constructor() {
     this.loadTagsFromLocalStorage();
     this.loadActivitiesFromLocalStorage();
+    this.loadLocalGlobalSettings();
     this.loadLocalFallback();
     this.loadFromBackend();
   }
@@ -363,23 +371,127 @@ class BrainStorageService {
     } catch {}
   }
 
-  public async loadFromBackend() {
+  private loadLocalGlobalSettings() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY_GLOBAL_SETTINGS);
+      if (raw) {
+        this.globalSettings = sanitizeArgonSettings(JSON.parse(raw));
+      }
+    } catch {
+      this.globalSettings = sanitizeArgonSettings(null);
+    }
+  }
+
+  private saveLocalGlobalSettings() {
+    try {
+      localStorage.setItem(
+        STORAGE_KEY_GLOBAL_SETTINGS,
+        JSON.stringify(this.globalSettings)
+      );
+    } catch {}
+  }
+
+  public getGlobalSettings(): ArgonGlobalSettings {
+    return this.globalSettings;
+  }
+
+  public async syncGlobalSettingsFromBackend(): Promise<ArgonGlobalSettings> {
+    try {
+      const res = await fetch(`${API_BASE}/api/settings`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.settings) {
+          this.globalSettings = sanitizeArgonSettings(
+            data.settings,
+            this.globalSettings
+          );
+          this.saveLocalGlobalSettings();
+          this.notify();
+        }
+      }
+    } catch {}
+    return this.globalSettings;
+  }
+
+  public async updateGlobalSettings(
+    patch: DeepPartialArgonGlobalSettings
+  ): Promise<ArgonGlobalSettings> {
+    const merged = sanitizeArgonSettings(
+      {
+        ...this.globalSettings,
+        ...patch,
+        updatedAt: new Date().toISOString(),
+        general: { ...this.globalSettings.general, ...(patch.general || {}) },
+        autoBackup: {
+          ...this.globalSettings.autoBackup,
+          ...(patch.autoBackup || {}),
+        },
+        memoryIntelligence: {
+          ...this.globalSettings.memoryIntelligence,
+          ...(patch.memoryIntelligence || {}),
+        },
+        importProcessing: {
+          ...this.globalSettings.importProcessing,
+          ...(patch.importProcessing || {}),
+        },
+        aiConnections: {
+          ...this.globalSettings.aiConnections,
+          ...(patch.aiConnections || {}),
+        },
+      },
+      this.globalSettings
+    );
+
+    this.globalSettings = merged;
+    this.saveLocalGlobalSettings();
+    this.notify();
+
+    try {
+      const res = await fetch(`${API_BASE}/api/settings`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings: merged }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.settings) {
+          this.globalSettings = sanitizeArgonSettings(
+            data.settings,
+            this.globalSettings
+          );
+          this.saveLocalGlobalSettings();
+          this.notify();
+        }
+      }
+    } catch {}
+
+    return this.globalSettings;
+  }
+
+  public async loadFromBackend(options?: { forceReplaceLocal?: boolean }) {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2000);
+      const timeoutId = setTimeout(() => controller.abort(), 2500);
 
-      const brainsRes = await fetch(`${API_BASE}/api/brains`, { signal: controller.signal });
+      const brainsRes = await fetch(`${API_BASE}/api/brains`, {
+        signal: controller.signal,
+      });
       clearTimeout(timeoutId);
 
-      if (!brainsRes.ok) throw new Error('Backend returned status ' + brainsRes.status);
+      if (!brainsRes.ok)
+        throw new Error('Backend returned status ' + brainsRes.status);
       const backendBrains: string[] = await brainsRes.json();
-      this.brains = Array.from(new Set([...DEFAULT_BRAINS, ...backendBrains, ...this.brains]));
+      this.brains = Array.from(
+        new Set([...DEFAULT_BRAINS, ...backendBrains, ...this.brains])
+      );
 
       // Fetch all brains in parallel for high performance
       const brainFactsArrays = await Promise.all(
-        backendBrains.map(async (brain) => {
+        this.brains.map(async (brain) => {
           try {
-            const factsRes = await fetch(`${API_BASE}/api/facts?brain=${encodeURIComponent(brain)}`);
+            const factsRes = await fetch(
+              `${API_BASE}/api/facts?brain=${encodeURIComponent(brain)}`
+            );
             if (factsRes.ok) {
               const brainFacts: Fact[] = await factsRes.json();
               return brainFacts;
@@ -392,11 +504,91 @@ class BrainStorageService {
       const allFacts = brainFactsArrays.flat();
 
       if (allFacts.length > 0) {
-        this.facts = this.applyTags(allFacts);
-        this.saveLocalFacts();
+        // Non-destructive reconciliation: if the backend was freshly initialized with only
+        // the default seed records (<= 13 facts) while localStorage holds user-imported records,
+        // preserve and re-hydrate the local user records instead of wiping them out.
+        const seedFileNames = new Set(
+          SEED_FACTS.map((sf) => (sf.fileName || '').toLowerCase()).filter(
+            Boolean
+          )
+        );
+        const backendKeys = new Set(
+          allFacts.map(
+            (f) =>
+              `${f.brain}::${(f.filePath || f.fileName || '').toLowerCase()}::${
+                f.checksum || f.content.slice(0, 80)
+              }`
+          )
+        );
+        const localOnlyUserFacts =
+          !options?.forceReplaceLocal &&
+          allFacts.length <= SEED_FACTS.length + 1 &&
+          this.facts.length > allFacts.length
+            ? this.facts.filter((lf) => {
+                const key = `${lf.brain}::${(
+                  lf.filePath ||
+                  lf.fileName ||
+                  ''
+                ).toLowerCase()}::${lf.checksum || lf.content.slice(0, 80)}`;
+                if (backendKeys.has(key)) return false;
+                if (
+                  lf.id <= SEED_FACTS.length &&
+                  lf.fileName &&
+                  seedFileNames.has(lf.fileName.toLowerCase())
+                ) {
+                  return false;
+                }
+                return true;
+              })
+            : [];
+
+        if (localOnlyUserFacts.length > 0) {
+          this.facts = this.applyTags([...allFacts, ...localOnlyUserFacts]);
+          this.saveLocalFacts();
+          // Re-hydrate missing local user records to SQLite synchronously during loadFromBackend
+          for (const lf of localOnlyUserFacts) {
+            try {
+              await fetch(`${API_BASE}/api/remember`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  brain: lf.brain,
+                  content: lf.content,
+                  source: lf.source,
+                  fileName: lf.fileName,
+                  filePath: lf.filePath,
+                  fileType: lf.fileType,
+                  tags: lf.tags,
+                  parentId: lf.parentId,
+                  isDocumentRoot: lf.isDocumentRoot,
+                  isUnifiedContextNode: lf.isUnifiedContextNode,
+                  documentTitle: lf.documentTitle,
+                  semanticSectionCount: lf.semanticSectionCount,
+                  mergeHistory: lf.mergeHistory,
+                  sourceFolder: lf.sourceFolder,
+                  originalCreatedAt: lf.originalCreatedAt,
+                  importedAt: lf.importedAt,
+                  importBatchId: lf.importBatchId,
+                  checksum: lf.checksum,
+                  extractionStatus: lf.extractionStatus,
+                  extractionWarnings: lf.extractionWarnings,
+                  relatedSources: lf.relatedSources,
+                  fixtureId: lf.fixtureId,
+                  topicKey: lf.topicKey,
+                  fileSizeBytes: lf.fileSizeBytes,
+                  structuredData: lf.structuredData,
+                }),
+              });
+            } catch {}
+          }
+        } else {
+          this.facts = this.applyTags(allFacts);
+          this.saveLocalFacts();
+        }
       }
       this.backendReachable = true;
       this.backendChecked = true;
+      void this.syncGlobalSettingsFromBackend();
       this.notify();
     } catch {
       this.backendReachable = false;
@@ -511,6 +703,14 @@ class BrainStorageService {
 
   public getFactById(id: number): Fact | undefined {
     return this.facts.find((f) => f.id === id);
+  }
+
+  public getFacts(brain?: string): Fact[] {
+    return brain ? this.recall(brain) : [...this.facts];
+  }
+
+  public getAllFactsForBrain(brain: string): Fact[] {
+    return this.recall(brain);
   }
 
   public computeRelevanceScore(fact: Fact, query: string, preferredBrain?: string): { score: number; matchedFields: string[] } {
@@ -1213,7 +1413,33 @@ class BrainStorageService {
   }
 
   /**
+   * Reconstructs the full content of a document node (including child branches or sliced chunks
+   * when `fact` is a branching hub or a multi-chunk root node) so duplicate detection, Merge,
+   * and Replace operate on the complete logical document rather than only the 300-char hub snippet.
+   */
+  public getReconstructedDocumentContent(fact: Fact): string {
+    const children = this.facts
+      .filter((c) => c.brain === fact.brain && c.parentId === fact.id)
+      .sort((a, b) => a.id - b.id);
+    if (children.length === 0) {
+      return fact.content;
+    }
+    const isBranchHub =
+      fact.tags?.includes('document-hub') ||
+      fact.content.startsWith('[Document:');
+    if (isBranchHub) {
+      const titleHeader = fact.documentTitle ? `# ${fact.documentTitle}\n\n` : '';
+      return `${titleHeader}${children.map((c) => c.content.trim()).join('\n\n')}`;
+    }
+    // Sliced / chunked root: root is chunk 0, children are chunks 1..k-1
+    return [fact.content.trim(), ...children.map((c) => c.content.trim())].join(
+      '\n\n'
+    );
+  }
+
+  /**
    * Finds an existing fact node for a file path, file name, or title in a specific brain.
+   * Always prioritizes root document nodes (`isDocumentRoot` or `!parentId`) over child branch/chunk nodes.
    */
   public findNodeByFilePath(
     brain: string,
@@ -1221,10 +1447,17 @@ class BrainStorageService {
     title?: string
   ): Fact | undefined {
     if (!brain) return undefined;
-    const bFacts = this.facts.filter(
+    const allBrainFacts = this.facts.filter(
       (f) => f.brain === brain.trim().toLowerCase()
     );
-    if (bFacts.length === 0) return undefined;
+    if (allBrainFacts.length === 0) return undefined;
+
+    // Sort root nodes ahead of child nodes so root/hub nodes are matched first
+    const bFacts = [...allBrainFacts].sort((a, b) => {
+      const aRoot = a.isDocumentRoot || !a.parentId ? 0 : 1;
+      const bRoot = b.isDocumentRoot || !b.parentId ? 0 : 1;
+      return aRoot - bRoot;
+    });
 
     if (filePathOrName) {
       const cleanTarget = filePathOrName.trim().toLowerCase();
@@ -1281,7 +1514,8 @@ class BrainStorageService {
     fileName: string,
     content: string,
     filePath?: string,
-    title?: string
+    title?: string,
+    incomingChecksum?: string
   ): ExistingFileNodeCheck {
     if (!brain || !brain.trim() || !content || !content.trim()) {
       return {
@@ -1317,18 +1551,27 @@ class BrainStorageService {
         };
       }
 
-      const bFacts = this.facts.filter((f) => f.brain === resolvedBrain);
+      const allBrainFacts = this.facts.filter((f) => f.brain === resolvedBrain);
+      // Prioritize root nodes ahead of child nodes
+      const bFacts = [...allBrainFacts].sort((a, b) => {
+        const aRoot = a.isDocumentRoot || !a.parentId ? 0 : 1;
+        const bRoot = b.isDocumentRoot || !b.parentId ? 0 : 1;
+        return aRoot - bRoot;
+      });
 
-      // 1. Check if ANY node in the destination brain has exact duplicate normalized content
-      // (even when filenames, archive paths, whitespace, casing, or auto-generated leading title headings differ)
-      const exactContentMatch = bFacts.find((f) =>
-        areDocumentsExactDuplicates(
-          f.content,
+      // 1. Check if ANY node in the destination brain has exact duplicate normalized content or matching checksum
+      const exactContentMatch = bFacts.find((f) => {
+        if (incomingChecksum && f.checksum && f.checksum === incomingChecksum) {
+          return true;
+        }
+        const candidateText = this.getReconstructedDocumentContent(f);
+        return areDocumentsExactDuplicates(
+          candidateText,
           content,
           [f.documentTitle, f.fileName, f.filePath],
           [title, fileName, filePath]
-        )
-      );
+        );
+      });
 
       // 2. Check by file path, file name, or document title (same logical file/document identity)
       const pathOrTitleMatch = this.findNodeByFilePath(
@@ -1338,19 +1581,27 @@ class BrainStorageService {
       );
 
       if (pathOrTitleMatch) {
-        const isExact = areDocumentsExactDuplicates(
-          pathOrTitleMatch.content,
-          content,
-          [
-            pathOrTitleMatch.documentTitle,
-            pathOrTitleMatch.fileName,
-            pathOrTitleMatch.filePath,
-          ],
-          [title, fileName, filePath]
-        );
+        const existingFullText =
+          this.getReconstructedDocumentContent(pathOrTitleMatch);
+        const isExact =
+          Boolean(
+            incomingChecksum &&
+              pathOrTitleMatch.checksum &&
+              pathOrTitleMatch.checksum === incomingChecksum
+          ) ||
+          areDocumentsExactDuplicates(
+            existingFullText,
+            content,
+            [
+              pathOrTitleMatch.documentTitle,
+              pathOrTitleMatch.fileName,
+              pathOrTitleMatch.filePath,
+            ],
+            [title, fileName, filePath]
+          );
 
         const diff = detectIncrementalDiff(
-          pathOrTitleMatch.content,
+          existingFullText,
           content,
           pathOrTitleMatch.fileType,
           fileName
@@ -1389,20 +1640,19 @@ class BrainStorageService {
       }
 
       // 3. Check for Related Content: partial content overlap or shared semantic sections in destination brain
-      // (Never treat partial matches as exact duplicates)
       let relatedFact: Fact | undefined = undefined;
       const incomingBodyNorm = incomingNorm.bodyNorm;
 
       if (incomingBodyNorm.length >= 35) {
         relatedFact = bFacts.find((f) => {
-          const fNorm = normalizeContentForDuplicateCheck(f.content, [
+          const candidateText = this.getReconstructedDocumentContent(f);
+          const fNorm = normalizeContentForDuplicateCheck(candidateText, [
             f.documentTitle,
             f.fileName,
             f.filePath,
           ]);
           const fBodyNorm = fNorm.bodyNorm;
 
-          // Partial match: one document is a substantial proper substring of the other
           if (
             fBodyNorm.length >= 35 &&
             fBodyNorm !== incomingBodyNorm &&
@@ -1412,8 +1662,7 @@ class BrainStorageService {
             return true;
           }
 
-          // Shared substantial paragraph/section overlap without full document equality
-          const fBlocks = f.content
+          const fBlocks = candidateText
             .replace(/^#\s+[^\n]+(?:\n+|$)/, '')
             .split(/\n\s*\n/)
             .map((b) =>
@@ -1436,8 +1685,10 @@ class BrainStorageService {
       }
 
       if (relatedFact) {
+        const existingFullText =
+          this.getReconstructedDocumentContent(relatedFact);
         const diff = detectIncrementalDiff(
-          relatedFact.content,
+          existingFullText,
           content,
           relatedFact.fileType,
           fileName
@@ -1480,6 +1731,22 @@ class BrainStorageService {
   }
 
   /**
+   * Durable deletion helper used for atomic rollback of partially created multi-node documents
+   * or cleaning up old child nodes when a branched/sliced document is replaced.
+   */
+  private async forgetDurably(id: number): Promise<void> {
+    this.facts = this.facts.filter((f) => f.id !== id);
+    this.saveLocalFacts();
+    try {
+      await fetch(`${API_BASE}/api/forget`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      });
+    } catch {}
+  }
+
+  /**
    * Backend-confirmed (or local-confirmed in offline cache mode) persistence for
    * ImportReviewQueue actions ('create' | 'merge' | 'replace').
    * Never optimistically marks items as imported: awaits durable confirmation before
@@ -1499,6 +1766,7 @@ class BrainStorageService {
     strategy?: IngestStrategy;
     chunkSize?: number;
     simulateFailure?: boolean;
+    simulateFailureAtStep?: number;
     sourceFolder?: string;
     originalCreatedAt?: string | null;
     importedAt?: string;
@@ -1545,6 +1813,9 @@ class BrainStorageService {
         ? `# ${cleanTitle}\n\n${rawText}`
         : rawText;
 
+    const documentChecksum =
+      params.checksum || (await computeContentChecksum(rawText));
+
     // Locate target existing node for merge / replace
     const existingFact =
       (params.targetFactId !== undefined
@@ -1556,7 +1827,8 @@ class BrainStorageService {
         effectiveFileName,
         rawText,
         effectivePath,
-        cleanTitle
+        cleanTitle,
+        documentChecksum
       ).existingFact;
 
     // Build headers including optional companion token and simulated failure flag
@@ -1573,8 +1845,6 @@ class BrainStorageService {
       }
     } catch {}
 
-    // If a specific targetFactId was requested for merge/replace and cannot be found locally,
-    // verify against backend /api/correct so missing node errors are properly surfaced.
     const targetIdForUpdate = existingFact?.id ?? params.targetFactId;
 
     // CASE 1: MERGE into existing destination node
@@ -1588,10 +1858,12 @@ class BrainStorageService {
         throw new Error('Simulated persistence failure — destination node was not modified');
       }
 
-      const baseContent = existingFact ? existingFact.content : '';
+      const baseContent = existingFact
+        ? this.getReconstructedDocumentContent(existingFact)
+        : '';
       const diff = existingFact
         ? detectIncrementalDiff(
-            existingFact.content,
+            baseContent,
             formattedText,
             resolvedType,
             effectiveFileName
@@ -1608,10 +1880,10 @@ class BrainStorageService {
 
       const mergedContent = existingFact
         ? diff.isIdentical
-          ? existingFact.content
+          ? baseContent
           : diff.hasNewContent
           ? diff.mergedContent
-          : `${existingFact.content.trim()}\n\n${rawText}`
+          : `${baseContent.trim()}\n\n${rawText}`
         : formattedText;
 
       const parsed = parseSemanticSections(
@@ -1636,6 +1908,13 @@ class BrainStorageService {
         ...(existingFact?.mergeHistory || []),
       ];
 
+      // Remove any old child branch/chunk nodes when consolidating merged content into the root node
+      const existingChildren = existingFact
+        ? this.facts.filter(
+            (c) => c.brain === resolvedBrain && c.parentId === existingFact.id
+          )
+        : [];
+
       try {
         const res = await fetch(`${API_BASE}/api/correct`, {
           method: 'POST',
@@ -1644,7 +1923,7 @@ class BrainStorageService {
             id: targetIdForUpdate,
             content: mergedContent,
             source: existingFact?.source || params.source,
-            tags: mergedTags,
+            tags: mergedTags.filter((t) => t !== 'document-hub'),
             fileName: existingFact?.fileName || effectiveFileName,
             filePath: existingFact?.filePath || effectivePath,
             fileType: existingFact?.fileType || resolvedType,
@@ -1670,11 +1949,15 @@ class BrainStorageService {
           throw new Error('Backend did not confirm merge update.');
         }
 
+        for (const child of existingChildren) {
+          await this.forgetDurably(child.id);
+        }
+
         const targetRef = existingFact || (data.fact as Fact);
         if (existingFact) {
           existingFact.content = mergedContent;
           existingFact.updated_at = data.updated_at || new Date().toISOString();
-          existingFact.tags = mergedTags;
+          existingFact.tags = mergedTags.filter((t) => t !== 'document-hub');
           existingFact.fileName = existingFact.fileName || effectiveFileName;
           existingFact.filePath = existingFact.filePath || effectivePath;
           existingFact.fileType = existingFact.fileType || resolvedType;
@@ -1683,6 +1966,7 @@ class BrainStorageService {
           existingFact.isUnifiedContextNode = true;
           existingFact.semanticSectionCount = parsed.sections.length;
           existingFact.mergeHistory = nextMergeHistory;
+          existingFact.checksum = await computeContentChecksum(mergedContent);
         }
 
         this.saveLocalFacts();
@@ -1708,9 +1992,13 @@ class BrainStorageService {
           throw err;
         }
 
+        for (const child of existingChildren) {
+          await this.forgetDurably(child.id);
+        }
+
         existingFact.content = mergedContent;
         existingFact.updated_at = new Date().toISOString();
-        existingFact.tags = mergedTags;
+        existingFact.tags = mergedTags.filter((t) => t !== 'document-hub');
         existingFact.fileName = existingFact.fileName || effectiveFileName;
         existingFact.filePath = existingFact.filePath || effectivePath;
         existingFact.fileType = existingFact.fileType || resolvedType;
@@ -1719,6 +2007,7 @@ class BrainStorageService {
         existingFact.isUnifiedContextNode = true;
         existingFact.semanticSectionCount = parsed.sections.length;
         existingFact.mergeHistory = nextMergeHistory;
+        existingFact.checksum = await computeContentChecksum(mergedContent);
 
         this.saveLocalFacts();
         this.recordActivity(existingFact, 'modified');
@@ -1754,7 +2043,7 @@ class BrainStorageService {
       const nextTags =
         params.tags && params.tags.length > 0
           ? Array.from(new Set(params.tags))
-          : existingFact?.tags || [];
+          : (existingFact?.tags || []).filter((t) => t !== 'document-hub');
       const replaceRecord = {
         timestamp: new Date().toISOString(),
         action: 'updated' as const,
@@ -1766,6 +2055,12 @@ class BrainStorageService {
         replaceRecord,
         ...(existingFact?.mergeHistory || []),
       ];
+
+      const existingChildren = existingFact
+        ? this.facts.filter(
+            (c) => c.brain === resolvedBrain && c.parentId === existingFact.id
+          )
+        : [];
 
       try {
         const res = await fetch(`${API_BASE}/api/correct`, {
@@ -1801,20 +2096,62 @@ class BrainStorageService {
           throw new Error('Backend did not confirm replacement.');
         }
 
+        for (const child of existingChildren) {
+          await this.forgetDurably(child.id);
+        }
+
+        const isBranchingReplace =
+          params.strategy === 'branching' &&
+          parsed.sections.filter((s) => s.content.trim()).length > 1;
+        const branchSections = isBranchingReplace
+          ? parsed.sections.filter((s) => s.content.trim())
+          : [];
+        const previewSnippet =
+          rawText.length > 300 ? rawText.slice(0, 300) + '...' : rawText;
+        const rootReplacedContent = isBranchingReplace
+          ? `[Document: ${cleanTitle}]\n${previewSnippet}`
+          : formattedText;
+
         const targetRef = existingFact || (data.fact as Fact);
         if (existingFact) {
-          existingFact.content = formattedText;
+          existingFact.content = rootReplacedContent;
           existingFact.source = params.source;
           existingFact.updated_at = data.updated_at || new Date().toISOString();
-          existingFact.tags = nextTags;
+          existingFact.tags = isBranchingReplace
+            ? Array.from(new Set([...nextTags, 'document-hub']))
+            : nextTags;
           existingFact.fileName = effectiveFileName;
           existingFact.filePath = effectivePath;
           existingFact.fileType = resolvedType;
           existingFact.documentTitle = cleanTitle;
           existingFact.isDocumentRoot = true;
-          existingFact.isUnifiedContextNode = true;
+          existingFact.isUnifiedContextNode = !isBranchingReplace;
           existingFact.semanticSectionCount = parsed.sections.length;
           existingFact.mergeHistory = nextMergeHistory;
+          existingFact.checksum = documentChecksum;
+        }
+
+        if (isBranchingReplace && targetRef) {
+          for (let i = 0; i < branchSections.length; i++) {
+            await this.rememberDurably(
+              resolvedBrain,
+              branchSections[i].content.trim(),
+              params.source,
+              effectiveFileName,
+              resolvedType,
+              params.tags,
+              effectivePath,
+              {
+                parentId: targetRef.id,
+                isDocumentRoot: false,
+                isUnifiedContextNode: false,
+                documentTitle:
+                  branchSections[i].title || `${cleanTitle} · Section ${i + 1}`,
+                semanticSectionCount: 1,
+                headers,
+              }
+            );
+          }
         }
 
         this.saveLocalFacts();
@@ -1826,6 +2163,7 @@ class BrainStorageService {
           action: 'updated',
           message: `Replaced Node #${targetIdForUpdate} in "${resolvedBrain}"`,
           sectionsCount: parsed.sections.length,
+          chunksCreated: isBranchingReplace ? 1 + branchSections.length : 1,
           isExistingNode: true,
           previousId: targetIdForUpdate,
         };
@@ -1840,6 +2178,10 @@ class BrainStorageService {
           throw err;
         }
 
+        for (const child of existingChildren) {
+          await this.forgetDurably(child.id);
+        }
+
         existingFact.content = formattedText;
         existingFact.source = params.source;
         existingFact.updated_at = new Date().toISOString();
@@ -1852,6 +2194,7 @@ class BrainStorageService {
         existingFact.isUnifiedContextNode = true;
         existingFact.semanticSectionCount = parsed.sections.length;
         existingFact.mergeHistory = nextMergeHistory;
+        existingFact.checksum = documentChecksum;
 
         this.saveLocalFacts();
         this.recordActivity(existingFact, 'modified');
@@ -1862,13 +2205,28 @@ class BrainStorageService {
           action: 'updated',
           message: `Replaced Node #${existingFact.id} in "${resolvedBrain}"`,
           sectionsCount: parsed.sections.length,
+          chunksCreated: 1,
           isExistingNode: true,
           previousId: existingFact.id,
         };
       }
     }
 
-    // CASE 3: Multi-chunk or branching creation with measurable determinate chunk progress
+    const sharedProvenance = {
+      sourceFolder: params.sourceFolder,
+      originalCreatedAt: params.originalCreatedAt,
+      importedAt: params.importedAt,
+      importBatchId: params.importBatchId,
+      extractionStatus: params.extractionStatus,
+      extractionWarnings: params.extractionWarnings,
+      relatedSources: params.relatedSources,
+      fixtureId: params.fixtureId,
+      topicKey: params.topicKey,
+      fileSizeBytes: params.fileSizeBytes,
+      structuredData: params.structuredData,
+    };
+
+    // CASE 3: Multi-chunk or branching creation with measurable determinate chunk progress & atomic rollback on mid-import failure
     const strategy = params.strategy || 'semantic';
     if (strategy === 'chunk') {
       const targetChunkSize = Math.max(200, params.chunkSize || 1200);
@@ -1890,46 +2248,70 @@ class BrainStorageService {
 
       if (chunks.length > 1) {
         let firstFact: Fact | null = null;
-        for (let i = 0; i < chunks.length; i++) {
-          params.onProgress?.({
-            mode: 'determinate',
-            current: i,
-            total: chunks.length,
-            unit: 'chunks',
-            label: 'Persisting chunks',
-          });
-          const savedChunk = await this.rememberDurably(
-            resolvedBrain,
-            chunks[i],
-            params.source,
-            effectiveFileName,
-            resolvedType,
-            params.tags,
-            effectivePath,
-            {
-              documentTitle: `${cleanTitle} (Part ${i + 1}/${chunks.length})`,
-              semanticSectionCount: 1,
-              isDocumentRoot: i === 0,
-              headers,
-              simulateFailure: params.simulateFailure,
-              mergeHistory: [
-                {
-                  timestamp: new Date().toISOString(),
-                  action: 'created',
-                  summary: `Created chunk ${i + 1} of ${chunks.length} from ${effectiveFileName}`,
-                  newContentLength: chunks[i].length,
-                },
-              ],
-            }
-          );
-          if (!firstFact) firstFact = savedChunk;
-          params.onProgress?.({
-            mode: 'determinate',
-            current: i + 1,
-            total: chunks.length,
-            unit: 'chunks',
-            label: 'Persisting chunks',
-          });
+        const createdIds: number[] = [];
+        try {
+          for (let i = 0; i < chunks.length; i++) {
+            params.onProgress?.({
+              mode: 'determinate',
+              current: i,
+              total: chunks.length,
+              unit: 'chunks',
+              label: 'Persisting chunks',
+            });
+            const failThisStep =
+              params.simulateFailure ||
+              (typeof params.simulateFailureAtStep === 'number' &&
+                params.simulateFailureAtStep === i);
+            const savedChunk = await this.rememberDurably(
+              resolvedBrain,
+              chunks[i],
+              params.source,
+              effectiveFileName,
+              resolvedType,
+              params.tags,
+              effectivePath,
+              {
+                ...sharedProvenance,
+                checksum: i === 0 ? documentChecksum : undefined,
+                parentId: i > 0 && firstFact ? firstFact.id : undefined,
+                documentTitle:
+                  i === 0
+                    ? cleanTitle
+                    : `${cleanTitle} (Part ${i + 1}/${chunks.length})`,
+                semanticSectionCount: i === 0 ? chunks.length : 1,
+                isDocumentRoot: i === 0,
+                isUnifiedContextNode: false,
+                headers: failThisStep
+                  ? { ...headers, 'x-simulate-failure': 'true' }
+                  : headers,
+                simulateFailure: failThisStep,
+                mergeHistory: [
+                  {
+                    timestamp: new Date().toISOString(),
+                    action: 'created',
+                    summary: `Created chunk ${i + 1} of ${chunks.length} from ${effectiveFileName}`,
+                    newContentLength: chunks[i].length,
+                  },
+                ],
+              }
+            );
+            createdIds.push(savedChunk.id);
+            if (!firstFact) firstFact = savedChunk;
+            params.onProgress?.({
+              mode: 'determinate',
+              current: i + 1,
+              total: chunks.length,
+              unit: 'chunks',
+              label: 'Persisting chunks',
+            });
+          }
+        } catch (chunkErr) {
+          // Atomic rollback: remove any partial chunks created before the error
+          for (const createdId of createdIds) {
+            await this.forgetDurably(createdId);
+          }
+          this.notify();
+          throw chunkErr;
         }
 
         return {
@@ -1937,6 +2319,7 @@ class BrainStorageService {
           action: 'created',
           message: `Imported ${chunks.length} chunks into "${resolvedBrain}" (starting at Node #${firstFact!.id})`,
           sectionsCount: chunks.length,
+          chunksCreated: chunks.length,
           isExistingNode: false,
         };
       }
@@ -1951,84 +2334,113 @@ class BrainStorageService {
       const sections = parsedBranch.sections.filter((s) => s.content.trim());
       if (sections.length > 1) {
         const totalRecords = 1 + sections.length;
-        params.onProgress?.({
-          mode: 'determinate',
-          current: 0,
-          total: totalRecords,
-          unit: 'records',
-          label: 'Persisting branching nodes',
-        });
-        const previewSnippet =
-          rawText.length > 300 ? rawText.slice(0, 300) + '...' : rawText;
-        const rootFact = await this.rememberDurably(
-          resolvedBrain,
-          `[Document: ${cleanTitle}]\n${previewSnippet}`,
-          params.source,
-          effectiveFileName,
-          resolvedType,
-          [...(params.tags || []), 'document-hub'],
-          effectivePath,
-          {
-            isDocumentRoot: true,
-            isUnifiedContextNode: true,
-            documentTitle: cleanTitle,
-            semanticSectionCount: sections.length,
-            headers,
-            simulateFailure: params.simulateFailure,
-            mergeHistory: [
-              {
-                timestamp: new Date().toISOString(),
-                action: 'created',
-                summary: `Initialized branching document hub for ${effectiveFileName} (${sections.length} branch sections)`,
-                newContentLength: formattedText.length,
-              },
-            ],
-          }
-        );
-
-        params.onProgress?.({
-          mode: 'determinate',
-          current: 1,
-          total: totalRecords,
-          unit: 'records',
-          label: 'Persisting branching nodes',
-        });
-
-        for (let i = 0; i < sections.length; i++) {
-          await this.rememberDurably(
-            resolvedBrain,
-            sections[i].content.trim(),
-            params.source,
-            effectiveFileName,
-            resolvedType,
-            params.tags,
-            effectivePath,
-            {
-              parentId: rootFact.id,
-              documentTitle: sections[i].title || `${cleanTitle} · Section ${i + 1}`,
-              semanticSectionCount: 1,
-              headers,
-              simulateFailure: params.simulateFailure,
-            }
-          );
+        const createdIds: number[] = [];
+        try {
           params.onProgress?.({
             mode: 'determinate',
-            current: i + 2,
+            current: 0,
             total: totalRecords,
             unit: 'records',
             label: 'Persisting branching nodes',
           });
-        }
-        this.saveLocalFacts();
-        this.notify();
+          const previewSnippet =
+            rawText.length > 300 ? rawText.slice(0, 300) + '...' : rawText;
+          const failRoot =
+            params.simulateFailure || params.simulateFailureAtStep === 0;
+          const rootFact = await this.rememberDurably(
+            resolvedBrain,
+            `[Document: ${cleanTitle}]\n${previewSnippet}`,
+            params.source,
+            effectiveFileName,
+            resolvedType,
+            [...(params.tags || []), 'document-hub'],
+            effectivePath,
+            {
+              ...sharedProvenance,
+              checksum: documentChecksum,
+              isDocumentRoot: true,
+              isUnifiedContextNode: false,
+              documentTitle: cleanTitle,
+              semanticSectionCount: sections.length,
+              headers: failRoot
+                ? { ...headers, 'x-simulate-failure': 'true' }
+                : headers,
+              simulateFailure: failRoot,
+              mergeHistory: [
+                {
+                  timestamp: new Date().toISOString(),
+                  action: 'created',
+                  summary: `Initialized branching document hub for ${effectiveFileName} (${sections.length} branch sections)`,
+                  newContentLength: formattedText.length,
+                },
+              ],
+            }
+          );
+          createdIds.push(rootFact.id);
 
-        return {
-          fact: rootFact,
-          action: 'created',
-          message: `Imported Hub Node #${rootFact.id} + ${sections.length} branch nodes in "${resolvedBrain}"`,
-          sectionsCount: sections.length,
-          isExistingNode: false,
-        };
+          params.onProgress?.({
+            mode: 'determinate',
+            current: 1,
+            total: totalRecords,
+            unit: 'records',
+            label: 'Persisting branching nodes',
+          });
+
+          for (let i = 0; i < sections.length; i++) {
+            const failChild =
+              params.simulateFailure ||
+              (typeof params.simulateFailureAtStep === 'number' &&
+                params.simulateFailureAtStep === i + 1);
+            const childFact = await this.rememberDurably(
+              resolvedBrain,
+              sections[i].content.trim(),
+              params.source,
+              effectiveFileName,
+              resolvedType,
+              params.tags,
+              effectivePath,
+              {
+                ...sharedProvenance,
+                parentId: rootFact.id,
+                isDocumentRoot: false,
+                isUnifiedContextNode: false,
+                documentTitle:
+                  sections[i].title || `${cleanTitle} · Section ${i + 1}`,
+                semanticSectionCount: 1,
+                headers: failChild
+                  ? { ...headers, 'x-simulate-failure': 'true' }
+                  : headers,
+                simulateFailure: failChild,
+              }
+            );
+            createdIds.push(childFact.id);
+            params.onProgress?.({
+              mode: 'determinate',
+              current: i + 2,
+              total: totalRecords,
+              unit: 'records',
+              label: 'Persisting branching nodes',
+            });
+          }
+          this.saveLocalFacts();
+          this.notify();
+
+          return {
+            fact: rootFact,
+            action: 'created',
+            message: `Imported Hub Node #${rootFact.id} + ${sections.length} branch nodes in "${resolvedBrain}"`,
+            sectionsCount: sections.length,
+            chunksCreated: 1 + sections.length,
+            isExistingNode: false,
+          };
+        } catch (branchErr) {
+          // Atomic rollback: remove hub and any partial branch child nodes created before the failure
+          for (const createdId of createdIds) {
+            await this.forgetDurably(createdId);
+          }
+          this.notify();
+          throw branchErr;
+        }
       }
     }
 
@@ -2062,23 +2474,13 @@ class BrainStorageService {
       params.tags || [],
       effectivePath,
       {
+        ...sharedProvenance,
+        checksum: documentChecksum,
         isDocumentRoot: true,
-        isUnifiedContextNode: true,
+        isUnifiedContextNode: strategy === 'semantic' || strategy === 'single',
         documentTitle: cleanTitle,
         semanticSectionCount: parsed.sections.length,
         mergeHistory: initialHistory,
-        sourceFolder: params.sourceFolder,
-        originalCreatedAt: params.originalCreatedAt,
-        importedAt: params.importedAt,
-        importBatchId: params.importBatchId,
-        checksum: params.checksum,
-        extractionStatus: params.extractionStatus,
-        extractionWarnings: params.extractionWarnings,
-        relatedSources: params.relatedSources,
-        fixtureId: params.fixtureId,
-        topicKey: params.topicKey,
-        fileSizeBytes: params.fileSizeBytes,
-        structuredData: params.structuredData,
         headers,
         simulateFailure: params.simulateFailure,
       }
@@ -2089,6 +2491,7 @@ class BrainStorageService {
       action: 'created',
       message: `Imported as Node #${confirmedFact.id} in "${resolvedBrain}"`,
       sectionsCount: parsed.sections.length,
+      chunksCreated: 1,
       isExistingNode: false,
     };
   }
@@ -3137,7 +3540,9 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
     return data as DatabaseStatusPayload;
   }
 
-  public async createDatabaseBackup(): Promise<{
+  public async createDatabaseBackup(options?: {
+    kind?: 'manual' | 'scheduled' | 'post-import';
+  }): Promise<{
     success: boolean;
     backup: DatabaseBackupItem;
     backups: DatabaseBackupItem[];
@@ -3145,12 +3550,63 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
     const res = await fetch(`${API_BASE}/api/database/backups`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: options?.kind || 'manual' }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       throw new Error(data?.error || `Failed to create database backup (HTTP ${res.status})`);
     }
     return data;
+  }
+
+  public async runAutoBackupCheck(
+    optionsOrForce?:
+      | {
+          force?: boolean;
+          kind?: 'scheduled' | 'post-import';
+          simulateFailure?: boolean;
+        }
+      | boolean,
+    kindArg?: 'scheduled' | 'post-import'
+  ): Promise<{
+    success: boolean;
+    triggered: boolean;
+    backup: DatabaseBackupItem | null;
+    settings: ArgonGlobalSettings;
+    autoBackup: ArgonGlobalSettings['autoBackup'];
+    status: DatabaseStatusPayload;
+    error?: string;
+  }> {
+    const payload =
+      typeof optionsOrForce === 'boolean'
+        ? { force: optionsOrForce, kind: kindArg || 'scheduled' }
+        : optionsOrForce || { force: true };
+    const res = await fetch(`${API_BASE}/api/database/auto-backup/run-check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(
+        data?.error || `Automatic backup check failed (HTTP ${res.status})`
+      );
+    }
+    if (data?.settings) {
+      this.globalSettings = sanitizeArgonSettings(
+        data.settings,
+        this.globalSettings
+      );
+      this.saveLocalGlobalSettings();
+      this.notify();
+    }
+    return {
+      ...data,
+      autoBackup:
+        data?.settings?.autoBackup ||
+        data?.status?.autoBackup ||
+        this.globalSettings.autoBackup,
+    };
   }
 
   public async restoreDatabaseBackup(fileName: string): Promise<{
@@ -3170,7 +3626,7 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
       throw new Error(data?.error || `Database restore failed (HTTP ${res.status})`);
     }
     // Reload facts and brains from the restored SQLite database
-    await this.loadFromBackend();
+    await this.loadFromBackend({ forceReplaceLocal: true });
     return data;
   }
 
@@ -3367,7 +3823,7 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
     if (!res.ok) {
       throw new Error(data?.error || `External database restore failed (HTTP ${res.status})`);
     }
-    await this.loadFromBackend();
+    await this.loadFromBackend({ forceReplaceLocal: true });
     return data;
   }
 
@@ -3842,7 +4298,13 @@ export interface DatabaseBackupItem {
   integrityStatus: string;
   schemaVersion: number;
   factsCount: number;
-  kind: 'manual' | 'pre-migration' | 'pre-restore-safety' | 'external-import';
+  kind:
+    | 'manual'
+    | 'pre-migration'
+    | 'pre-restore-safety'
+    | 'external-import'
+    | 'scheduled'
+    | 'post-import';
 }
 
 export interface DatabaseStatusPayload {
@@ -3858,11 +4320,14 @@ export interface DatabaseStatusPayload {
   factsCount: number;
   brainsCount: number;
   brains: string[];
+  brainCounts?: Record<string, number>;
   devicesCount: number;
   capturesCount: number;
   retention: {
     maxBackups: number;
   };
+  autoBackup?: AutoBackupSettings;
+  globalSettings?: ArgonGlobalSettings;
   backupsSummary: {
     totalBackups: number;
     verifiedBackups: number;

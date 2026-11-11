@@ -46,7 +46,7 @@ export type {
 
 export const DEFAULT_IMPORT_CONCURRENCY = 3;
 export const MIN_IMPORT_CONCURRENCY = 1;
-export const MAX_IMPORT_CONCURRENCY = 8;
+export const MAX_IMPORT_CONCURRENCY = 10;
 
 export function normalizeImportConcurrency(value?: number): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) {
@@ -1364,10 +1364,18 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
               data-testid="import-concurrency-select"
               className="mono rounded bg-transparent text-[11px] font-semibold text-[#9db4ff] outline-none disabled:opacity-50"
             >
-              {[1, 2, 3, 4, 5, 6, 8].map((n) => (
-                <option key={n} value={n} className="bg-[#050711] text-white">
-                  {n}
-                  {n === DEFAULT_IMPORT_CONCURRENCY ? ' (default)' : ''}
+              {[
+                { value: 1, label: '1 — Sequential' },
+                { value: 2, label: '2 — Conservative' },
+                { value: 3, label: '3 — Balanced (default)' },
+                { value: 4, label: '4' },
+                { value: 5, label: '5 — Faster' },
+                { value: 6, label: '6' },
+                { value: 8, label: '8 — High throughput' },
+                { value: 10, label: '10 — Maximum' },
+              ].map((opt) => (
+                <option key={opt.value} value={opt.value} className="bg-[#050711] text-white">
+                  {opt.label}
                 </option>
               ))}
             </select>
@@ -1586,6 +1594,11 @@ export const ImportReviewQueue: React.FC<ImportReviewQueueProps> = ({
             <span className="tabular-nums text-white/80">
               {activeBatchProgress.completed} / {activeBatchProgress.total}{' '}
               processed · {metrics.imported} / {metrics.total} imported
+              {typeof activeBatchProgress.pending === 'number' &&
+                ` · ${activeBatchProgress.pending} pending`}
+              {typeof activeBatchProgress.retried === 'number' &&
+                activeBatchProgress.retried > 0 &&
+                ` · ${activeBatchProgress.retried} retried`}
             </span>
           </div>
           <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-white/10">

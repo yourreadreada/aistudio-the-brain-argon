@@ -1,5 +1,5 @@
 import React from 'react';
-import { Menu, Plus, Upload, Puzzle } from 'lucide-react';
+import { Menu, Plus, Upload, Puzzle, Settings } from 'lucide-react';
 import { AISource, Fact, FactFileType, SOURCE_PALETTE, FILE_TYPE_CONFIG } from '../types/brain';
 import { GlobalSearchBar } from './GlobalSearchBar';
 import { GuidedService } from './GuidedConnectionModal';
@@ -45,6 +45,8 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
   onSelectFileTypeFilter,
   onOpenAddFact,
   onOpenIngest,
+  onOpenSettings,
+  isSettingsActive = false,
   onToggleMobileSidebar,
   totalFactsCount = 0,
 }) => {
@@ -113,7 +115,7 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
         />
       </div>
 
-      {/* Zone 3: Primary Workspace Actions (Companion, Capture Hub, Store Fact) */}
+      {/* Zone 3: Primary Workspace Actions (Companion, Capture Hub, Store Fact, Settings) */}
       <div className="flex items-center gap-2 shrink-0">
         <button
           type="button"
@@ -142,6 +144,24 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
           <Plus className="h-3.5 w-3.5" />
           <span>Store Fact</span>
         </button>
+
+        {onOpenSettings && (
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            data-testid="header-settings-button"
+            aria-label={isSettingsActive ? 'Return to Workspace from Settings' : 'Open Application Settings'}
+            aria-pressed={isSettingsActive}
+            title={isSettingsActive ? 'Close Settings (Return to Workspace)' : 'Settings'}
+            className={`flex h-8 w-8 items-center justify-center rounded-lg border transition shrink-0 focus:outline-none focus:ring-2 focus:ring-[#9db4ff]/50 ${
+              isSettingsActive
+                ? 'border-[#9db4ff]/60 bg-[#9db4ff]/20 text-white shadow-[0_0_12px_rgba(157,180,255,0.25)]'
+                : 'border-white/12 bg-white/[0.03] text-white/70 hover:border-white/25 hover:bg-white/[0.08] hover:text-white'
+            }`}
+          >
+            <Settings className="h-4 w-4" />
+          </button>
+        )}
       </div>
     </header>
   );

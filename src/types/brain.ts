@@ -410,6 +410,9 @@ export interface BatchExecutionProgress {
   imported?: number;
   skipped?: number;
   failed?: number;
+  retried?: number;
+  pending?: number;
+  cancelled?: boolean;
   activeCount: number;
 }
 
@@ -418,6 +421,7 @@ export interface IngestOperationResult {
   action: 'created' | 'merged' | 'appended' | 'updated' | 'unchanged';
   message: string;
   sectionsCount: number;
+  chunksCreated?: number;
   isExistingNode: boolean;
   previousId?: number;
 }
@@ -837,3 +841,382 @@ export const SOURCE_PALETTE: Record<AISource, SourceMeta> = {
 };
 
 export const DEFAULT_BRAINS = ['coding', 'college', 'personal'];
+
+// ============================================================================
+// SECTION 12: GLOBAL APPLICATION SETTINGS & IMPORT/BACKUP CONFIGURATION
+// ============================================================================
+
+export type DuplicateHandlingPolicy = 'skip' | 'ask_user' | 'merge' | 'replace';
+export type FailedRetryBehaviour = 'manual' | 'auto_retry_transient';
+export type BackupScheduleFrequency = 'hourly' | 'daily' | 'weekly';
+export type SettingsCategory =
+  | 'general'
+  | 'database'
+  | 'memory'
+  | 'import'
+  | 'ai'
+  | 'connections'
+  | 'companion'
+  | 'diagnostics';
+
+export interface ImportProcessingSettings {
+  maxFilesPerBatch: number;
+  concurrency: number;
+  defaultStrategy: IngestStrategy;
+  chunkSize: number;
+  defaultBrain: string;
+  duplicateDetectionEnabled: boolean;
+  defaultDuplicatePolicy: DuplicateHandlingPolicy;
+  maxRetries: number;
+  failedRetryBehaviour: FailedRetryBehaviour;
+  autoVerifyAfterImport: boolean;
+  showNotifications: boolean;
+  autoBackupAfterLargeImport: boolean;
+  largeImportBackupThreshold: number;
+}
+
+export interface AutoBackupSettings {
+  enabled: boolean;
+  schedule: BackupScheduleFrequency;
+  maxBackups: number;
+  verifyAfterBackup: boolean;
+  backupBeforeRestore: boolean;
+  backupAfterImport: boolean;
+  backupDirectory?: string;
+  lastBackupAt?: string | null;
+  nextScheduledBackupAt?: string | null;
+  lastBackupError?: string | null;
+  lastBackupFileName?: string | null;
+}
+
+export interface GeneralAppearanceSettings {
+  defaultWorkspace: string;
+  defaultViewMode: 'graph' | 'list' | 'sync' | 'activity';
+  defaultGraphLayout: 'radial' | 'force' | 'timeline';
+  reducedMotion: boolean;
+  compactTableDensity: boolean;
+}
+
+export interface MemoryIntelligenceSettings {
+  autoExtractMetadata: boolean;
+  strictFolderProvenance: boolean;
+  enableSemanticRelationships: boolean;
+  minTagConfidence: number;
+  defaultExportIncludeMetadata: boolean;
+  defaultExportGroupBySource: boolean;
+}
+
+export interface AIConnectionsSettings {
+  loopbackBindHost: string;
+  mcpBridgeEnabled: boolean;
+  defaultRecallLimit: number;
+}
+
+export interface ArgonGlobalSettings {
+  version: number;
+  updatedAt: string;
+  general: GeneralAppearanceSettings;
+  autoBackup: AutoBackupSettings;
+  memoryIntelligence: MemoryIntelligenceSettings;
+  importProcessing: ImportProcessingSettings;
+  aiConnections: AIConnectionsSettings;
+}
+
+export interface DeepPartialArgonGlobalSettings {
+  version?: number;
+  updatedAt?: string;
+  general?: Partial<GeneralAppearanceSettings>;
+  autoBackup?: Partial<AutoBackupSettings>;
+  memoryIntelligence?: Partial<MemoryIntelligenceSettings>;
+  importProcessing?: Partial<ImportProcessingSettings>;
+  aiConnections?: Partial<AIConnectionsSettings>;
+}
+
+export const DEFAULT_ARGON_SETTINGS: ArgonGlobalSettings = {
+  version: 1,
+  updatedAt: '2026-11-11T00:00:00.000Z',
+  general: {
+    defaultWorkspace: 'coding',
+    defaultViewMode: 'graph',
+    defaultGraphLayout: 'radial',
+    reducedMotion: false,
+    compactTableDensity: false,
+  },
+  autoBackup: {
+    enabled: true,
+    schedule: 'daily',
+    maxBackups: 10,
+    verifyAfterBackup: true,
+    backupBeforeRestore: true,
+    backupAfterImport: true,
+    lastBackupAt: null,
+    nextScheduledBackupAt: null,
+    lastBackupError: null,
+    lastBackupFileName: null,
+  },
+  memoryIntelligence: {
+    autoExtractMetadata: true,
+    strictFolderProvenance: true,
+    enableSemanticRelationships: true,
+    minTagConfidence: 0.7,
+    defaultExportIncludeMetadata: true,
+    defaultExportGroupBySource: true,
+  },
+  importProcessing: {
+    maxFilesPerBatch: 1000,
+    concurrency: 3,
+    defaultStrategy: 'semantic',
+    chunkSize: 1200,
+    defaultBrain: 'coding',
+    duplicateDetectionEnabled: true,
+    defaultDuplicatePolicy: 'skip',
+    maxRetries: 2,
+    failedRetryBehaviour: 'auto_retry_transient',
+    autoVerifyAfterImport: true,
+    showNotifications: true,
+    autoBackupAfterLargeImport: true,
+    largeImportBackupThreshold: 50,
+  },
+  aiConnections: {
+    loopbackBindHost: '127.0.0.1',
+    mcpBridgeEnabled: true,
+    defaultRecallLimit: 250,
+  },
+};
+
+export function sanitizeArgonSettings(
+  raw: DeepPartialArgonGlobalSettings | Partial<ArgonGlobalSettings> | null | undefined,
+  base: ArgonGlobalSettings = DEFAULT_ARGON_SETTINGS
+): ArgonGlobalSettings {
+  const input = raw && typeof raw === 'object' ? raw : {};
+  const gen = (input.general || {}) as Partial<GeneralAppearanceSettings>;
+  const ab = (input.autoBackup || {}) as Partial<AutoBackupSettings>;
+  const mi = (input.memoryIntelligence || {}) as Partial<MemoryIntelligenceSettings>;
+  const ip = (input.importProcessing || {}) as Partial<ImportProcessingSettings>;
+  const ai = (input.aiConnections || {}) as Partial<AIConnectionsSettings>;
+
+  const clampInt = (val: unknown, fallback: number, min: number, max: number) => {
+    const n = Number(val);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, Math.floor(n)));
+  };
+
+  const validStrategy = (val: unknown, fallback: IngestStrategy): IngestStrategy => {
+    if (val === 'semantic' || val === 'branching' || val === 'chunk' || val === 'single') {
+      return val === 'single' ? 'semantic' : val;
+    }
+    return fallback;
+  };
+
+  const validDupPolicy = (
+    val: unknown,
+    fallback: DuplicateHandlingPolicy
+  ): DuplicateHandlingPolicy => {
+    if (val === 'skip' || val === 'ask_user' || val === 'merge' || val === 'replace') {
+      return val;
+    }
+    return fallback;
+  };
+
+  const validRetryBehaviour = (
+    val: unknown,
+    fallback: FailedRetryBehaviour
+  ): FailedRetryBehaviour => {
+    if (val === 'manual' || val === 'auto_retry_transient') return val;
+    return fallback;
+  };
+
+  const validSchedule = (
+    val: unknown,
+    fallback: BackupScheduleFrequency
+  ): BackupScheduleFrequency => {
+    if (val === 'hourly' || val === 'daily' || val === 'weekly') return val;
+    return fallback;
+  };
+
+  const validViewMode = (
+    val: unknown,
+    fallback: GeneralAppearanceSettings['defaultViewMode']
+  ): GeneralAppearanceSettings['defaultViewMode'] => {
+    if (val === 'graph' || val === 'list' || val === 'sync' || val === 'activity') {
+      return val;
+    }
+    return fallback;
+  };
+
+  const validLayout = (
+    val: unknown,
+    fallback: GeneralAppearanceSettings['defaultGraphLayout']
+  ): GeneralAppearanceSettings['defaultGraphLayout'] => {
+    if (val === 'radial' || val === 'force' || val === 'timeline') return val;
+    return fallback;
+  };
+
+  return {
+    version: 1,
+    updatedAt:
+      typeof input.updatedAt === 'string' && input.updatedAt.trim()
+        ? input.updatedAt
+        : new Date().toISOString(),
+    general: {
+      defaultWorkspace:
+        typeof gen.defaultWorkspace === 'string' && gen.defaultWorkspace.trim()
+          ? gen.defaultWorkspace.trim().toLowerCase()
+          : base.general.defaultWorkspace,
+      defaultViewMode: validViewMode(gen.defaultViewMode, base.general.defaultViewMode),
+      defaultGraphLayout: validLayout(
+        gen.defaultGraphLayout,
+        base.general.defaultGraphLayout
+      ),
+      reducedMotion:
+        typeof gen.reducedMotion === 'boolean'
+          ? gen.reducedMotion
+          : base.general.reducedMotion,
+      compactTableDensity:
+        typeof gen.compactTableDensity === 'boolean'
+          ? gen.compactTableDensity
+          : base.general.compactTableDensity,
+    },
+    autoBackup: {
+      enabled:
+        typeof ab.enabled === 'boolean' ? ab.enabled : base.autoBackup.enabled,
+      schedule: validSchedule(ab.schedule, base.autoBackup.schedule),
+      maxBackups: clampInt(ab.maxBackups, base.autoBackup.maxBackups, 1, 100),
+      verifyAfterBackup:
+        typeof ab.verifyAfterBackup === 'boolean'
+          ? ab.verifyAfterBackup
+          : base.autoBackup.verifyAfterBackup,
+      backupBeforeRestore:
+        typeof ab.backupBeforeRestore === 'boolean'
+          ? ab.backupBeforeRestore
+          : base.autoBackup.backupBeforeRestore,
+      backupAfterImport:
+        typeof ab.backupAfterImport === 'boolean'
+          ? ab.backupAfterImport
+          : base.autoBackup.backupAfterImport,
+      lastBackupAt:
+        ab.lastBackupAt !== undefined ? ab.lastBackupAt : base.autoBackup.lastBackupAt,
+      nextScheduledBackupAt:
+        ab.nextScheduledBackupAt !== undefined
+          ? ab.nextScheduledBackupAt
+          : base.autoBackup.nextScheduledBackupAt,
+      lastBackupError:
+        ab.lastBackupError !== undefined
+          ? ab.lastBackupError
+          : base.autoBackup.lastBackupError,
+      lastBackupFileName:
+        ab.lastBackupFileName !== undefined
+          ? ab.lastBackupFileName
+          : base.autoBackup.lastBackupFileName,
+    },
+    memoryIntelligence: {
+      autoExtractMetadata:
+        typeof mi.autoExtractMetadata === 'boolean'
+          ? mi.autoExtractMetadata
+          : base.memoryIntelligence.autoExtractMetadata,
+      strictFolderProvenance:
+        typeof mi.strictFolderProvenance === 'boolean'
+          ? mi.strictFolderProvenance
+          : base.memoryIntelligence.strictFolderProvenance,
+      enableSemanticRelationships:
+        typeof mi.enableSemanticRelationships === 'boolean'
+          ? mi.enableSemanticRelationships
+          : base.memoryIntelligence.enableSemanticRelationships,
+      minTagConfidence: Math.max(
+        0.1,
+        Math.min(
+          1.0,
+          Number.isFinite(Number(mi.minTagConfidence))
+            ? Number(mi.minTagConfidence)
+            : base.memoryIntelligence.minTagConfidence
+        )
+      ),
+      defaultExportIncludeMetadata:
+        typeof mi.defaultExportIncludeMetadata === 'boolean'
+          ? mi.defaultExportIncludeMetadata
+          : base.memoryIntelligence.defaultExportIncludeMetadata,
+      defaultExportGroupBySource:
+        typeof mi.defaultExportGroupBySource === 'boolean'
+          ? mi.defaultExportGroupBySource
+          : base.memoryIntelligence.defaultExportGroupBySource,
+    },
+    importProcessing: {
+      maxFilesPerBatch: clampInt(
+        ip.maxFilesPerBatch,
+        base.importProcessing.maxFilesPerBatch,
+        1,
+        5000
+      ),
+      concurrency: clampInt(
+        ip.concurrency,
+        base.importProcessing.concurrency,
+        1,
+        10
+      ),
+      defaultStrategy: validStrategy(
+        ip.defaultStrategy,
+        base.importProcessing.defaultStrategy
+      ),
+      chunkSize: clampInt(
+        ip.chunkSize,
+        base.importProcessing.chunkSize,
+        200,
+        10000
+      ),
+      defaultBrain:
+        typeof ip.defaultBrain === 'string' && ip.defaultBrain.trim()
+          ? ip.defaultBrain.trim().toLowerCase()
+          : base.importProcessing.defaultBrain,
+      duplicateDetectionEnabled:
+        typeof ip.duplicateDetectionEnabled === 'boolean'
+          ? ip.duplicateDetectionEnabled
+          : base.importProcessing.duplicateDetectionEnabled,
+      defaultDuplicatePolicy: validDupPolicy(
+        ip.defaultDuplicatePolicy,
+        base.importProcessing.defaultDuplicatePolicy
+      ),
+      maxRetries: clampInt(
+        ip.maxRetries,
+        base.importProcessing.maxRetries,
+        0,
+        5
+      ),
+      failedRetryBehaviour: validRetryBehaviour(
+        ip.failedRetryBehaviour,
+        base.importProcessing.failedRetryBehaviour
+      ),
+      autoVerifyAfterImport:
+        typeof ip.autoVerifyAfterImport === 'boolean'
+          ? ip.autoVerifyAfterImport
+          : base.importProcessing.autoVerifyAfterImport,
+      showNotifications:
+        typeof ip.showNotifications === 'boolean'
+          ? ip.showNotifications
+          : base.importProcessing.showNotifications,
+      autoBackupAfterLargeImport:
+        typeof ip.autoBackupAfterLargeImport === 'boolean'
+          ? ip.autoBackupAfterLargeImport
+          : base.importProcessing.autoBackupAfterLargeImport,
+      largeImportBackupThreshold: clampInt(
+        ip.largeImportBackupThreshold,
+        base.importProcessing.largeImportBackupThreshold,
+        1,
+        5000
+      ),
+    },
+    aiConnections: {
+      loopbackBindHost: '127.0.0.1',
+      mcpBridgeEnabled:
+        typeof ai.mcpBridgeEnabled === 'boolean'
+          ? ai.mcpBridgeEnabled
+          : base.aiConnections.mcpBridgeEnabled,
+      defaultRecallLimit: clampInt(
+        ai.defaultRecallLimit,
+        base.aiConnections.defaultRecallLimit,
+        10,
+        2000
+      ),
+    },
+  };
+}
+
