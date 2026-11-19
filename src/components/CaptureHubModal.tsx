@@ -2784,6 +2784,31 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                         </option>
                       </select>
                     </label>
+
+                    <label className="inline-flex items-center gap-1.5">
+                      <span>Concurrency (Session Override):</span>
+                      <select
+                        value={concurrencyLimit}
+                        onChange={(e) => {
+                          const next = normalizeImportConcurrency(
+                            parseInt(e.target.value, 10)
+                          );
+                          setConcurrencyLimit(next);
+                        }}
+                        data-testid="concurrency-limit-select"
+                        className="rounded border border-white/15 bg-black/60 px-1.5 py-0.5 text-[10.5px] text-[#9db4ff] outline-none"
+                      >
+                        {[1, 2, 3, 5, 8, 10].map((level) => (
+                          <option
+                            key={level}
+                            value={level}
+                            className="bg-[#050711] text-white"
+                          >
+                            {level}x{level === 3 ? ' (default)' : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                   </div>
                 </div>
               </div>

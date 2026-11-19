@@ -3591,11 +3591,6 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
       body: JSON.stringify(payload),
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      throw new Error(
-        data?.error || `Automatic backup check failed (HTTP ${res.status})`
-      );
-    }
     if (data?.settings) {
       this.globalSettings = sanitizeArgonSettings(
         data.settings,
@@ -3604,8 +3599,18 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
       this.saveLocalGlobalSettings();
       this.notify();
     }
+    if (!res.ok && !data?.settings) {
+      throw new Error(
+        data?.error || `Automatic backup check failed (HTTP ${res.status})`
+      );
+    }
     return {
-      ...data,
+      success: res.ok && data?.success !== false,
+      triggered: Boolean(data?.triggered),
+      backup: data?.backup ?? null,
+      settings: data?.settings || this.globalSettings,
+      status: data?.status,
+      error: data?.error,
       autoBackup:
         data?.settings?.autoBackup ||
         data?.status?.autoBackup ||
