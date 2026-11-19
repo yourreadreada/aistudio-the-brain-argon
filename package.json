@@ -17,7 +17,8 @@
     "test": "node --import tsx --test tests/*.test.ts",
     "package:extension": "node scripts/package-extension.mjs",
     "db:backup": "tsx scripts/db-cli.ts backup",
-    "db:seed-demo": "tsx scripts/db-cli.ts seed-demo"
+    "db:seed-demo": "tsx scripts/db-cli.ts seed-demo",
+    "mcp:server": "tsx scripts/mcp-server.ts"
   },
   "dependencies": {
     "@google/genai": "^2.32.0",

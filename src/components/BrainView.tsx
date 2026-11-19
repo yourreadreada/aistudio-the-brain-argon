@@ -620,8 +620,19 @@ export const BrainView: React.FC<BrainViewProps> = ({
     return list;
   }, [auditLogs, auditSortDir]);
 
+  useEffect(() => {
+    if (!isMobileSidebarOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setIsMobileSidebarOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isMobileSidebarOpen]);
+
   return (
-    <div className="relative flex h-screen w-screen overflow-hidden bg-[#03040a] text-white">
+    <div className="relative flex h-dvh w-full overflow-hidden bg-[#03040a] text-white">
       {/* Desktop Collapsible Sidebar */}
       <div className="hidden md:flex h-full shrink-0">
         <BrainSidebar
@@ -760,7 +771,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
           onSelectFileTypeFilter={setActiveFileTypeFilter}
           onOpenAddFact={() => setIsAddFactOpen(true)}
           onOpenIngest={(tab) => handleOpenCaptureHub(tab || 'import')}
-          onOpenMcp={() => handleOpenGuidedConfig('chatgpt')}
+          onOpenMcp={() => setIsMcpOpen(true)}
           onOpenSettings={() =>
             setViewMode((prev) => (prev === 'settings' ? 'graph' : 'settings'))
           }
@@ -1043,8 +1054,8 @@ export const BrainView: React.FC<BrainViewProps> = ({
                     </p>
                   </div>
                 ) : (
-                  <div className="overflow-hidden rounded-xl border border-white/10 bg-[#060812]/90">
-                    <table className="w-full text-left border-collapse">
+                  <div className="overflow-x-auto rounded-xl border border-white/10 bg-[#060812]/90">
+                    <table className="w-full min-w-[680px] text-left border-collapse">
                       <thead>
                         <tr className="border-b border-white/10 bg-white/[0.02] text-[11px] font-medium text-white/55 select-none">
                           <th
@@ -1274,14 +1285,24 @@ export const BrainView: React.FC<BrainViewProps> = ({
                     </p>
                   </div>
 
-                  <button
-                    type="button"
-                    onClick={() => handleOpenGuidedConfig('chatgpt')}
-                    className="flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.04] px-3.5 py-2 text-xs font-medium text-white transition hover:border-white/30 hover:bg-white/[0.08]"
-                  >
-                    <ExternalLink className="h-3.5 w-3.5" />
-                    <span>Open Full Connection Wizard</span>
-                  </button>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      data-testid="open-mcp-bridge-studio-btn"
+                      onClick={() => setIsMcpOpen(true)}
+                      className="flex items-center gap-1.5 rounded-lg bg-[#9db4ff] px-3.5 py-2 text-xs font-semibold text-[#050712] transition hover:bg-white"
+                    >
+                      <span>MCP Bridge & Diagnostics</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleOpenGuidedConfig('chatgpt')}
+                      className="flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/[0.04] px-3.5 py-2 text-xs font-medium text-white transition hover:border-white/30 hover:bg-white/[0.08]"
+                    >
+                      <ExternalLink className="h-3.5 w-3.5" />
+                      <span>Open Full Connection Wizard</span>
+                    </button>
+                  </div>
                 </div>
 
                 {/* Explicit Connectivity Honesty Banner */}
@@ -1645,6 +1666,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
                   refreshData();
                   refreshActivities();
                 }}
+                onOpenMcpBridge={() => setIsMcpOpen(true)}
               />
             </div>
           )}

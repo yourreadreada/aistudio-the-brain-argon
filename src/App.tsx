@@ -60,8 +60,8 @@ export default function App() {
   };
 
   return (
-    <div className="relative min-h-screen w-full bg-[#03040a] font-sans text-white overflow-hidden">
-      <div className="relative h-screen w-screen">
+    <div className="relative min-h-dvh w-full bg-[#03040a] font-sans text-white overflow-hidden">
+      <div className="relative h-dvh w-full">
         {currentView === 'welcome' ? (
           <WelcomeView onEnterBrain={handleEnterBrain} isEnteringExternal={isWarping} />
         ) : (

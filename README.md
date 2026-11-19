@@ -45,7 +45,20 @@ The Brain is a local-first, SQLite-backed personal and engineering memory system
 - **External Backup Import & Restore (`Restore from External Backup`)**: Allows selecting any `.db` file from disk, inspects its SQLite header, schema tables, `PRAGMA integrity_check`, and record counts, creates an automatic pre-restore safety backup, and restores atomically with automatic rollback on failure.
 - **Backup Retention & Cleanup**: Displays **Verified**, **Invalid**, and **Total** backup counts, supports deleting individual backups (while protecting the last known-good verified backup), and one-click cleanup of invalid backups.
 
-### 6. Full-Page Activity Log & Provider-Neutral Spinal Cord Architecture
+### 6. MCP Bridge (Desktop stdio MCP, Local HTTP API & Browser Companion)
+- **Desktop stdio MCP (`scripts/mcp-server.ts`)**: Real Node.js/TypeScript JSON-RPC 2.0 stdio server (`npm run mcp:server`) backed directly by `node:sqlite`. Supports `initialize`, `tools/list`, `tools/call` (`list_brains`, `search_memories`, `get_memory`, `remember_fact`, `database_status`), and `resources/read`.
+- **Local HTTP API (`http://127.0.0.1:3000`)**: Exposes REST (`/api/recall`, `/api/remember`, `/api/brains`) and JSON-RPC (`POST /api/mcp`), live runtime diagnostics (`GET /api/mcp/diagnostics`), and live smoke testing (`POST /api/mcp/smoke-test`).
+- **Browser Companion (`extension/`)**: Unpacked Chrome/Edge/Brave extension authenticated via SHA-256-hashed `brn_live_*` device tokens.
+
+### 7. Local Security & Privacy Posture (`SECURITY_PRIVACY.md`)
+- Live verifiable audit (`GET /api/security/posture` & Settings → **Local Security & Privacy Posture**).
+- Truthfully reports unencrypted standard SQLite on disk, enforces `0600`/`0700` POSIX permissions on DB/WAL/backups, verifies zero plaintext companion tokens, redacts secrets in activity logs & portable exports, and distinguishes **Local-First** vs **Offline-Capable** vs **Air-Gapped**.
+
+### 8. Portable Brain Format Family (`.brain.json`, `.brain.md`, `.brainpack.zip`)
+- Versioned, SHA-256 checksum-verified exports (`GET /api/portable/export`) with selective filtering by Brain, source, and date range, secret redaction by default, and explicit opt-in for attachments.
+- Preview & diff inspection (`POST /api/portable/inspect`) and atomic round-trip import (`POST /api/portable/import`) with `skip` / `merge` / `replace` conflict policies and remapped parent/child hierarchy links.
+
+### 9. Full-Page Activity Log & Provider-Neutral Spinal Cord Architecture
 - **Activity Log**: Durable SQLite `activity_logs` table with search, category/status/source filters, expandable JSON diagnostics, automatic secret redaction, and **JSON / CSV export**.
 - **AI Entities, Wormholes & Spinal Cord**: Provider-neutral entity registry (`AI_ENTITIES_REGISTRY`) and local-only Spinal Cord boundary (`127.0.0.1:3000`, LAN/remote exposure disabled).
 
@@ -57,6 +70,9 @@ The Brain is a local-first, SQLite-backed personal and engineering memory system
 # Start full-stack server (bound to 127.0.0.1:3000)
 npm run dev
 
+# Start Desktop stdio MCP server directly (used by Claude Desktop / Cursor)
+npm run mcp:server
+
 # Run automated test suites
 npm test
 
@@ -64,3 +80,4 @@ npm test
 npm run build
 npm run lint
 ```
+

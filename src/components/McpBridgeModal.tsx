@@ -1,4 +1,18 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  CheckCircle2,
+  AlertTriangle,
+  RefreshCw,
+  Play,
+  Copy,
+  Check,
+  Terminal,
+  Globe,
+  Puzzle,
+  Sparkles,
+  FlaskConical,
+  X,
+} from 'lucide-react';
 import { brainStore } from '../services/brainStorage';
 import { AISource, Fact } from '../types/brain';
 import { BrainLogo } from './BrainLogo';
@@ -9,18 +23,98 @@ interface McpBridgeModalProps {
   currentBrain: string;
 }
 
-type BridgeTab = 'extension' | 'chatgpt' | 'claude' | 'gemini' | 'simulator' | 'advanced';
+type BridgeTab = 'desktop_mcp' | 'http_api' | 'companion' | 'web_primers' | 'simulator';
+
+interface McpDiagnosticsState {
+  checkedAt: string;
+  protocolVersion: string;
+  serverInfo: { name: string; version: string };
+  runtime: {
+    nodeExecutable: string;
+    nodeVersion: string;
+    tsxBinPath: string;
+    tsxAvailable: boolean;
+    mcpScriptPath: string;
+    mcpScriptExists: boolean;
+    dbPath: string;
+    workspaceRoot: string;
+  };
+  transports: {
+    desktopStdioMcp: {
+      status: 'available' | 'unavailable';
+      label: string;
+      protocol: string;
+      command: string;
+      args: string[];
+      cwd: string;
+      env: Record<string, string>;
+      summary: string;
+    };
+    localHttpApi: {
+      status: 'online';
+      label: string;
+      baseUrl: string;
+      endpoints: {
+        status: string;
+        brains: string;
+        recall: string;
+        remember: string;
+        mcpJsonRpc: string;
+        openApi: string;
+      };
+      summary: string;
+    };
+    browserCompanion: {
+      status: 'paired' | 'ready_unpaired' | 'unavailable';
+      label: string;
+      manifestExists: boolean;
+      activeDevices: number;
+      captureEndpoint: string;
+      summary: string;
+    };
+  };
+  testedClientConfigs: {
+    claudeDesktop: {
+      clientName: string;
+      configPathHint: string;
+      config: Record<string, any>;
+    };
+    cursor: {
+      clientName: string;
+      configPathHint: string;
+      config: Record<string, any>;
+    };
+  };
+  tools: Array<{ name: string; permission: 'read' | 'write'; description: string }>;
+}
+
+interface SmokeTestResult {
+  ok: boolean;
+  durationMs: number;
+  checkedAt: string;
+  steps: Array<{ step: string; ok: boolean; detail: string }>;
+  sampleMemories?: Fact[];
+  error?: string;
+}
 
 export const McpBridgeModal: React.FC<McpBridgeModalProps> = ({
   isOpen,
   onClose,
   currentBrain,
 }) => {
-  const [activeTab, setActiveTab] = useState<BridgeTab>('extension');
+  const [activeTab, setActiveTab] = useState<BridgeTab>('desktop_mcp');
+  const [selectedClient, setSelectedClient] = useState<'claudeDesktop' | 'cursor'>('claudeDesktop');
+  const [selectedPrimer, setSelectedPrimer] = useState<'chatgpt' | 'claude' | 'gemini'>('chatgpt');
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  // Local server prober
-  const [serverOnline, setServerOnline] = useState<boolean | null>(null);
+  // Live diagnostics & health check
+  const [diagnostics, setDiagnostics] = useState<McpDiagnosticsState | null>(null);
+  const [diagLoading, setDiagLoading] = useState<boolean>(false);
+  const [diagError, setDiagError] = useState<string | null>(null);
+
+  // Live smoke test
+  const [smokeRunning, setSmokeRunning] = useState<boolean>(false);
+  const [smokeResult, setSmokeResult] = useState<SmokeTestResult | null>(null);
 
   // Live Simulator State
   const [simModel, setSimModel] = useState<AISource>('gpt');
@@ -34,25 +128,65 @@ export const McpBridgeModal: React.FC<McpBridgeModalProps> = ({
   } | null>(null);
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
 
+  const loadDiagnostics = useCallback(async () => {
+    setDiagLoading(true);
+    setDiagError(null);
+    try {
+      const data = await brainStore.fetchMcpDiagnostics(currentBrain);
+      setDiagnostics(data);
+    } catch (err: any) {
+      setDiagnostics(null);
+      setDiagError(
+        err?.message ||
+          'Local Argon HTTP server is unreachable. Start it with: npm run dev'
+      );
+    } finally {
+      setDiagLoading(false);
+    }
+  }, [currentBrain]);
+
   useEffect(() => {
     if (!isOpen) return;
+    loadDiagnostics();
+  }, [isOpen, loadDiagnostics]);
 
-    // Check if local web server (http://localhost:8787) is responding
-    fetch('http://localhost:8787/api/brains', { signal: AbortSignal.timeout(1500) })
-      .then((res) => {
-        setServerOnline(res.ok);
-      })
-      .catch(() => {
-        setServerOnline(false);
-      });
-  }, [isOpen]);
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, onClose]);
 
   if (!isOpen) return null;
 
   const handleCopy = (text: string, key: string) => {
-    navigator.clipboard.writeText(text);
+    navigator.clipboard.writeText(text).catch(() => {});
     setCopiedKey(key);
     setTimeout(() => setCopiedKey(null), 2000);
+  };
+
+  const handleRunSmokeTest = async () => {
+    setSmokeRunning(true);
+    setSmokeResult(null);
+    try {
+      const res = await brainStore.runMcpSmokeTest(currentBrain);
+      setSmokeResult(res);
+    } catch (err: any) {
+      setSmokeResult({
+        ok: false,
+        durationMs: 0,
+        checkedAt: new Date().toISOString(),
+        steps: [],
+        error: err?.message || 'MCP smoke test failed',
+      });
+    } finally {
+      setSmokeRunning(false);
+    }
   };
 
   const handleRunSimulation = (promptToRun?: string) => {
@@ -70,7 +204,7 @@ export const McpBridgeModal: React.FC<McpBridgeModalProps> = ({
         savedFact: result.savedFact,
       });
       setIsSimulating(false);
-    }, 400);
+    }, 250);
   };
 
   const chatGptInstructions = brainStore.generateChatGptCustomInstructions(currentBrain);
@@ -78,536 +212,466 @@ export const McpBridgeModal: React.FC<McpBridgeModalProps> = ({
   const geminiPrimer = brainStore.generateGeminiPrimer(currentBrain);
   const contextSnapshot = brainStore.exportContextSnapshot(currentBrain);
   const openApiSpec = JSON.stringify(brainStore.getOpenApiSpec(), null, 2);
-  const desktopMcpJson = JSON.stringify(
-    {
-      mcpServers: {
-        brain: {
-          command: 'python3',
-          args: ['-m', 'brain.server'],
-          env: { BRAIN_DEFAULT: currentBrain },
-        },
-      },
-    },
-    null,
-    2
-  );
+
+  const activeClientConfig = diagnostics?.testedClientConfigs?.[selectedClient];
+  const activeClientConfigJson = activeClientConfig
+    ? JSON.stringify(activeClientConfig.config, null, 2)
+    : '';
+
+  const localBaseUrl =
+    diagnostics?.transports.localHttpApi.baseUrl ||
+    (typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1:3000');
+
+  const curlMcpExample = `curl -s -X POST ${localBaseUrl}/api/mcp \\
+  -H "Content-Type: application/json" \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_memories","arguments":{"brain":"${currentBrain}","limit":5}}}'`;
+
+  const stdioStatus = diagnostics?.transports.desktopStdioMcp.status;
+  const companionStatus = diagnostics?.transports.browserCompanion.status;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      {/* Backdrop */}
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="mcp-bridge-modal-title"
+      data-testid="mcp-bridge-modal"
+    >
       <div
         onClick={onClose}
         className="absolute inset-0 bg-black/85 backdrop-blur-md transition-opacity"
       />
 
-      {/* Modal Dialog */}
-      <div className="relative flex max-h-[92vh] w-full max-w-3xl flex-col rounded-2xl border border-white/20 bg-[#060814]/95 shadow-2xl backdrop-blur-2xl overflow-hidden">
-        {/* Top Header */}
-        <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
-          <div className="flex items-center gap-3 text-white">
-            <BrainLogo size={18} className="text-white" />
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="mono text-xs font-semibold tracking-wider text-white">
-                  WEB AI & MEMORY BRIDGE
-                </span>
-                <span className="mono rounded bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-0.5 text-[10px] text-emerald-300 font-semibold">
-                  100% Free Plan Compatible
+      <div className="relative flex max-h-[92dvh] w-full max-w-4xl flex-col rounded-2xl border border-white/15 bg-[#060814]/98 shadow-2xl overflow-hidden">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-3 border-b border-white/10 px-4 sm:px-6 py-4">
+          <div className="flex items-center gap-3 text-white min-w-0">
+            <BrainLogo size={18} className="text-white shrink-0" />
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <h2
+                  id="mcp-bridge-modal-title"
+                  className="mono text-xs font-semibold tracking-wider text-white uppercase"
+                >
+                  MCP Bridge & Local Transport Diagnostics
+                </h2>
+                <span className="mono rounded border border-white/15 bg-white/5 px-1.5 py-0.5 text-[10px] text-white/75">
+                  Node.js + node:sqlite
                 </span>
               </div>
-              <p className="mono text-[11px] text-white/50">
-                Connect your memory to ChatGPT, Claude & Gemini web chats with zero subscriptions.
+              <p className="mt-0.5 text-xs text-white/55">
+                Three distinct local connection paths: Desktop stdio MCP, Local HTTP API, and Browser Companion.
               </p>
             </div>
           </div>
-          <button
-            onClick={onClose}
-            className="text-white/40 transition hover:text-white p-1 text-sm mono"
-          >
-            ✕
-          </button>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={loadDiagnostics}
+              disabled={diagLoading}
+              aria-label="Re-check live MCP runtime diagnostics"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-white/5 px-2.5 py-1.5 text-xs text-white/80 hover:bg-white/10 hover:text-white transition min-h-[36px]"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${diagLoading ? 'animate-spin' : ''}`} />
+              <span className="hidden sm:inline">Re-check</span>
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close MCP Bridge modal"
+              className="inline-flex items-center justify-center rounded-lg border border-white/10 bg-white/5 text-white/60 transition hover:bg-white/10 hover:text-white h-9 w-9"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
-        {/* Tab Strip */}
-        <div className="flex items-center gap-1 border-b border-white/10 bg-black/40 px-6 py-2 overflow-x-auto scrollbar-thin">
-          <button
-            onClick={() => setActiveTab('extension')}
-            className={`mono whitespace-nowrap px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'extension'
-                ? 'bg-indigo-600 text-white shadow'
-                : 'text-white/60 hover:text-white hover:bg-white/5'
-            }`}
-          >
-            Browser Extension (1-Click)
-          </button>
-          <button
-            onClick={() => setActiveTab('chatgpt')}
-            className={`mono whitespace-nowrap px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'chatgpt'
-                ? 'bg-emerald-600 text-white shadow'
-                : 'text-white/60 hover:text-white hover:bg-white/5'
-            }`}
-          >
-            ChatGPT Web (Free)
-          </button>
-          <button
-            onClick={() => setActiveTab('claude')}
-            className={`mono whitespace-nowrap px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'claude'
-                ? 'bg-amber-600 text-white shadow'
-                : 'text-white/60 hover:text-white hover:bg-white/5'
-            }`}
-          >
-            Claude Web (Free)
-          </button>
-          <button
-            onClick={() => setActiveTab('gemini')}
-            className={`mono whitespace-nowrap px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'gemini'
-                ? 'bg-sky-600 text-white shadow'
-                : 'text-white/60 hover:text-white hover:bg-white/5'
-            }`}
-          >
-            Gemini Web (Free)
-          </button>
-          <button
-            onClick={() => setActiveTab('simulator')}
-            className={`mono whitespace-nowrap px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'simulator'
-                ? 'bg-purple-600 text-white shadow'
-                : 'text-white/60 hover:text-white hover:bg-white/5'
-            }`}
-          >
-            🧪 Live Simulator
-          </button>
-          <button
-            onClick={() => setActiveTab('advanced')}
-            className={`mono whitespace-nowrap px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-              activeTab === 'advanced'
-                ? 'bg-white/20 text-white shadow'
-                : 'text-white/40 hover:text-white/70 hover:bg-white/5'
-            }`}
-          >
-            Advanced / Plus
-          </button>
+        {/* Transport Status Overview Bar */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 border-b border-white/10 bg-black/40 px-4 sm:px-6 py-3">
+          <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2 flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="mono text-[10px] uppercase tracking-wider text-white/45">
+                1. Desktop stdio MCP
+              </div>
+              <div className="text-xs font-medium text-white truncate">
+                Claude Desktop / Cursor
+              </div>
+            </div>
+            <span
+              data-testid="mcp-stdio-status-badge"
+              className={`mono text-[10px] font-semibold px-2 py-0.5 rounded border shrink-0 ${
+                stdioStatus === 'available'
+                  ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300'
+                  : diagLoading
+                    ? 'border-white/15 bg-white/5 text-white/50'
+                    : 'border-amber-500/30 bg-amber-500/15 text-amber-300'
+              }`}
+            >
+              {diagLoading ? 'Checking' : stdioStatus === 'available' ? 'Verified' : 'Unavailable'}
+            </span>
+          </div>
+
+          <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2 flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="mono text-[10px] uppercase tracking-wider text-white/45">
+                2. Local HTTP API
+              </div>
+              <div className="mono text-[11px] text-white truncate">{localBaseUrl}</div>
+            </div>
+            <span
+              data-testid="mcp-http-status-badge"
+              className={`mono text-[10px] font-semibold px-2 py-0.5 rounded border shrink-0 ${
+                diagnostics
+                  ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300'
+                  : diagLoading
+                    ? 'border-white/15 bg-white/5 text-white/50'
+                    : 'border-rose-500/30 bg-rose-500/15 text-rose-300'
+              }`}
+            >
+              {diagLoading ? 'Checking' : diagnostics ? 'Online' : 'Offline'}
+            </span>
+          </div>
+
+          <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2 flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <div className="mono text-[10px] uppercase tracking-wider text-white/45">
+                3. Browser Companion
+              </div>
+              <div className="text-xs font-medium text-white truncate">
+                {diagnostics
+                  ? `${diagnostics.transports.browserCompanion.activeDevices} paired device(s)`
+                  : 'Chrome / Edge / Brave'}
+              </div>
+            </div>
+            <span
+              data-testid="mcp-companion-status-badge"
+              className={`mono text-[10px] font-semibold px-2 py-0.5 rounded border shrink-0 ${
+                companionStatus === 'paired'
+                  ? 'border-emerald-500/30 bg-emerald-500/15 text-emerald-300'
+                  : companionStatus === 'ready_unpaired'
+                    ? 'border-sky-500/30 bg-sky-500/15 text-sky-300'
+                    : 'border-white/15 bg-white/5 text-white/50'
+              }`}
+            >
+              {companionStatus === 'paired'
+                ? 'Paired'
+                : companionStatus === 'ready_unpaired'
+                  ? 'Unpaired'
+                  : diagLoading
+                    ? 'Checking'
+                    : 'Unavailable'}
+            </span>
+          </div>
         </div>
 
-        {/* Modal Body */}
-        <div className="flex-1 overflow-y-auto p-6 space-y-5 max-h-[65vh] scrollbar-thin">
-          {/* TAB 1: BROWSER EXTENSION COMPANION */}
-          {activeTab === 'extension' && (
-            <div className="space-y-4">
-              <div className="rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-indigo-200">
-                    The Brain Browser Companion (Chrome / Edge / Brave)
-                  </h3>
-                  <span className="mono text-[11px] text-indigo-300">
-                    Active Brain: <strong className="text-white">"{currentBrain}"</strong>
-                  </span>
-                </div>
-                <p className="mt-1.5 text-xs text-white/70 leading-relaxed">
-                  The fastest zero-cost way to connect your memory. Once loaded into your browser, it adds 1-click <strong>"Inject Memory"</strong> and <strong>"Save Chat"</strong> buttons directly while you browse <code>chatgpt.com</code>, <code>claude.ai</code>, or <code>gemini.google.com</code>.
+        {/* Navigation Tabs */}
+        <div
+          role="tablist"
+          aria-label="MCP transport tabs"
+          className="flex items-center gap-1 border-b border-white/10 bg-black/30 px-4 sm:px-6 py-2 overflow-x-auto"
+        >
+          {[
+            { id: 'desktop_mcp' as BridgeTab, label: 'Desktop stdio MCP', icon: Terminal },
+            { id: 'http_api' as BridgeTab, label: 'Local HTTP API', icon: Globe },
+            { id: 'companion' as BridgeTab, label: 'Browser Companion', icon: Puzzle },
+            { id: 'web_primers' as BridgeTab, label: 'Web AI Primers', icon: Sparkles },
+            { id: 'simulator' as BridgeTab, label: 'Live Simulator', icon: FlaskConical },
+          ].map(({ id, label, icon: Icon }) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === id}
+              onClick={() => setActiveTab(id)}
+              className={`inline-flex items-center gap-1.5 mono whitespace-nowrap px-3 py-2 rounded-lg text-xs font-medium transition min-h-[36px] ${
+                activeTab === id
+                  ? 'bg-[#9db4ff] text-[#050712] font-semibold'
+                  : 'text-white/65 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <Icon className="h-3.5 w-3.5" />
+              <span>{label}</span>
+            </button>
+          ))}
+        </div>
+
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-5">
+          {diagError && (
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-xs text-amber-200 flex items-start gap-2.5">
+              <AlertTriangle className="h-4 w-4 text-amber-300 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <div className="font-semibold">Local Argon runtime check failed</div>
+                <p className="text-amber-100/80">{diagError}</p>
+                <p className="mono text-[11px] text-white/75">
+                  Start the supported Node/TypeScript runtime with: <code>npm run dev</code> (serves{' '}
+                  <code>http://127.0.0.1:3000</code>).
                 </p>
-              </div>
-
-              {/* Local Server Prober Status */}
-              <div className="flex items-center justify-between rounded-xl border border-white/10 bg-black/40 px-4 py-3 mono text-xs">
-                <div className="flex items-center gap-2">
-                  <span className="text-white/60">Local Memory API Status:</span>
-                  {serverOnline ? (
-                    <span className="text-emerald-400 font-medium">✓ Online (http://localhost:8787)</span>
-                  ) : serverOnline === false ? (
-                    <span className="text-amber-400 font-medium">
-                      Offline · Run <code>python -m brain.web</code> in terminal
-                    </span>
-                  ) : (
-                    <span className="text-white/40">Checking...</span>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setServerOnline(null);
-                    fetch('http://localhost:8787/api/brains', { signal: AbortSignal.timeout(1500) })
-                      .then((r) => setServerOnline(r.ok))
-                      .catch(() => setServerOnline(false));
-                  }}
-                  className="text-indigo-400 hover:text-indigo-300 transition"
-                >
-                  Re-check
-                </button>
-              </div>
-
-              {/* 3-Step Setup Guide */}
-              <div className="space-y-3">
-                <h4 className="mono text-xs uppercase tracking-wider text-white/50">
-                  3-Step Setup (Takes 30 Seconds)
-                </h4>
-
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3.5 space-y-1.5">
-                    <div className="mono text-[11px] font-semibold text-indigo-400">
-                      Step 1 · Open Extensions
-                    </div>
-                    <p className="text-xs text-white/70 leading-relaxed">
-                      In Chrome or Brave, navigate to:
-                      <code className="block mt-1 bg-black/50 p-1 rounded text-[11px] text-white/90">
-                        chrome://extensions
-                      </code>
-                      and toggle on <strong>Developer mode</strong> (top right).
-                    </p>
-                  </div>
-
-                  <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3.5 space-y-1.5">
-                    <div className="mono text-[11px] font-semibold text-indigo-400">
-                      Step 2 · Load Unpacked
-                    </div>
-                    <p className="text-xs text-white/70 leading-relaxed">
-                      Click the <strong>Load unpacked</strong> button and select the <code>extension/</code> folder located in this workspace.
-                    </p>
-                  </div>
-
-                  <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3.5 space-y-1.5">
-                    <div className="mono text-[11px] font-semibold text-indigo-400">
-                      Step 3 · Pin & Use
-                    </div>
-                    <p className="text-xs text-white/70 leading-relaxed">
-                      Pin the Brain icon to your toolbar. Open ChatGPT, Claude, or Gemini web and click <strong>Inject Memory</strong> or <strong>Save Chat</strong>!
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              {/* Quick Actions */}
-              <div className="rounded-xl border border-white/10 bg-black/30 p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="mono text-xs text-white/70">
-                    Quick Context Snapshot for "{currentBrain}"
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => handleCopy(contextSnapshot, 'snapshot')}
-                    className="mono px-3 py-1.5 rounded-lg bg-white/10 text-white text-xs hover:bg-white/20 transition"
-                  >
-                    {copiedKey === 'snapshot' ? 'Copied ✓' : 'Copy Snapshot'}
-                  </button>
-                </div>
-                <pre className="max-h-28 overflow-y-auto rounded-lg bg-black/60 p-2.5 font-mono text-[10.5px] text-white/70 leading-relaxed scrollbar-thin">
-                  {contextSnapshot}
-                </pre>
               </div>
             </div>
           )}
 
-          {/* TAB 2: CHATGPT WEB (FREE) */}
-          {activeTab === 'chatgpt' && (
+          {/* TAB 1: DESKTOP STDIO MCP */}
+          {activeTab === 'desktop_mcp' && (
             <div className="space-y-4">
-              <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-emerald-200">
-                    ChatGPT Web Free · Two-Way Memory Guide
-                  </h3>
-                  <span className="mono text-[10.5px] text-emerald-300 bg-emerald-500/20 px-2 py-0.5 rounded">
-                    100% Free · No Plus Required
-                  </span>
-                </div>
-                <p className="mt-1.5 text-xs text-white/70 leading-relaxed">
-                  On the free tier of ChatGPT, you can connect your Brain using <strong>Custom Instructions</strong> (permanent memory across all chats) or the <strong>Browser Extension</strong> (1-click prompt injection).
-                </p>
-              </div>
-
-              {/* Method 1: Permanent Custom Instructions */}
               <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <h4 className="text-xs font-semibold text-white">
-                      Method 1: Permanent Memory via ChatGPT Custom Instructions
-                    </h4>
-                    <p className="text-[11px] text-white/50">
-                      In chatgpt.com, click your Profile → Settings → Personalization → Custom Instructions.
+                    <h3 className="text-sm font-semibold text-white">
+                      Desktop stdio MCP Server (Node.js + node:sqlite)
+                    </h3>
+                    <p className="mt-0.5 text-xs text-white/60">
+                      Launched directly as a subprocess by desktop MCP clients (Claude Desktop, Cursor) over stdin/stdout JSON-RPC 2.0. Does not require Python or a separate web port.
                     </p>
                   </div>
                   <button
                     type="button"
-                    onClick={() => handleCopy(chatGptInstructions, 'chatgpt-instructions')}
-                    className="mono px-3 py-1.5 rounded-lg bg-emerald-500 text-black font-semibold text-xs hover:bg-emerald-400 transition shrink-0"
+                    data-testid="run-mcp-smoke-test-btn"
+                    onClick={handleRunSmokeTest}
+                    disabled={smokeRunning || !diagnostics}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-emerald-500 px-3.5 py-2 text-xs font-semibold text-[#04110b] hover:bg-emerald-400 transition disabled:opacity-40 min-h-[38px]"
                   >
-                    {copiedKey === 'chatgpt-instructions' ? 'Copied ✓' : 'Copy Instructions'}
+                    <Play className="h-3.5 w-3.5" />
+                    <span>{smokeRunning ? 'Running Smoke Test...' : 'Run Live MCP Smoke Test'}</span>
                   </button>
                 </div>
 
-                <div className="rounded-lg bg-black/60 p-3">
-                  <span className="mono text-[10px] text-white/40 block mb-1">
-                    Paste into: "What would you like ChatGPT to know about you to provide better responses?"
-                  </span>
-                  <pre className="max-h-36 overflow-y-auto font-mono text-[11px] text-white/80 leading-relaxed scrollbar-thin whitespace-pre-wrap">
-                    {chatGptInstructions}
-                  </pre>
-                </div>
-              </div>
-
-              {/* Method 2: Extension Flow */}
-              <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-2">
-                <h4 className="text-xs font-semibold text-white">
-                  Method 2: One-Click Extension Injection & Saving
-                </h4>
-                <p className="text-xs text-white/70 leading-relaxed">
-                  With the Chrome Extension loaded, you can open any chat on <code>chatgpt.com</code>, click the Brain icon, and:
-                </p>
-                <ul className="list-disc list-inside text-xs text-white/60 space-y-1">
-                  <li>Click <strong>Inject Brain Memory</strong> to pre-fill your prompt box with your facts.</li>
-                  <li>Click <strong>Save Current Web Chat</strong> to automatically record decisions back into SQLite!</li>
-                </ul>
-              </div>
-            </div>
-          )}
-
-          {/* TAB 3: CLAUDE WEB (FREE) */}
-          {activeTab === 'claude' && (
-            <div className="space-y-4">
-              <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-amber-200">
-                    Claude Web Free · Memory Priming & Capture
-                  </h3>
-                  <span className="mono text-[10.5px] text-amber-300 bg-amber-500/20 px-2 py-0.5 rounded">
-                    Free Claude.ai Chats
-                  </span>
-                </div>
-                <p className="mt-1.5 text-xs text-white/70 leading-relaxed">
-                  Claude has a massive context window. In free chats on <code>claude.ai</code>, paste this tailored primer at the start of your session, or use the extension to inject it automatically.
-                </p>
-              </div>
-
-              <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h4 className="text-xs font-semibold text-white">
-                      Claude Context Primer Block
-                    </h4>
-                    <p className="text-[11px] text-white/50">
-                      Paste at the beginning of any new conversation on claude.ai.
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => handleCopy(claudePrimer, 'claude-primer')}
-                    className="mono px-3 py-1.5 rounded-lg bg-amber-500 text-black font-semibold text-xs hover:bg-amber-400 transition shrink-0"
-                  >
-                    {copiedKey === 'claude-primer' ? 'Copied ✓' : 'Copy Claude Primer'}
-                  </button>
-                </div>
-
-                <pre className="max-h-44 overflow-y-auto rounded-lg bg-black/60 p-3 font-mono text-[11px] text-white/80 leading-relaxed scrollbar-thin whitespace-pre-wrap">
-                  {claudePrimer}
-                </pre>
-              </div>
-
-              <div className="rounded-xl border border-white/10 bg-black/30 p-3.5 text-xs text-white/60">
-                <strong className="text-white">How Claude saves facts back:</strong> Claude will highlight any finalized milestone with <code>🧠 DURABLE FACT: ...</code>. When done, click <strong>Save Current Web Chat</strong> in the extension to automatically merge it into your brain!
-              </div>
-            </div>
-          )}
-
-          {/* TAB 4: GEMINI WEB (FREE) */}
-          {activeTab === 'gemini' && (
-            <div className="space-y-4">
-              <div className="rounded-xl border border-sky-500/30 bg-sky-500/10 p-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-sky-200">
-                    Gemini Web Free · Grounding & Memory Sync
-                  </h3>
-                  <span className="mono text-[10.5px] text-sky-300 bg-sky-500/20 px-2 py-0.5 rounded">
-                    Free Gemini Chats
-                  </span>
-                </div>
-                <p className="mt-1.5 text-xs text-white/70 leading-relaxed">
-                  Connect your memory to Google Gemini on <code>gemini.google.com</code> using one-click prompt injection or pasting this tailored memory primer.
-                </p>
-              </div>
-
-              <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h4 className="text-xs font-semibold text-white">
-                      Gemini Grounding Primer
-                    </h4>
-                    <p className="text-[11px] text-white/50">
-                      Paste into Gemini web prompt box or custom system instructions.
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => handleCopy(geminiPrimer, 'gemini-primer')}
-                    className="mono px-3 py-1.5 rounded-lg bg-sky-500 text-black font-semibold text-xs hover:bg-sky-400 transition shrink-0"
-                  >
-                    {copiedKey === 'gemini-primer' ? 'Copied ✓' : 'Copy Gemini Primer'}
-                  </button>
-                </div>
-
-                <pre className="max-h-44 overflow-y-auto rounded-lg bg-black/60 p-3 font-mono text-[11px] text-white/80 leading-relaxed scrollbar-thin whitespace-pre-wrap">
-                  {geminiPrimer}
-                </pre>
-              </div>
-            </div>
-          )}
-
-          {/* TAB 5: LIVE MEMORY SIMULATOR */}
-          {activeTab === 'simulator' && (
-            <div className="space-y-4">
-              <div className="rounded-xl border border-purple-500/30 bg-purple-500/10 p-4">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-semibold text-purple-200">
-                    Live Web AI Memory Simulator
-                  </h3>
-                  <span className="mono text-[10.5px] text-purple-300 bg-purple-500/20 px-2 py-0.5 rounded">
-                    Test Two-Way Flow Right Now
-                  </span>
-                </div>
-                <p className="mt-1.5 text-xs text-white/70 leading-relaxed">
-                  Test how ChatGPT, Claude, and Gemini retrieve your durable facts and automatically save new ones to brain <strong>"{currentBrain}"</strong> before opening any external tabs.
-                </p>
-              </div>
-
-              {/* Persona Selector */}
-              <div className="flex items-center gap-2">
-                <span className="mono text-xs text-white/50">Simulate:</span>
-                <div className="flex rounded-lg border border-white/15 bg-black/40 p-0.5 mono text-xs">
-                  <button
-                    type="button"
-                    onClick={() => setSimModel('gpt')}
-                    className={`px-3 py-1 rounded transition ${
-                      simModel === 'gpt' ? 'bg-emerald-600 text-white font-medium' : 'text-white/60 hover:text-white'
-                    }`}
-                  >
-                    ChatGPT Web
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSimModel('claude')}
-                    className={`px-3 py-1 rounded transition ${
-                      simModel === 'claude' ? 'bg-amber-600 text-white font-medium' : 'text-white/60 hover:text-white'
-                    }`}
-                  >
-                    Claude Web
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setSimModel('gemini')}
-                    className={`px-3 py-1 rounded transition ${
-                      simModel === 'gemini' ? 'bg-sky-600 text-white font-medium' : 'text-white/60 hover:text-white'
-                    }`}
-                  >
-                    Gemini Web
-                  </button>
-                </div>
-              </div>
-
-              {/* Preset Test Buttons */}
-              <div className="space-y-1.5">
-                <span className="mono text-[10.5px] text-white/40 block">Try Preset Test Messages:</span>
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSimPrompt('What is our architecture for The Brain?');
-                      handleRunSimulation('What is our architecture for The Brain?');
-                    }}
-                    className="mono rounded-lg border border-white/15 bg-white/5 px-2.5 py-1 text-xs text-white/80 hover:text-white hover:bg-white/10 transition"
-                  >
-                    1. Test Recall ("What is our architecture...")
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const testSave = 'Remember that we switched to SQLite FTS5 for zero-latency semantic recall';
-                      setSimPrompt(testSave);
-                      handleRunSimulation(testSave);
-                    }}
-                    className="mono rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs text-emerald-300 hover:bg-emerald-500/20 transition"
-                  >
-                    2. Test Auto-Save ("Remember that we switched to SQLite...")
-                  </button>
-                </div>
-              </div>
-
-              {/* Input Form */}
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={simPrompt}
-                  onChange={(e) => setSimPrompt(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleRunSimulation()}
-                  placeholder="Type a message or fact to test..."
-                  className="mono flex-1 rounded-xl border border-white/20 bg-black/50 px-3.5 py-2 text-xs text-white outline-none"
-                />
-                <button
-                  type="button"
-                  disabled={isSimulating || !simPrompt.trim()}
-                  onClick={() => handleRunSimulation()}
-                  className="mono rounded-xl bg-purple-600 px-4 py-2 text-xs font-semibold text-white hover:bg-purple-500 transition disabled:opacity-40"
-                >
-                  {isSimulating ? 'Processing...' : 'Send Test'}
-                </button>
-              </div>
-
-              {/* Simulation Result Output */}
-              {simLog && (
-                <div className="rounded-xl border border-white/10 bg-black/60 p-4 space-y-3">
-                  <div className="flex items-center justify-between pb-2 border-b border-white/10 mono text-xs text-white/60">
-                    <span>
-                      Interaction Log · Simulated {simLog.model.toUpperCase()}
-                    </span>
-                    <span className="text-emerald-400">
-                      {simLog.savedFact ? '✓ Memory Auto-Saved' : `✓ ${simLog.recalled.length} Fact(s) Recalled`}
-                    </span>
-                  </div>
-
-                  {/* Recalled Facts Pill */}
-                  {simLog.recalled.length > 0 && (
-                    <div className="space-y-1">
-                      <span className="mono text-[10px] text-white/40 uppercase">Facts Recalled from SQLite:</span>
-                      <div className="space-y-1">
-                        {simLog.recalled.slice(0, 2).map((rf) => (
-                          <div key={rf.id} className="mono text-[11px] text-white/70 bg-white/5 p-2 rounded border border-white/5">
-                            [#{rf.id} | {rf.source.toUpperCase()}] {rf.content.slice(0, 140)}...
-                          </div>
-                        ))}
+                {/* Live Runtime Verification Grid */}
+                {diagnostics && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5 pt-1 text-xs">
+                    <div className="rounded-lg border border-white/10 bg-black/40 p-3 space-y-1">
+                      <div className="mono text-[10px] uppercase tracking-wider text-white/45">
+                        Verified Node & Script Runtime
+                      </div>
+                      <div className="mono text-[11px] text-white/85 break-all">
+                        Node {diagnostics.runtime.nodeVersion} ·{' '}
+                        {diagnostics.runtime.tsxAvailable ? 'tsx present' : 'tsx missing'}
+                      </div>
+                      <div className="mono text-[10.5px] text-white/55 break-all">
+                        Entry: {diagnostics.runtime.mcpScriptPath}
                       </div>
                     </div>
+                    <div className="rounded-lg border border-white/10 bg-black/40 p-3 space-y-1">
+                      <div className="mono text-[10px] uppercase tracking-wider text-white/45">
+                        Target SQLite Database & Protocol
+                      </div>
+                      <div className="mono text-[11px] text-emerald-300">
+                        MCP Protocol {diagnostics.protocolVersion} · stdio JSON-RPC 2.0
+                      </div>
+                      <div className="mono text-[10.5px] text-white/55 break-all">
+                        DB: {diagnostics.runtime.dbPath}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* Smoke Test Output */}
+                {smokeResult && (
+                  <div
+                    data-testid="mcp-smoke-test-result"
+                    className={`rounded-xl border p-3.5 space-y-2.5 text-xs ${
+                      smokeResult.ok
+                        ? 'border-emerald-500/30 bg-emerald-500/10'
+                        : 'border-rose-500/30 bg-rose-500/10'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 font-semibold text-white">
+                        {smokeResult.ok ? (
+                          <CheckCircle2 className="h-4 w-4 text-emerald-400" />
+                        ) : (
+                          <AlertTriangle className="h-4 w-4 text-rose-400" />
+                        )}
+                        <span>
+                          {smokeResult.ok
+                            ? `MCP Smoke Test Passed (${smokeResult.durationMs}ms)`
+                            : 'MCP Smoke Test Failed'}
+                        </span>
+                      </div>
+                      <span className="mono text-[10px] text-white/60">
+                        Brain: {currentBrain}
+                      </span>
+                    </div>
+                    {smokeResult.error && (
+                      <p className="text-rose-200">{smokeResult.error}</p>
+                    )}
+                    <div className="space-y-1">
+                      {smokeResult.steps.map((st, idx) => (
+                        <div
+                          key={idx}
+                          className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-black/40 px-2.5 py-1.5 mono text-[11px]"
+                        >
+                          <span className={st.ok ? 'text-emerald-300' : 'text-rose-300'}>
+                            {st.ok ? 'PASS' : 'FAIL'} · {st.step}
+                          </span>
+                          <span className="text-white/75">{st.detail}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Tested Client Configs */}
+              {diagnostics && (
+                <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedClient('claudeDesktop')}
+                        className={`mono px-3 py-1.5 rounded-lg text-xs transition ${
+                          selectedClient === 'claudeDesktop'
+                            ? 'bg-white text-black font-semibold'
+                            : 'bg-white/5 text-white/70 hover:text-white'
+                        }`}
+                      >
+                        Claude Desktop
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedClient('cursor')}
+                        className={`mono px-3 py-1.5 rounded-lg text-xs transition ${
+                          selectedClient === 'cursor'
+                            ? 'bg-white text-black font-semibold'
+                            : 'bg-white/5 text-white/70 hover:text-white'
+                        }`}
+                      >
+                        Cursor
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(activeClientConfigJson, `client-${selectedClient}`)}
+                      className="inline-flex items-center gap-1.5 mono px-3 py-1.5 rounded-lg bg-white/10 text-white text-xs hover:bg-white/20 transition"
+                    >
+                      {copiedKey === `client-${selectedClient}` ? (
+                        <Check className="h-3.5 w-3.5 text-emerald-400" />
+                      ) : (
+                        <Copy className="h-3.5 w-3.5" />
+                      )}
+                      <span>
+                        {copiedKey === `client-${selectedClient}` ? 'Copied' : 'Copy JSON Config'}
+                      </span>
+                    </button>
+                  </div>
+
+                  {activeClientConfig && (
+                    <p className="mono text-[11px] text-white/55">
+                      Config file: {activeClientConfig.configPathHint}
+                    </p>
                   )}
 
-                  {/* Saved Fact Notification */}
-                  {simLog.savedFact && (
-                    <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/15 p-2.5 mono text-xs text-emerald-300">
-                      <strong>✓ Stored New Fact #{simLog.savedFact.id}</strong> into brain "{currentBrain}"!
-                    </div>
-                  )}
+                  <pre
+                    data-testid="mcp-client-config-json"
+                    className="max-h-56 overflow-auto rounded-lg bg-black/65 p-3 font-mono text-[11px] text-emerald-200/90 leading-relaxed"
+                  >
+                    {activeClientConfigJson}
+                  </pre>
 
-                  {/* AI Reply */}
-                  <div className="space-y-1">
-                    <span className="mono text-[10px] text-white/40 uppercase">Simulated AI Response:</span>
-                    <div className="whitespace-pre-wrap rounded-lg bg-white/[0.03] p-3 text-xs text-white/90 leading-relaxed border border-white/10">
-                      {simLog.reply}
-                    </div>
+                  <p className="text-[11px] text-white/55">
+                    You can also launch the stdio server manually to inspect stderr logs via{' '}
+                    <code className="mono text-white/85">npm run mcp:server</code>.
+                  </p>
+                </div>
+              )}
+
+              {/* Exposed MCP Tools & Read/Write Permissions */}
+              {diagnostics?.tools && (
+                <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-2.5">
+                  <h4 className="mono text-[11px] uppercase tracking-wider text-white/55">
+                    Exposed MCP Tools (Read vs Write Permissions Separated)
+                  </h4>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    {diagnostics.tools.map((tool) => (
+                      <div
+                        key={tool.name}
+                        className="rounded-lg border border-white/10 bg-black/40 p-2.5 space-y-1"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <code className="mono text-xs font-semibold text-white">{tool.name}</code>
+                          <span
+                            className={`mono text-[10px] px-1.5 py-0.5 rounded border ${
+                              tool.permission === 'write'
+                                ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                                : 'border-sky-500/30 bg-sky-500/10 text-sky-300'
+                            }`}
+                          >
+                            {tool.permission.toUpperCase()}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-white/60 leading-relaxed">
+                          {tool.description}
+                        </p>
+                      </div>
+                    ))}
                   </div>
                 </div>
               )}
             </div>
           )}
 
-          {/* TAB 6: ADVANCED / PLUS & DESKTOP MCP */}
-          {activeTab === 'advanced' && (
+          {/* TAB 2: LOCAL HTTP API */}
+          {activeTab === 'http_api' && (
             <div className="space-y-4">
               <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-semibold text-white">
+                      Local HTTP REST & JSON-RPC API
+                    </h3>
+                    <p className="mt-0.5 text-xs text-white/60">
+                      Bound strictly to <code>127.0.0.1:3000</code> (or active origin <code>{localBaseUrl}</code>) for local automation, scripts, and HTTP MCP clients.
+                    </p>
+                  </div>
+                  <span className="mono text-[11px] text-emerald-300">
+                    {diagnostics ? 'HTTP 200 Verified' : 'Unavailable'}
+                  </span>
+                </div>
+
+                {diagnostics && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] mono">
+                    {Object.entries(diagnostics.transports.localHttpApi.endpoints).map(
+                      ([key, url]) => (
+                        <div
+                          key={key}
+                          className="rounded-lg border border-white/10 bg-black/40 px-3 py-2 flex items-center justify-between gap-2"
+                        >
+                          <span className="text-white/50">{key}</span>
+                          <span className="text-white/90 truncate">{url}</span>
+                        </div>
+                      )
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <h4 className="text-xs font-semibold text-white">
+                    Test Local HTTP JSON-RPC (`POST /api/mcp`)
+                  </h4>
+                  <button
+                    type="button"
+                    onClick={() => handleCopy(curlMcpExample, 'curl-mcp')}
+                    className="mono px-3 py-1.5 rounded-lg bg-white/10 text-white text-xs hover:bg-white/20 transition"
+                  >
+                    {copiedKey === 'curl-mcp' ? 'Copied' : 'Copy curl'}
+                  </button>
+                </div>
+                <pre className="overflow-x-auto rounded-lg bg-black/65 p-3 font-mono text-[11px] text-white/80 leading-relaxed">
+                  {curlMcpExample}
+                </pre>
+              </div>
+
+              <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
                   <div>
                     <h4 className="text-xs font-semibold text-white">
-                      ChatGPT Plus Custom Action (OpenAPI Spec)
+                      OpenAPI 3.1.0 Specification
                     </h4>
-                    <p className="text-[11px] text-white/50">
-                      If you ever upgrade to ChatGPT Plus, you can paste this into "Create new action" in Custom GPTs.
+                    <p className="text-[11px] text-white/55">
+                      Uses active origin <code>{localBaseUrl}</code> for `/api/recall` and `/api/remember`.
                     </p>
                   </div>
                   <button
@@ -615,50 +679,220 @@ export const McpBridgeModal: React.FC<McpBridgeModalProps> = ({
                     onClick={() => handleCopy(openApiSpec, 'openapi')}
                     className="mono px-3 py-1.5 rounded-lg bg-white/10 text-white text-xs hover:bg-white/20 transition shrink-0"
                   >
-                    {copiedKey === 'openapi' ? 'Copied ✓' : 'Copy OpenAPI Spec'}
+                    {copiedKey === 'openapi' ? 'Copied' : 'Copy OpenAPI'}
                   </button>
                 </div>
-                <pre className="max-h-36 overflow-y-auto rounded-lg bg-black/60 p-3 font-mono text-[10.5px] text-white/70 leading-relaxed scrollbar-thin">
+                <pre className="max-h-44 overflow-auto rounded-lg bg-black/65 p-3 font-mono text-[10.5px] text-white/75 leading-relaxed">
                   {openApiSpec}
                 </pre>
               </div>
+            </div>
+          )}
+
+          {/* TAB 3: BROWSER COMPANION */}
+          {activeTab === 'companion' && (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-indigo-500/25 bg-indigo-500/10 p-4 space-y-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold text-indigo-100">
+                    Browser Companion Extension (Separate from Desktop MCP)
+                  </h3>
+                  <span className="mono text-[11px] text-indigo-200">
+                    {diagnostics?.transports.browserCompanion.activeDevices ?? 0} paired device(s)
+                  </span>
+                </div>
+                <p className="text-xs text-white/75 leading-relaxed">
+                  The unpacked Chrome/Edge/Brave extension communicates with{' '}
+                  <code>{localBaseUrl}/api/companion/capture</code> using a SHA-256-hashed Bearer device token. It does not spawn a desktop stdio MCP process.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3.5 space-y-1.5">
+                  <div className="mono text-[11px] font-semibold text-[#9db4ff]">
+                    Step 1 · Open Extensions
+                  </div>
+                  <p className="text-xs text-white/70 leading-relaxed">
+                    Open <code className="bg-black/50 px-1 py-0.5 rounded">chrome://extensions</code> and enable <strong>Developer mode</strong>.
+                  </p>
+                </div>
+                <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3.5 space-y-1.5">
+                  <div className="mono text-[11px] font-semibold text-[#9db4ff]">
+                    Step 2 · Load Unpacked
+                  </div>
+                  <p className="text-xs text-white/70 leading-relaxed">
+                    Select the <code>extension/</code> directory in this Argon workspace (configured for <code>127.0.0.1:3000</code> and <code>localhost:3000</code>).
+                  </p>
+                </div>
+                <div className="rounded-xl border border-white/10 bg-white/[0.02] p-3.5 space-y-1.5">
+                  <div className="mono text-[11px] font-semibold text-[#9db4ff]">
+                    Step 3 · Pair Device Token
+                  </div>
+                  <p className="text-xs text-white/70 leading-relaxed">
+                    Generate a one-time <code>brn_live_*</code> token in the AI Sync Studio or Settings to authenticate captures into the Review Queue.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 4: WEB AI PRIMERS (FREE FALLBACK) */}
+          {activeTab === 'web_primers' && (
+            <div className="space-y-4">
+              <div className="flex flex-wrap items-center gap-2">
+                {(['chatgpt', 'claude', 'gemini'] as const).map((provider) => (
+                  <button
+                    key={provider}
+                    type="button"
+                    onClick={() => setSelectedPrimer(provider)}
+                    className={`mono px-3 py-1.5 rounded-lg text-xs transition ${
+                      selectedPrimer === provider
+                        ? 'bg-white text-black font-semibold'
+                        : 'bg-white/5 text-white/65 hover:text-white'
+                    }`}
+                  >
+                    {provider === 'chatgpt'
+                      ? 'ChatGPT Web'
+                      : provider === 'claude'
+                        ? 'Claude Web'
+                        : 'Gemini Web'}
+                  </button>
+                ))}
+              </div>
 
               <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-3">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <div>
                     <h4 className="text-xs font-semibold text-white">
-                      Desktop MCP Config (Claude Desktop / Cursor)
+                      Manual Context Primer for "{currentBrain}"
                     </h4>
-                    <p className="text-[11px] text-white/50">
-                      For desktop apps using stdio terminal processes.
+                    <p className="text-[11px] text-white/55">
+                      Fallback when using web chat interfaces without Desktop MCP. Copy and paste into your session.
                     </p>
                   </div>
                   <button
                     type="button"
-                    onClick={() => handleCopy(desktopMcpJson, 'desktop-mcp')}
-                    className="mono px-3 py-1.5 rounded-lg bg-white/10 text-white text-xs hover:bg-white/20 transition shrink-0"
+                    onClick={() =>
+                      handleCopy(
+                        selectedPrimer === 'chatgpt'
+                          ? chatGptInstructions
+                          : selectedPrimer === 'claude'
+                            ? claudePrimer
+                            : geminiPrimer,
+                        `primer-${selectedPrimer}`
+                      )
+                    }
+                    className="mono px-3 py-1.5 rounded-lg bg-[#9db4ff] text-[#050712] font-semibold text-xs hover:bg-white transition"
                   >
-                    {copiedKey === 'desktop-mcp' ? 'Copied ✓' : 'Copy Config'}
+                    {copiedKey === `primer-${selectedPrimer}` ? 'Copied' : 'Copy Primer'}
                   </button>
                 </div>
-                <pre className="max-h-28 overflow-y-auto rounded-lg bg-black/60 p-3 font-mono text-[10.5px] text-white/70 leading-relaxed scrollbar-thin">
-                  {desktopMcpJson}
+                <pre className="max-h-56 overflow-auto rounded-lg bg-black/65 p-3 font-mono text-[11px] text-white/80 leading-relaxed whitespace-pre-wrap">
+                  {selectedPrimer === 'chatgpt'
+                    ? chatGptInstructions
+                    : selectedPrimer === 'claude'
+                      ? claudePrimer
+                      : geminiPrimer}
                 </pre>
+              </div>
+
+              <div className="rounded-xl border border-white/10 bg-black/30 p-4 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="mono text-xs text-white/75">
+                    Concise Context Snapshot ("{currentBrain}")
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => handleCopy(contextSnapshot, 'snapshot')}
+                    className="mono px-3 py-1.5 rounded-lg bg-white/10 text-white text-xs hover:bg-white/20 transition"
+                  >
+                    {copiedKey === 'snapshot' ? 'Copied' : 'Copy Snapshot'}
+                  </button>
+                </div>
+                <pre className="max-h-36 overflow-auto rounded-lg bg-black/60 p-2.5 font-mono text-[10.5px] text-white/70 leading-relaxed whitespace-pre-wrap">
+                  {contextSnapshot}
+                </pre>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 5: LIVE SIMULATOR */}
+          {activeTab === 'simulator' && (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-white/10 bg-white/[0.02] p-4 space-y-3">
+                <h3 className="text-sm font-semibold text-white">
+                  Local Recall & Save-Back Simulator
+                </h3>
+                <p className="text-xs text-white/65">
+                  Exercises local recall against Brain <strong>"{currentBrain}"</strong> without calling external APIs.
+                </p>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="mono text-xs text-white/50">Provider Persona:</span>
+                  {(['gpt', 'claude', 'gemini'] as AISource[]).map((src) => (
+                    <button
+                      key={src}
+                      type="button"
+                      onClick={() => setSimModel(src)}
+                      className={`mono px-3 py-1.5 rounded-lg text-xs transition ${
+                        simModel === src
+                          ? 'bg-white text-black font-semibold'
+                          : 'bg-white/5 text-white/65 hover:text-white'
+                      }`}
+                    >
+                      {src.toUpperCase()}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                  <input
+                    type="text"
+                    value={simPrompt}
+                    onChange={(e) => setSimPrompt(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleRunSimulation()}
+                    placeholder="Type a recall query or durable fact..."
+                    className="mono flex-1 rounded-xl border border-white/20 bg-black/50 px-3.5 py-2.5 text-xs text-white"
+                  />
+                  <button
+                    type="button"
+                    disabled={isSimulating || !simPrompt.trim()}
+                    onClick={() => handleRunSimulation()}
+                    className="mono rounded-xl bg-[#9db4ff] px-4 py-2.5 text-xs font-semibold text-[#050712] hover:bg-white transition disabled:opacity-40 min-h-[40px]"
+                  >
+                    {isSimulating ? 'Running...' : 'Run Local Test'}
+                  </button>
+                </div>
+
+                {simLog && (
+                  <div className="rounded-xl border border-white/10 bg-black/60 p-4 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-white/10 mono text-xs text-white/60">
+                      <span>Simulated {simLog.model.toUpperCase()}</span>
+                      <span className="text-emerald-400">
+                        {simLog.savedFact
+                          ? 'Saved New Memory'
+                          : `${simLog.recalled.length} Fact(s) Recalled`}
+                      </span>
+                    </div>
+                    <div className="whitespace-pre-wrap rounded-lg bg-white/[0.03] p-3 text-xs text-white/90 leading-relaxed border border-white/10">
+                      {simLog.reply}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
           )}
         </div>
 
-        {/* Modal Footer */}
-        <div className="flex items-center justify-between border-t border-white/10 bg-black/40 px-6 py-3.5">
-          <div className="mono text-xs text-white/50 flex items-center gap-1.5">
-            <span>Targeting Brain:</span>
-            <strong className="text-white">"{currentBrain}"</strong>
+        {/* Footer */}
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/10 bg-black/40 px-4 sm:px-6 py-3.5 safe-bottom">
+          <div className="mono text-xs text-white/55">
+            Target Brain: <strong className="text-white">"{currentBrain}"</strong>
           </div>
           <button
             type="button"
             onClick={onClose}
-            className="mono rounded-xl bg-white px-5 py-2 text-xs font-semibold text-black transition hover:bg-white/90 shadow-md"
+            className="mono rounded-xl bg-white px-5 py-2 text-xs font-semibold text-black transition hover:bg-white/90 min-h-[38px]"
           >
             Done
           </button>

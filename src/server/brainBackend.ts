@@ -10,6 +10,28 @@ import {
   sanitizeArgonSettings,
   BackupScheduleFrequency,
 } from '../types/brain';
+import {
+  hardenDatabaseFilePermissions,
+  inspectLocalSecurityPosture,
+} from './securityPosture.js';
+import {
+  collectMcpDiagnostics,
+  handleMcpJsonRpcRequest,
+  runMcpLiveSmokeTest,
+} from './mcpProtocol.js';
+import {
+  buildBrainpackZip,
+  buildPortablePackage,
+  diffPortablePackageAgainstExisting,
+  parseBrainpackZip,
+  parsePortableMarkdown,
+  parsePortablePackageJson,
+  PortableConflictPolicy,
+  PortableExportFilter,
+  serializePortableMarkdown,
+  sha256Hex,
+  verifyPortablePackage,
+} from '../services/portableFormat.js';
 
 export const ALLOWED_AI_SOURCES = [
   'claude',
@@ -804,6 +826,9 @@ export function createConsistentBackup(
     if (typeof options.maxBackups === 'number' && options.maxBackups >= 1) {
       applyBackupRetention(targetDir, options.maxBackups);
     }
+
+    // Enforce strict owner-only permissions (0600) on newly promoted snapshot & metadata
+    hardenDatabaseFilePermissions(dbPath, targetDir);
 
     return metadata;
   } finally {
@@ -2251,6 +2276,10 @@ export function initializeDatabase(
        VALUES ('db_initialized', '1', ?)
        ON CONFLICT(key) DO UPDATE SET updated_at = excluded.updated_at`
     ).run(now);
+
+    if (dbPath !== ':memory:') {
+      hardenDatabaseFilePermissions(dbPath, resolvedBackupDir);
+    }
 
     return {
       db,
@@ -5960,6 +5989,640 @@ INSTRUCTIONS FOR TWO-WAY SYNC:
       });
     } catch {
       res.status(500).json({ error: 'Chat processing failed' });
+    }
+  });
+
+  // =========================================================================
+  // 12. MCP Bridge JSON-RPC 2.0, Live Diagnostics & Smoke Test (Section 2.1)
+  // =========================================================================
+  app.post('/api/mcp', (req: Request, res: Response) => {
+    try {
+      const payload = req.body;
+      if (!payload || typeof payload !== 'object') {
+        return res.status(400).json({
+          jsonrpc: '2.0',
+          id: null,
+          error: { code: -32600, message: 'Invalid JSON-RPC request body.' },
+        });
+      }
+
+      if (Array.isArray(payload)) {
+        const responses = payload
+          .map((item) =>
+            handleMcpJsonRpcRequest(db, item, {
+              defaultBrain: process.env.BRAIN_DEFAULT || 'coding',
+              transport: 'http',
+            })
+          )
+          .filter((r) => r !== null);
+        return res.json(responses);
+      }
+
+      const response = handleMcpJsonRpcRequest(db, payload, {
+        defaultBrain: process.env.BRAIN_DEFAULT || 'coding',
+        transport: 'http',
+      });
+      if (response === null) {
+        return res.status(204).end();
+      }
+      return res.json(response);
+    } catch (err: any) {
+      return res.status(500).json({
+        jsonrpc: '2.0',
+        id: req.body?.id ?? null,
+        error: { code: -32603, message: err?.message || 'MCP request failed' },
+      });
+    }
+  });
+
+  app.get('/api/mcp/diagnostics', (req: Request, res: Response) => {
+    try {
+      const hostHeader = req.get('host') || '127.0.0.1:3000';
+      const protocol = req.protocol || 'http';
+      const origin = `${protocol}://${hostHeader}`;
+      const requestedBrain =
+        typeof req.query.brain === 'string' && req.query.brain.trim()
+          ? req.query.brain.trim()
+          : process.env.BRAIN_DEFAULT || 'coding';
+      const diagnostics = collectMcpDiagnostics({
+        db,
+        dbPath: resolvedDbPath,
+        origin,
+        defaultBrain: requestedBrain,
+      });
+      return res.json(diagnostics);
+    } catch (err: any) {
+      return res.status(500).json({
+        error: err?.message || 'Failed to collect MCP diagnostics',
+      });
+    }
+  });
+
+  app.post('/api/mcp/smoke-test', (req: Request, res: Response) => {
+    try {
+      const brain =
+        typeof req.body?.brain === 'string' && req.body.brain.trim()
+          ? req.body.brain.trim()
+          : process.env.BRAIN_DEFAULT || 'coding';
+      const result = runMcpLiveSmokeTest(db, brain);
+      return res.json(result);
+    } catch (err: any) {
+      return res.status(500).json({
+        ok: false,
+        error: err?.message || 'MCP smoke test failed',
+      });
+    }
+  });
+
+  // =========================================================================
+  // 13. Local Security & Privacy Posture (Section 2.2)
+  // =========================================================================
+  app.get('/api/security/posture', (_req: Request, res: Response) => {
+    try {
+      let maxBackups = 10;
+      try {
+        const metaRow = db
+          .prepare(`SELECT value FROM app_metadata WHERE key = 'backup_max_count'`)
+          .get() as { value?: string } | undefined;
+        if (metaRow?.value) {
+          const parsed = Number(metaRow.value);
+          if (Number.isInteger(parsed) && parsed >= 1) maxBackups = parsed;
+        }
+      } catch {
+        // default 10
+      }
+
+      const report = inspectLocalSecurityPosture({
+        db,
+        dbPath: resolvedDbPath,
+        backupDir: resolvedBackupDir,
+        bindHost: resolveBindHost(),
+        maxBackups,
+      });
+      return res.json(report);
+    } catch (err: any) {
+      return res.status(500).json({
+        error: err?.message || 'Failed to inspect local security posture',
+      });
+    }
+  });
+
+  app.post('/api/security/harden-permissions', (_req: Request, res: Response) => {
+    try {
+      const result = hardenDatabaseFilePermissions(resolvedDbPath, resolvedBackupDir);
+      try {
+        recordSystemAuditLog(db, {
+          category: 'security_harden_permissions',
+          summary: `Enforced owner-only POSIX permissions (0600/0700) on ${result.updatedFiles.length} path(s)`,
+          status: result.errors.length === 0 ? 'success' : 'warning',
+          details: result,
+        });
+      } catch {
+        // non-fatal
+      }
+      const posture = inspectLocalSecurityPosture({
+        db,
+        dbPath: resolvedDbPath,
+        backupDir: resolvedBackupDir,
+        bindHost: resolveBindHost(),
+      });
+      return res.json({ ok: result.errors.length === 0, result, posture });
+    } catch (err: any) {
+      return res.status(500).json({
+        ok: false,
+        error: err?.message || 'Failed to harden file permissions',
+      });
+    }
+  });
+
+  // =========================================================================
+  // 14. Portable Brain Format Family (.brain.json, .brain.md, .brainpack.zip)
+  // =========================================================================
+  app.get('/api/portable/export', async (req: Request, res: Response) => {
+    try {
+      const formatParam = String(req.query.format || 'json').toLowerCase();
+      const brainParam =
+        typeof req.query.brain === 'string' && req.query.brain.trim()
+          ? req.query.brain.trim()
+          : 'all';
+      const sourceParam =
+        typeof req.query.source === 'string' && req.query.source.trim()
+          ? req.query.source.trim()
+          : 'all';
+      const dateFrom =
+        typeof req.query.dateFrom === 'string' && req.query.dateFrom.trim()
+          ? req.query.dateFrom.trim()
+          : undefined;
+      const dateTo =
+        typeof req.query.dateTo === 'string' && req.query.dateTo.trim()
+          ? req.query.dateTo.trim()
+          : undefined;
+      const excludeSecrets = req.query.excludeSecrets !== 'false';
+      const includePrivate = req.query.includePrivate === 'true';
+      const includeAttachments = req.query.includeAttachments === 'true';
+
+      const rows = db.prepare('SELECT * FROM facts ORDER BY id ASC').all();
+      const serialized = rows.map(serializeFactRow).filter(Boolean) as Array<Record<string, any>>;
+
+      const filter: PortableExportFilter = {
+        brain: brainParam,
+        source: sourceParam,
+        dateFrom,
+        dateTo,
+        excludeSecrets,
+        includePrivate,
+        includeAttachments,
+      };
+      const pkg = buildPortablePackage(serialized, filter);
+      const stamp = new Date().toISOString().slice(0, 10);
+      const scopeSlug = brainParam === 'all' ? 'all-brains' : brainParam.replace(/[^a-z0-9_-]/gi, '_');
+
+      try {
+        recordSystemAuditLog(db, {
+          category: 'portable_export',
+          brain: brainParam === 'all' ? undefined : brainParam,
+          summary: `Exported portable ${formatParam} package (${pkg.facts.length} facts)`,
+          status: 'success',
+          details: {
+            format: formatParam,
+            factCount: pkg.facts.length,
+            secretsExcluded: excludeSecrets,
+            includeAttachments,
+            payloadChecksum: pkg.payloadChecksum,
+          },
+        });
+      } catch {
+        // non-fatal
+      }
+
+      if (formatParam === 'md' || formatParam === 'markdown') {
+        const mdText = serializePortableMarkdown(pkg);
+        res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="the-brain-${scopeSlug}-${stamp}.brain.md"`
+        );
+        return res.send(mdText);
+      }
+
+      if (formatParam === 'zip' || formatParam === 'brainpack') {
+        const { buffer } = await buildBrainpackZip(pkg);
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader(
+          'Content-Disposition',
+          `attachment; filename="the-brain-${scopeSlug}-${stamp}.brainpack.zip"`
+        );
+        return res.send(Buffer.from(buffer));
+      }
+
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="the-brain-${scopeSlug}-${stamp}.brain.json"`
+      );
+      return res.send(JSON.stringify(pkg, null, 2));
+    } catch (err: any) {
+      return res.status(500).json({
+        error: err?.message || 'Portable export failed',
+      });
+    }
+  });
+
+  async function decodePortablePayload(body: any): Promise<{
+    detectedFormat: 'brain_json' | 'brain_md' | 'brainpack_zip' | 'unknown';
+    verification: ReturnType<typeof verifyPortablePackage>;
+  }> {
+    const requestedFormat = String(body?.format || '').toLowerCase();
+    const fileName = String(body?.fileName || '').toLowerCase();
+
+    if (
+      requestedFormat === 'zip' ||
+      requestedFormat === 'brainpack' ||
+      fileName.endsWith('.brainpack.zip') ||
+      fileName.endsWith('.zip')
+    ) {
+      const b64 = typeof body?.base64 === 'string' ? body.base64 : '';
+      if (!b64) {
+        return {
+          detectedFormat: 'brainpack_zip',
+          verification: { valid: false, error: 'Missing base64 payload for .brainpack.zip archive.' },
+        };
+      }
+      const bytes = Buffer.from(b64, 'base64');
+      const verification = await parseBrainpackZip(new Uint8Array(bytes));
+      return { detectedFormat: 'brainpack_zip', verification };
+    }
+
+    if (
+      requestedFormat === 'md' ||
+      requestedFormat === 'markdown' ||
+      fileName.endsWith('.brain.md') ||
+      fileName.endsWith('.md')
+    ) {
+      const text = typeof body?.content === 'string' ? body.content : '';
+      const verification = parsePortableMarkdown(text);
+      return { detectedFormat: 'brain_md', verification };
+    }
+
+    if (body?.packageData && typeof body.packageData === 'object') {
+      return {
+        detectedFormat: 'brain_json',
+        verification: verifyPortablePackage(body.packageData),
+      };
+    }
+
+    if (typeof body?.content === 'string') {
+      const trimmed = body.content.trim();
+      if (trimmed.startsWith('---')) {
+        return { detectedFormat: 'brain_md', verification: parsePortableMarkdown(trimmed) };
+      }
+      return { detectedFormat: 'brain_json', verification: parsePortablePackageJson(trimmed) };
+    }
+
+    if (body && body.format === 'the-brain-portable-package') {
+      return { detectedFormat: 'brain_json', verification: verifyPortablePackage(body) };
+    }
+
+    return {
+      detectedFormat: 'unknown',
+      verification: {
+        valid: false,
+        error: 'Unsupported or empty portable package payload. Provide .brain.json, .brain.md, or .brainpack.zip.',
+      },
+    };
+  }
+
+  app.post('/api/portable/inspect', async (req: Request, res: Response) => {
+    try {
+      const { detectedFormat, verification } = await decodePortablePayload(req.body);
+      if (!verification.valid || !verification.packageData) {
+        return res.status(400).json({
+          valid: false,
+          format: detectedFormat,
+          schemaVersion: verification.schemaVersion ?? null,
+          checksumValid: false,
+          error: verification.error || 'Portable package verification failed.',
+        });
+      }
+
+      const pkg = verification.packageData;
+      const existingRows = db.prepare('SELECT * FROM facts').all();
+      const existingFacts = existingRows.map(serializeFactRow).filter(Boolean) as any[];
+      const diff = diffPortablePackageAgainstExisting(pkg, existingFacts);
+
+      return res.json({
+        valid: true,
+        format: detectedFormat,
+        schemaVersion: pkg.schemaVersion,
+        checksumValid: true,
+        exportedAt: pkg.exportedAt,
+        sourceInstance: pkg.sourceInstance,
+        secretsExcluded: pkg.manifest?.secretsExcluded ?? true,
+        brains: pkg.brains.map((b) => b.slug),
+        summary: diff.summary,
+        items: diff.items.slice(0, 200),
+      });
+    } catch (err: any) {
+      return res.status(500).json({
+        valid: false,
+        error: err?.message || 'Failed to inspect portable package',
+      });
+    }
+  });
+
+  app.post('/api/portable/import', async (req: Request, res: Response) => {
+    try {
+      const conflictPolicyRaw = String(req.body?.conflictPolicy || 'skip').toLowerCase();
+      const conflictPolicy: PortableConflictPolicy =
+        conflictPolicyRaw === 'merge' || conflictPolicyRaw === 'replace'
+          ? conflictPolicyRaw
+          : 'skip';
+      const targetBrainOverride =
+        typeof req.body?.targetBrainOverride === 'string' && req.body.targetBrainOverride.trim()
+          ? req.body.targetBrainOverride.trim()
+          : null;
+
+      if (targetBrainOverride) {
+        const brainCheck = validateBrainName(targetBrainOverride);
+        if (!brainCheck.valid) {
+          return res.status(400).json({ error: brainCheck.error });
+        }
+      }
+
+      const { detectedFormat, verification } = await decodePortablePayload(req.body);
+      if (!verification.valid || !verification.packageData) {
+        return res.status(400).json({
+          ok: false,
+          error: verification.error || 'Portable package verification failed; import aborted.',
+        });
+      }
+
+      const pkg = verification.packageData;
+
+      // Create pre-import safety snapshot if destructive replacement is requested on a file-backed DB
+      let safetyBackupFileName: string | null = null;
+      if (
+        conflictPolicy === 'replace' &&
+        resolvedDbPath &&
+        resolvedDbPath !== ':memory:' &&
+        fs.existsSync(resolvedDbPath)
+      ) {
+        try {
+          const safetyMeta = createConsistentBackup(db, resolvedDbPath, {
+            backupDir: resolvedBackupDir,
+            kind: 'pre-restore-safety',
+          });
+          safetyBackupFileName = safetyMeta.fileName;
+        } catch {
+          // continue safely if backup dir is unavailable in test fixture
+        }
+      }
+
+      const existingRows = db.prepare('SELECT * FROM facts').all();
+      const existingFacts = existingRows.map(serializeFactRow).filter(Boolean) as any[];
+      const effectivePkg = targetBrainOverride
+        ? {
+            ...pkg,
+            facts: pkg.facts.map((f) => ({ ...f, brain: targetBrainOverride })),
+          }
+        : pkg;
+      const diff = diffPortablePackageAgainstExisting(effectivePkg, existingFacts);
+
+      const diffByRef = new Map(diff.items.map((item) => [item.portableRefId, item]));
+      const refToNewId = new Map<string, number>();
+
+      let importedCount = 0;
+      let mergedCount = 0;
+      let replacedCount = 0;
+      let skippedCount = 0;
+      const brainsAffected = new Set<string>();
+      const now = new Date().toISOString();
+
+      const insertStmt = db.prepare(`
+        INSERT INTO facts (
+          brain, content, source, source_folder, file_name, file_path, file_type,
+          document_title, tags_json, original_created_at, imported_at, created_at, updated_at,
+          checksum, fixture_id, topic_key, related_sources_json, structured_data_json,
+          merge_history_json, parent_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      `);
+
+      const updateReplaceStmt = db.prepare(`
+        UPDATE facts SET
+          content = ?, source = ?, source_folder = ?, file_name = ?, file_path = ?,
+          file_type = ?, document_title = ?, tags_json = ?, original_created_at = ?,
+          updated_at = ?, checksum = ?, topic_key = ?, related_sources_json = ?,
+          structured_data_json = ?, merge_history_json = ?
+        WHERE id = ?
+      `);
+
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        for (const fact of effectivePkg.facts) {
+          const brainCheck = validateBrainName(fact.brain);
+          const resolvedBrain = brainCheck.valid ? brainCheck.value : 'coding';
+          const normalizedSource =
+            resolveServerSourceToken(fact.source) ||
+            (validateAISource(fact.source).valid ? (fact.source as any) : 'local-ai');
+          const diffItem = diffByRef.get(fact.portableRefId);
+
+          if (diffItem?.status === 'exact_duplicate') {
+            if (diffItem.existingFactId) {
+              refToNewId.set(fact.portableRefId, diffItem.existingFactId);
+            }
+            skippedCount++;
+            continue;
+          }
+
+          if (diffItem?.status === 'conflict' && diffItem.existingFactId) {
+            if (conflictPolicy === 'skip') {
+              refToNewId.set(fact.portableRefId, diffItem.existingFactId);
+              skippedCount++;
+              continue;
+            }
+
+            const existingRow = db
+              .prepare('SELECT * FROM facts WHERE id = ?')
+              .get(diffItem.existingFactId) as any;
+            const existingSerialized = serializeFactRow(existingRow);
+
+            if (conflictPolicy === 'replace') {
+              const mergeHistory = [
+                ...(Array.isArray(existingSerialized?.mergeHistory)
+                  ? existingSerialized.mergeHistory
+                  : []),
+                {
+                  action: 'portable_replace',
+                  timestamp: now,
+                  sourceInstance: pkg.sourceInstance,
+                  previousContentPreview: existingSerialized?.content?.slice(0, 140) || '',
+                },
+              ];
+              updateReplaceStmt.run(
+                fact.content,
+                normalizedSource,
+                fact.sourceFolder,
+                fact.fileName,
+                fact.filePath,
+                fact.fileType,
+                fact.documentTitle,
+                JSON.stringify(fact.tags || []),
+                fact.originalCreatedAt,
+                now,
+                fact.checksum || sha256Hex(fact.content),
+                fact.topicKey,
+                JSON.stringify(fact.relatedSources || []),
+                fact.structuredData ? JSON.stringify(fact.structuredData) : null,
+                JSON.stringify(mergeHistory),
+                diffItem.existingFactId
+              );
+              refToNewId.set(fact.portableRefId, diffItem.existingFactId);
+              replacedCount++;
+              brainsAffected.add(resolvedBrain);
+              continue;
+            }
+
+            if (conflictPolicy === 'merge') {
+              const mergedContent = `${existingSerialized?.content || ''}\n\n---\n[Merged from portable package ${pkg.exportedAt}]\n${fact.content}`;
+              const mergedTags = Array.from(
+                new Set([...(existingSerialized?.tags || []), ...(fact.tags || [])])
+              );
+              const mergedRelated = Array.from(
+                new Set([
+                  ...(existingSerialized?.relatedSources || []),
+                  ...(fact.relatedSources || []),
+                  normalizedSource,
+                ])
+              );
+              const mergeHistory = [
+                ...(Array.isArray(existingSerialized?.mergeHistory)
+                  ? existingSerialized.mergeHistory
+                  : []),
+                {
+                  action: 'portable_merge',
+                  timestamp: now,
+                  sourceInstance: pkg.sourceInstance,
+                  portableRefId: fact.portableRefId,
+                },
+              ];
+              updateReplaceStmt.run(
+                mergedContent,
+                existingSerialized?.source || normalizedSource,
+                existingSerialized?.sourceFolder || fact.sourceFolder,
+                existingSerialized?.fileName || fact.fileName,
+                existingSerialized?.filePath || fact.filePath,
+                existingSerialized?.fileType || fact.fileType,
+                existingSerialized?.documentTitle || fact.documentTitle,
+                JSON.stringify(mergedTags),
+                existingSerialized?.originalCreatedAt || fact.originalCreatedAt,
+                now,
+                sha256Hex(mergedContent),
+                existingSerialized?.topicKey || fact.topicKey,
+                JSON.stringify(mergedRelated),
+                existingSerialized?.structuredData
+                  ? JSON.stringify(existingSerialized.structuredData)
+                  : fact.structuredData
+                    ? JSON.stringify(fact.structuredData)
+                    : null,
+                JSON.stringify(mergeHistory),
+                diffItem.existingFactId
+              );
+              refToNewId.set(fact.portableRefId, diffItem.existingFactId);
+              mergedCount++;
+              brainsAffected.add(resolvedBrain);
+              continue;
+            }
+          }
+
+          // New fact insertion
+          const insertResult = insertStmt.run(
+            resolvedBrain,
+            fact.content,
+            normalizedSource,
+            fact.sourceFolder,
+            fact.fileName,
+            fact.filePath,
+            fact.fileType,
+            fact.documentTitle,
+            JSON.stringify(fact.tags || []),
+            fact.originalCreatedAt,
+            fact.importedAt || now,
+            fact.createdAt || now,
+            fact.updatedAt || now,
+            fact.checksum || sha256Hex(fact.content),
+            fact.fixtureId,
+            fact.topicKey,
+            JSON.stringify(fact.relatedSources || []),
+            fact.structuredData ? JSON.stringify(fact.structuredData) : null,
+            JSON.stringify(fact.mergeHistory || [])
+          );
+          const newId = Number(insertResult.lastInsertRowid);
+          refToNewId.set(fact.portableRefId, newId);
+          importedCount++;
+          brainsAffected.add(resolvedBrain);
+        }
+
+        // Second pass: restore parent/child hierarchy links using remapped IDs
+        const updateParentStmt = db.prepare('UPDATE facts SET parent_id = ? WHERE id = ?');
+        let restoredParentLinks = 0;
+        for (const fact of effectivePkg.facts) {
+          if (!fact.parentRefId) continue;
+          const childId = refToNewId.get(fact.portableRefId);
+          const parentId = refToNewId.get(fact.parentRefId);
+          if (childId && parentId && childId !== parentId) {
+            updateParentStmt.run(parentId, childId);
+            restoredParentLinks++;
+          }
+        }
+
+        db.exec('COMMIT');
+
+        try {
+          recordSystemAuditLog(db, {
+            category: 'portable_import',
+            summary: `Imported portable ${detectedFormat} package (${importedCount} new, ${mergedCount} merged, ${replacedCount} replaced, ${skippedCount} skipped)`,
+            status: 'success',
+            details: {
+              format: detectedFormat,
+              conflictPolicy,
+              importedCount,
+              mergedCount,
+              replacedCount,
+              skippedCount,
+              restoredParentLinks,
+              safetyBackupFileName,
+              sourceInstance: pkg.sourceInstance,
+            },
+          });
+        } catch {
+          // non-fatal
+        }
+
+        return res.json({
+          ok: true,
+          format: detectedFormat,
+          conflictPolicy,
+          importedCount,
+          mergedCount,
+          replacedCount,
+          skippedCount,
+          restoredParentLinks,
+          safetyBackupFileName,
+          brainsAffected: Array.from(brainsAffected).sort(),
+        });
+      } catch (txErr) {
+        try {
+          db.exec('ROLLBACK');
+        } catch {
+          // ignore
+        }
+        throw txErr;
+      }
+    } catch (err: any) {
+      return res.status(500).json({
+        ok: false,
+        error: err?.message || 'Portable package import failed',
+      });
     }
   });
 

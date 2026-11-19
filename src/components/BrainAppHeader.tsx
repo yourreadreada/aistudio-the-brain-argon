@@ -51,25 +51,25 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
   totalFactsCount = 0,
 }) => {
   return (
-    <header className="relative z-30 flex h-14 w-full shrink-0 items-center justify-between gap-4 border-b border-white/10 bg-[#050710]/90 px-4 md:px-6 backdrop-blur-xl">
+    <header className="relative z-30 flex h-14 w-full shrink-0 items-center justify-between gap-2 sm:gap-4 border-b border-white/10 bg-[#050710]/90 px-2.5 sm:px-4 md:px-6 backdrop-blur-xl">
       {/* Zone 1: Mobile Sidebar Toggle & Contextual Breadcrumb */}
-      <div className="flex items-center gap-3 min-w-0 shrink-0">
+      <div className="flex items-center gap-2 sm:gap-3 min-w-0 shrink-0">
         {onToggleMobileSidebar && (
           <button
             type="button"
             onClick={onToggleMobileSidebar}
-            className="flex md:hidden h-8 w-8 items-center justify-center rounded-lg border border-white/15 text-white/70 hover:text-white"
+            className="flex md:hidden h-9 w-9 items-center justify-center rounded-lg border border-white/15 text-white/75 hover:text-white shrink-0"
             aria-label="Toggle navigation menu"
           >
             <Menu className="h-4 w-4" />
           </button>
         )}
 
-        <nav aria-label="Breadcrumb" className="flex items-center gap-2 text-xs whitespace-nowrap">
+        <nav aria-label="Breadcrumb" className="flex items-center gap-1.5 sm:gap-2 text-xs whitespace-nowrap">
           <span className="text-white/45 hidden sm:inline">Workspaces</span>
           <span className="text-white/25 hidden sm:inline" aria-hidden="true">›</span>
-          <span className="font-semibold text-white capitalize">{currentBrain}</span>
-          <span className="mono rounded-md border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] tabular-nums text-white/60">
+          <span className="font-semibold text-white capitalize max-w-[90px] sm:max-w-none truncate">{currentBrain}</span>
+          <span className="hidden sm:inline-flex mono rounded-md border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] tabular-nums text-white/60">
             {totalFactsCount} {totalFactsCount === 1 ? 'node' : 'nodes'}
           </span>
 
@@ -106,7 +106,7 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
       </div>
 
       {/* Zone 2: Global Search Bar */}
-      <div className="flex flex-1 items-center justify-center max-w-lg">
+      <div className="flex flex-1 min-w-0 items-center justify-center max-w-lg">
         <GlobalSearchBar
           currentBrain={currentBrain}
           filterQuery={searchQuery}
@@ -116,7 +116,7 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
       </div>
 
       {/* Zone 3: Primary Workspace Actions (Companion, Capture Hub, Store Fact, Settings) */}
-      <div className="flex items-center gap-2 shrink-0">
+      <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
         <button
           type="button"
           onClick={() => onOpenIngest('companion')}
@@ -139,10 +139,12 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
         <button
           type="button"
           onClick={onOpenAddFact}
-          className="flex items-center gap-1.5 rounded-lg bg-white px-3.5 py-1.5 text-xs font-semibold text-black transition hover:bg-white/90 whitespace-nowrap shrink-0"
+          aria-label="Store Fact"
+          className="flex items-center gap-1 sm:gap-1.5 rounded-lg bg-white px-2.5 sm:px-3.5 py-1.5 text-xs font-semibold text-black transition hover:bg-white/90 whitespace-nowrap shrink-0 min-h-[36px] sm:min-h-0"
         >
           <Plus className="h-3.5 w-3.5" />
-          <span>Store Fact</span>
+          <span className="hidden sm:inline">Store Fact</span>
+          <span className="sm:hidden">Add</span>
         </button>
 
         {onOpenSettings && (
@@ -153,7 +155,7 @@ export const BrainAppHeader: React.FC<BrainAppHeaderProps> = ({
             aria-label={isSettingsActive ? 'Return to Workspace from Settings' : 'Open Application Settings'}
             aria-pressed={isSettingsActive}
             title={isSettingsActive ? 'Close Settings (Return to Workspace)' : 'Settings'}
-            className={`flex h-8 w-8 items-center justify-center rounded-lg border transition shrink-0 focus:outline-none focus:ring-2 focus:ring-[#9db4ff]/50 ${
+            className={`flex h-9 w-9 sm:h-8 sm:w-8 items-center justify-center rounded-lg border transition shrink-0 focus:outline-none focus:ring-2 focus:ring-[#9db4ff]/50 ${
               isSettingsActive
                 ? 'border-[#9db4ff]/60 bg-[#9db4ff]/20 text-white shadow-[0_0_12px_rgba(157,180,255,0.25)]'
                 : 'border-white/12 bg-white/[0.03] text-white/70 hover:border-white/25 hover:bg-white/[0.08] hover:text-white'

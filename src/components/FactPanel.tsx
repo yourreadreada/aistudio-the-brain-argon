@@ -230,6 +230,18 @@ export const FactPanel: React.FC<FactPanelProps> = ({
     };
   }, [fact, workspaceEdges]);
 
+  useEffect(() => {
+    if (!fact && !selectedSource) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [fact, selectedSource, onClose]);
+
   if (!fact && !selectedSource) return null;
 
   const getFormatIcon = (ft: FactFileType) => {
@@ -278,18 +290,18 @@ export const FactPanel: React.FC<FactPanelProps> = ({
     return (
       <aside
         aria-label="Source Inspector"
-        className="fixed inset-y-0 right-0 z-40 flex w-full max-w-[420px] flex-col border-l border-white/12 bg-[#060812]/95 shadow-2xl backdrop-blur-2xl transition-transform duration-200 ease-out"
+        className="fixed inset-y-0 right-0 z-40 flex h-dvh w-full sm:max-w-[420px] flex-col border-l border-white/12 bg-[#060812]/95 shadow-2xl backdrop-blur-2xl transition-transform duration-200 ease-out safe-top safe-bottom"
       >
         {/* Top Inspector Bar */}
-        <div className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-5">
+        <div className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-4 sm:px-5">
           <span className="mono text-[11px] font-semibold uppercase tracking-[0.16em] text-white/55">
             Source Inspector
           </span>
           <button
             type="button"
             onClick={onClose}
-            className="flex h-7 w-7 items-center justify-center rounded-lg text-white/45 transition hover:bg-white/[0.06] hover:text-white"
-            aria-label="Close inspector"
+            className="flex h-9 w-9 items-center justify-center rounded-lg text-white/55 transition hover:bg-white/[0.08] hover:text-white"
+            aria-label="Close source inspector"
           >
             <X className="h-4 w-4" />
           </button>
@@ -899,10 +911,10 @@ export const FactPanel: React.FC<FactPanelProps> = ({
   return (
     <aside
       aria-label="Node Inspector"
-      className="fixed inset-y-0 right-0 z-40 flex w-full max-w-[440px] flex-col border-l border-white/12 bg-[#060812]/95 shadow-2xl backdrop-blur-2xl transition-transform duration-200 ease-out"
+      className="fixed inset-y-0 right-0 z-40 flex h-dvh w-full sm:max-w-[440px] flex-col border-l border-white/12 bg-[#060812]/95 shadow-2xl backdrop-blur-2xl transition-transform duration-200 ease-out safe-top safe-bottom"
     >
       {/* Inspector Header */}
-      <div className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-5">
+      <div className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-4 sm:px-5">
         <div className="flex items-center gap-2 min-w-0">
           {onSelectSource && (
             <button

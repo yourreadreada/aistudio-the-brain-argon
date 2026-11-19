@@ -1813,100 +1813,104 @@ export const BrainViewerCanvas: React.FC<BrainViewerCanvasProps> = ({
         onWheel={handleWheel}
       />
 
-      {/* Top-Left Compact Workspace Statistics + Relationship Edge Filter Pills */}
-      <div className="pointer-events-auto absolute top-4 left-5 z-20 flex flex-wrap items-center gap-2">
-        <div className="rounded-xl border border-white/10 bg-[#070913]/85 px-3.5 py-2 backdrop-blur-md">
-          <div className="mono text-[9.5px] uppercase tracking-wider text-white/40">
-            Memories
-          </div>
-          <div className="mono mt-0.5 text-sm font-semibold tabular-nums text-white">
-            {workspaceStats.memoriesCount}
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-white/10 bg-[#070913]/85 px-3.5 py-2 backdrop-blur-md">
-          <div className="mono text-[9.5px] uppercase tracking-wider text-white/40">
-            Sources
-          </div>
-          <div className="mono mt-0.5 text-sm font-semibold tabular-nums text-white">
-            {workspaceStats.activeSourcesCount}
-            <span className="text-white/40">/{workspaceStats.totalPaletteSources}</span>
-          </div>
-        </div>
-
-        <div className="rounded-xl border border-white/10 bg-[#070913]/85 px-3.5 py-2 backdrop-blur-md">
-          <div className="mono text-[9.5px] uppercase tracking-wider text-white/40">
-            Last Sync
-          </div>
-          <div className="mono mt-0.5 text-sm font-semibold tabular-nums text-white">
-            {workspaceStats.lastSyncLabel}
-          </div>
-        </div>
-
-        {/* Relationship Edge Type Filter Bar */}
-        <div className="hidden md:flex items-center gap-1 rounded-xl border border-white/10 bg-[#070913]/85 p-1 backdrop-blur-md">
-          {(
-            [
-              { id: 'all', label: 'All Edges', count: relationshipCounts.all },
-              { id: 'source', label: 'Source', count: relationshipCounts.source },
-              { id: 'semantic', label: 'Semantic', count: relationshipCounts.semantic },
-              { id: 'explicit', label: 'Explicit', count: relationshipCounts.explicit },
-            ] as const
-          ).map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => setRelationshipFilter(item.id)}
-              className={`mono rounded-lg px-2 py-1 text-[10px] transition ${
-                relationshipFilter === item.id
-                  ? 'bg-white/15 font-semibold text-white'
-                  : 'text-white/50 hover:text-white/85'
-              }`}
-              title={`Filter graph edges by ${item.label} (identical across Radial & Force layouts)`}
-            >
-              {item.label} <span className="text-white/40">{item.count}</span>
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Top-Right Graph Layout Switcher (Radial | Force | Timeline) */}
+      {/* Top HUD Bar: Compact Workspace Stats + Edge Filter + Layout Switcher (non-overlapping on mobile) */}
       <div
-        role="group"
-        aria-label="Graph layout mode"
-        className={`pointer-events-auto absolute top-4 z-20 flex items-center gap-0.5 rounded-xl border border-white/12 bg-[#070913]/88 p-1 backdrop-blur-md transition-[right] duration-200 ${
-          isInspectorOpen ? 'right-5 xl:right-[436px]' : 'right-5'
+        className={`pointer-events-none absolute top-3 sm:top-4 left-3 sm:left-5 z-20 flex flex-wrap items-start justify-between gap-2 transition-[right] duration-200 ${
+          isInspectorOpen ? 'right-3 sm:right-5 xl:right-[436px]' : 'right-3 sm:right-5'
         }`}
       >
-        {(['radial', 'force', 'timeline'] as GraphLayoutMode[]).map((mode) => {
-          const active = layoutMode === mode;
-          return (
+        <div className="pointer-events-auto flex flex-wrap items-center gap-1.5 sm:gap-2">
+          <div className="rounded-xl border border-white/10 bg-[#070913]/85 px-2.5 sm:px-3.5 py-1.5 sm:py-2 backdrop-blur-md">
+            <div className="mono text-[9px] sm:text-[9.5px] uppercase tracking-wider text-white/40">
+              Memories
+            </div>
+            <div className="mono mt-0.5 text-xs sm:text-sm font-semibold tabular-nums text-white">
+              {workspaceStats.memoriesCount}
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-white/10 bg-[#070913]/85 px-2.5 sm:px-3.5 py-1.5 sm:py-2 backdrop-blur-md">
+            <div className="mono text-[9px] sm:text-[9.5px] uppercase tracking-wider text-white/40">
+              Sources
+            </div>
+            <div className="mono mt-0.5 text-xs sm:text-sm font-semibold tabular-nums text-white">
+              {workspaceStats.activeSourcesCount}
+              <span className="text-white/40">/{workspaceStats.totalPaletteSources}</span>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-white/10 bg-[#070913]/85 px-2.5 sm:px-3.5 py-1.5 sm:py-2 backdrop-blur-md">
+            <div className="mono text-[9px] sm:text-[9.5px] uppercase tracking-wider text-white/40">
+              Last Sync
+            </div>
+            <div className="mono mt-0.5 text-xs sm:text-sm font-semibold tabular-nums text-white">
+              {workspaceStats.lastSyncLabel}
+            </div>
+          </div>
+
+          {/* Relationship Edge Type Filter Bar */}
+          <div className="hidden md:flex items-center gap-1 rounded-xl border border-white/10 bg-[#070913]/85 p-1 backdrop-blur-md">
+            {(
+              [
+                { id: 'all', label: 'All Edges', count: relationshipCounts.all },
+                { id: 'source', label: 'Source', count: relationshipCounts.source },
+                { id: 'semantic', label: 'Semantic', count: relationshipCounts.semantic },
+                { id: 'explicit', label: 'Explicit', count: relationshipCounts.explicit },
+              ] as const
+            ).map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setRelationshipFilter(item.id)}
+                className={`mono rounded-lg px-2 py-1 text-[10px] transition ${
+                  relationshipFilter === item.id
+                    ? 'bg-white/15 font-semibold text-white'
+                    : 'text-white/50 hover:text-white/85'
+                }`}
+                title={`Filter graph edges by ${item.label} (identical across Radial & Force layouts)`}
+              >
+                {item.label} <span className="text-white/40">{item.count}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Graph Layout Switcher (Radial | Force | Timeline) */}
+        <div
+          role="group"
+          aria-label="Graph layout mode"
+          className="pointer-events-auto flex items-center gap-0.5 rounded-xl border border-white/12 bg-[#070913]/88 p-1 backdrop-blur-md shrink-0"
+        >
+          {(['radial', 'force', 'timeline'] as GraphLayoutMode[]).map((mode) => {
+            const active = layoutMode === mode;
+            return (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => {
+                  setLayoutMode(mode);
+                  brainSwitchTimeRef.current = performance.now();
+                }}
+                className={`rounded-lg px-2.5 py-1 text-xs font-medium capitalize transition ${
+                  active
+                    ? 'bg-white/[0.14] text-white shadow-sm'
+                    : 'text-white/55 hover:text-white'
+                }`}
+              >
+                {mode}
+              </button>
+            );
+          })}
+          {layoutMode === 'timeline' && (
             <button
-              key={mode}
               type="button"
-              onClick={() => {
-                setLayoutMode(mode);
-                brainSwitchTimeRef.current = performance.now();
-              }}
-              className={`rounded-lg px-2.5 py-1 text-xs font-medium capitalize transition ${
-                active
-                  ? 'bg-white/[0.14] text-white shadow-sm'
-                  : 'text-white/55 hover:text-white'
-              }`}
+              onClick={() => setShowTimelineLedger((prev) => !prev)}
+              className="ml-1 rounded-lg border border-indigo-400/30 bg-indigo-500/15 px-2 py-1 text-[10px] font-medium text-indigo-200 hover:bg-indigo-500/25"
             >
-              {mode}
+              {showTimelineLedger ? 'Hide Chronology' : 'Show Chronology'}
             </button>
-          );
-        })}
-        {layoutMode === 'timeline' && (
-          <button
-            type="button"
-            onClick={() => setShowTimelineLedger((prev) => !prev)}
-            className="ml-1 rounded-lg border border-indigo-400/30 bg-indigo-500/15 px-2 py-1 text-[10px] font-medium text-indigo-200 hover:bg-indigo-500/25"
-          >
-            {showTimelineLedger ? 'Hide Chronology' : 'Show Chronology'}
-          </button>
-        )}
+          )}
+        </div>
       </div>
 
       {/* Section 6: Chronological Timeline Overlay Drawer when layoutMode === 'timeline' */}

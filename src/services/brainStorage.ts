@@ -3356,6 +3356,10 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
    * Returns OpenAPI 3.1.0 specification for ChatGPT Custom GPT Actions.
    */
   public getOpenApiSpec(): object {
+    const resolvedOrigin =
+      typeof window !== 'undefined' && window.location?.origin
+        ? window.location.origin
+        : 'http://127.0.0.1:3000';
     return {
       openapi: "3.1.0",
       info: {
@@ -3363,7 +3367,7 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
         description: "Two-way memory storage and recall across AI platforms.",
         version: "1.0.0"
       },
-      servers: [{ url: "http://localhost:8787" }],
+      servers: [{ url: resolvedOrigin }],
       paths: {
         "/api/recall": {
           get: {
@@ -4273,6 +4277,112 @@ When we reach a concrete resolution or finalize a decision, format it clearly wi
     if (filters?.source) params.set('source', filters.source);
     if (filters?.search) params.set('search', filters.search);
     return `${API_BASE}/api/activity-logs/export?${params.toString()}`;
+  }
+
+  // =========================================================================
+  // MCP Bridge Diagnostics & Smoke Test (Section 2.1)
+  // =========================================================================
+  public async fetchMcpDiagnostics(brain?: string): Promise<any> {
+    const q = brain ? `?brain=${encodeURIComponent(brain)}` : '';
+    const res = await fetch(`${API_BASE}/api/mcp/diagnostics${q}`);
+    if (!res.ok) {
+      throw new Error(`MCP diagnostics request failed (${res.status})`);
+    }
+    return res.json();
+  }
+
+  public async runMcpSmokeTest(brain?: string): Promise<any> {
+    const res = await fetch(`${API_BASE}/api/mcp/smoke-test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ brain: brain || 'coding' }),
+    });
+    if (!res.ok) {
+      throw new Error(`MCP smoke test failed (${res.status})`);
+    }
+    return res.json();
+  }
+
+  // =========================================================================
+  // Local Security & Privacy Posture (Section 2.2)
+  // =========================================================================
+  public async fetchSecurityPosture(): Promise<any> {
+    const res = await fetch(`${API_BASE}/api/security/posture`);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch security posture (${res.status})`);
+    }
+    return res.json();
+  }
+
+  public async hardenSecurityPermissions(): Promise<any> {
+    const res = await fetch(`${API_BASE}/api/security/harden-permissions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to harden file permissions (${res.status})`);
+    }
+    return res.json();
+  }
+
+  // =========================================================================
+  // Portable Brain Format Family (.brain.json, .brain.md, .brainpack.zip)
+  // =========================================================================
+  public getPortableExportUrl(options: {
+    format: 'json' | 'md' | 'zip';
+    brain?: string;
+    source?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    excludeSecrets?: boolean;
+    includePrivate?: boolean;
+    includeAttachments?: boolean;
+  }): string {
+    const params = new URLSearchParams();
+    params.set('format', options.format);
+    if (options.brain) params.set('brain', options.brain);
+    if (options.source) params.set('source', options.source);
+    if (options.dateFrom) params.set('dateFrom', options.dateFrom);
+    if (options.dateTo) params.set('dateTo', options.dateTo);
+    params.set('excludeSecrets', options.excludeSecrets === false ? 'false' : 'true');
+    if (options.includePrivate) params.set('includePrivate', 'true');
+    if (options.includeAttachments) params.set('includeAttachments', 'true');
+    return `${API_BASE}/api/portable/export?${params.toString()}`;
+  }
+
+  public async inspectPortablePackage(payload: {
+    format?: 'json' | 'md' | 'zip';
+    fileName?: string;
+    content?: string;
+    base64?: string;
+  }): Promise<any> {
+    const res = await fetch(`${API_BASE}/api/portable/inspect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return res.json();
+  }
+
+  public async importPortablePackage(payload: {
+    format?: 'json' | 'md' | 'zip';
+    fileName?: string;
+    content?: string;
+    base64?: string;
+    conflictPolicy: 'skip' | 'merge' | 'replace';
+    targetBrainOverride?: string;
+  }): Promise<any> {
+    const res = await fetch(`${API_BASE}/api/portable/import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data?.error || `Portable import failed (${res.status})`);
+    }
+    await this.loadFromBackend({ forceReplaceLocal: true }).catch(() => {});
+    return data;
   }
 }
 

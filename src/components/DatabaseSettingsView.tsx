@@ -38,10 +38,12 @@ import {
   FailedRetryBehaviour,
   BackupScheduleFrequency,
 } from '../types/brain';
+import { SecurityAndPortableSection } from './SecurityAndPortableSection';
 
 interface DatabaseSettingsViewProps {
   onBackToWorkspace?: () => void;
   onAfterRestore?: () => void;
+  onOpenMcpBridge?: () => void;
 }
 
 function formatByteSize(bytes: number): string {
@@ -123,6 +125,7 @@ const SETTINGS_CATEGORIES: {
 export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
   onBackToWorkspace,
   onAfterRestore,
+  onOpenMcpBridge,
 }) => {
   const [statusData, setStatusData] = useState<DatabaseStatusPayload | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -1844,18 +1847,36 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
                 <span>5. AI Connections & MCP Bridge</span>
               </h2>
               <div className="space-y-2 text-xs text-white/65">
-                <div className="flex items-center justify-between rounded-xl border border-white/8 bg-black/30 px-3.5 py-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/8 bg-black/30 px-3.5 py-2">
                   <span>Local Loopback Gateway Binding</span>
                   <span className="mono text-emerald-400">
                     127.0.0.1:3000 (Strict Local)
                   </span>
                 </div>
-                <div className="flex items-center justify-between rounded-xl border border-white/8 bg-black/30 px-3.5 py-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/8 bg-black/30 px-3.5 py-2">
+                  <span>Desktop stdio MCP Server</span>
+                  <span className="mono text-emerald-400">
+                    Node.js · scripts/mcp-server.ts (JSON-RPC 2.0)
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/8 bg-black/30 px-3.5 py-2">
                   <span>Supported Sources</span>
                   <span className="mono text-white/85">
                     Claude · ChatGPT · Gemini · Cursor · GitHub · Ollama · Moodle
                   </span>
                 </div>
+                {onOpenMcpBridge && (
+                  <div className="pt-1">
+                    <button
+                      type="button"
+                      data-testid="open-mcp-bridge-settings-btn"
+                      onClick={onOpenMcpBridge}
+                      className="inline-flex items-center gap-2 rounded-xl bg-[#9db4ff] px-4 py-2 text-xs font-semibold text-[#050712] hover:bg-white transition min-h-[38px]"
+                    >
+                      <span>Open MCP Bridge & Live Diagnostics</span>
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -1870,13 +1891,13 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
                 <span>6 & 7. Browser Companion & System Diagnostics</span>
               </h2>
               <div className="space-y-2 text-xs text-white/65">
-                <div className="flex items-center justify-between rounded-xl border border-white/8 bg-black/30 px-3.5 py-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/8 bg-black/30 px-3.5 py-2">
                   <span>SQLite Engine & Journal Mode</span>
                   <span className="mono text-emerald-400">
-                    better-sqlite3 · WAL · Schema v{statusData?.schemaVersion ?? 5}
+                    node:sqlite (DatabaseSync) · WAL · Schema v{statusData?.schemaVersion ?? 5}
                   </span>
                 </div>
-                <div className="flex items-center justify-between rounded-xl border border-white/8 bg-black/30 px-3.5 py-2">
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-white/8 bg-black/30 px-3.5 py-2">
                   <span>Active Batch / Queue Capabilities</span>
                   <span className="mono text-[#9db4ff]">
                     {globalSettings.importProcessing.maxFilesPerBatch.toLocaleString()} files/batch · Concurrency {globalSettings.importProcessing.concurrency}
@@ -1886,6 +1907,17 @@ export const DatabaseSettingsView: React.FC<DatabaseSettingsViewProps> = ({
             </div>
           )}
         </div>
+
+        {/* Full-Width Portable Formats (Section 5.4) & Security & Privacy Posture (Section 2.2) */}
+        <SecurityAndPortableSection
+          availableBrains={statusData?.brains || []}
+          showPortable={showSection('database')}
+          showSecurity={showSection('database') || showSection('diagnostics') || showSection('connections')}
+          onDataImported={() => {
+            loadDatabaseStatus(true);
+            if (onAfterRestore) onAfterRestore();
+          }}
+        />
       </div>
     </div>
   );

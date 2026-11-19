@@ -3314,7 +3314,34 @@ export const CaptureHubModal: React.FC<CaptureHubModalProps> = ({
                       <span>Download .md</span>
                     </button>
                   </div>
+                  <div className="flex flex-wrap items-center gap-1.5 w-full justify-end">
+                    <a
+                      href={brainStore.getPortableExportUrl({ format: 'json', brain: exportBrain })}
+                      download
+                      className="mono rounded-lg border border-white/15 bg-white/[0.04] px-2.5 py-1.5 text-[11px] text-white/85 hover:bg-white/10 transition"
+                    >
+                      .brain.json
+                    </a>
+                    <a
+                      href={brainStore.getPortableExportUrl({ format: 'md', brain: exportBrain })}
+                      download
+                      className="mono rounded-lg border border-white/15 bg-white/[0.04] px-2.5 py-1.5 text-[11px] text-white/85 hover:bg-white/10 transition"
+                    >
+                      .brain.md
+                    </a>
+                    <a
+                      href={brainStore.getPortableExportUrl({ format: 'zip', brain: exportBrain })}
+                      download
+                      className="mono rounded-lg border border-[#9db4ff]/35 bg-[#9db4ff]/15 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-[#9db4ff]/25 transition"
+                    >
+                      .brainpack.zip
+                    </a>
+                  </div>
                 </div>
+              </div>
+
+              <div className="rounded-xl border border-amber-500/25 bg-amber-500/8 px-3.5 py-2.5 text-[11.5px] text-amber-100/90">
+                <strong>Portable export vs. database backup:</strong> Portable <code>.brain.md</code>, <code>.brain.json</code>, and <code>.brainpack.zip</code> exports are for reading, archiving, and selective transfer (redacting detected secrets by default). For full disaster-recovery SQLite snapshots, use <strong>Settings → Database & Backups</strong>.
               </div>
 
               <div className="rounded-xl border border-white/10 bg-[#060914] overflow-hidden">
