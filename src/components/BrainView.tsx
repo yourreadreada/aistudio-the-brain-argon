@@ -108,6 +108,9 @@ export const BrainView: React.FC<BrainViewProps> = ({
   const [activeSourceFilter, setActiveSourceFilter] = useState<AISource | null>(null);
   const [activeFileTypeFilter, setActiveFileTypeFilter] = useState<FactFileType | null>(null);
   const [viewMode, setViewMode] = useState<WorkspaceViewMode>('graph');
+  const [compactTableDensity, setCompactTableDensity] = useState<boolean>(
+    () => brainStore.getGlobalSettings().general.compactTableDensity
+  );
 
   // Section 4: Memory Table Sorting & Pagination State
   const [sortField, setSortField] = useState<TableSortField>('updated');
@@ -250,6 +253,14 @@ export const BrainView: React.FC<BrainViewProps> = ({
     setBrainCounts(brainStore.getFactCountsByBrain());
     setSourceCounts(brainStore.getFactCountsBySource(currentBrain));
     setFileTypeCounts(brainStore.getFactCountsByFileType(currentBrain));
+    const settings = brainStore.getGlobalSettings();
+    setCompactTableDensity(Boolean(settings.general.compactTableDensity));
+    if (typeof document !== 'undefined') {
+      document.documentElement.classList.toggle(
+        'reduce-motion',
+        Boolean(settings.general.reducedMotion)
+      );
+    }
     refreshConnectionStatus();
   };
 
@@ -1151,6 +1162,8 @@ export const BrainView: React.FC<BrainViewProps> = ({
                           const ftMeta = FILE_TYPE_CONFIG[ft];
                           const isSelected = selectedFact?.id === fact.id;
 
+                          const rowPad = compactTableDensity ? 'py-1.5' : 'py-3';
+
                           return (
                             <tr
                               key={fact.id}
@@ -1159,10 +1172,10 @@ export const BrainView: React.FC<BrainViewProps> = ({
                                 isSelected ? 'bg-white/[0.09]' : 'hover:bg-white/[0.04]'
                               }`}
                             >
-                              <td className="py-3 pl-4 pr-2 align-top mono text-[11px] tabular-nums text-white/50">
+                              <td className={`${rowPad} pl-4 pr-2 align-top mono text-[11px] tabular-nums text-white/50`}>
                                 #{fact.id}
                               </td>
-                              <td className="py-3 px-3 align-top whitespace-nowrap">
+                              <td className={`${rowPad} px-3 align-top whitespace-nowrap`}>
                                 <span
                                   className="font-semibold"
                                   style={{ color: s?.color || '#fff' }}
@@ -1175,7 +1188,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
                                   </div>
                                 )}
                               </td>
-                              <td className="py-3 px-3 align-top">
+                              <td className={`${rowPad} px-3 align-top`}>
                                 <div className="flex flex-wrap items-center gap-1.5 mb-0.5">
                                   {(fact.documentTitle || fact.fileName) && (
                                     <span className="font-semibold text-white">
@@ -1188,7 +1201,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
                                     </span>
                                   )}
                                 </div>
-                                <p className="text-white/85 leading-relaxed line-clamp-2">
+                                <p className={`text-white/85 leading-relaxed ${compactTableDensity ? 'line-clamp-1' : 'line-clamp-2'}`}>
                                   {fact.content}
                                 </p>
                                 {fact.tags && fact.tags.length > 0 && (
@@ -1199,7 +1212,7 @@ export const BrainView: React.FC<BrainViewProps> = ({
                                   </div>
                                 )}
                               </td>
-                              <td className="py-3 px-3 align-top hidden lg:table-cell whitespace-nowrap">
+                              <td className={`${rowPad} px-3 align-top hidden lg:table-cell whitespace-nowrap`}>
                                 <div className="flex items-center gap-1.5 text-[11px] text-white/60">
                                   <span className="mono font-medium" style={{ color: ftMeta.color }}>
                                     {ftMeta.badge}
@@ -1217,12 +1230,12 @@ export const BrainView: React.FC<BrainViewProps> = ({
                                   )}
                                 </div>
                               </td>
-                              <td className="py-3 px-3 align-top hidden md:table-cell mono text-[10.5px] text-white/50">
+                              <td className={`${rowPad} px-3 align-top hidden md:table-cell mono text-[10.5px] text-white/50`}>
                                 {fact.fileSizeBytes
                                   ? `${(fact.fileSizeBytes / 1024).toFixed(1)} KB`
                                   : `${fact.content.length} chars`}
                               </td>
-                              <td className="py-3 pl-3 pr-4 align-top text-right mono text-[11px] tabular-nums text-white/45 whitespace-nowrap">
+                              <td className={`${rowPad} pl-3 pr-4 align-top text-right mono text-[11px] tabular-nums text-white/45 whitespace-nowrap`}>
                                 {new Date(fact.updated_at).toLocaleDateString(undefined, {
                                   month: 'short',
                                   day: 'numeric',
@@ -1661,12 +1674,15 @@ export const BrainView: React.FC<BrainViewProps> = ({
           {viewMode === 'settings' && (
             <div className="relative z-10 h-full overflow-hidden">
               <DatabaseSettingsView
+                initialCategory="general"
                 onBackToWorkspace={() => setViewMode('graph')}
                 onAfterRestore={() => {
                   refreshData();
                   refreshActivities();
                 }}
                 onOpenMcpBridge={() => setIsMcpOpen(true)}
+                onOpenCompanion={() => handleOpenCaptureHub('companion')}
+                onOpenActivityLog={() => setViewMode('activity')}
               />
             </div>
           )}
